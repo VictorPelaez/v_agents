@@ -2,6 +2,10 @@
 __pycache__/
 *.py[codz]
 *$py.class
+# venv virtual environment
+myenv/
+config.
+vector_index/
 
 # C extensions
 *.so
