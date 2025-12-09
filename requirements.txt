@@ -1,0 +1,11 @@
+# installs
+langchain
+langchain_community
+langchain_text_splitters
+langchain_aws
+langchain-openai
+streamlit
+faiss-cpu
+deepagents
+tavily
+pypdf

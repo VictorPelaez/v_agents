@@ -1,7 +1,9 @@
 # genai_aws/front.py
-# streamlit run .\genai_aws\streamlit_front.py
+# .\myenv\Scripts\activate
+# streamlit run streamlit_front.py
 import streamlit as st
-from v_agents.rag_pipeline import ingestion_workflow_pdf, rag_response, get_vector_index, list_sources_from_vector_index
+from rag_pipeline import ingestion_workflow_pdf, rag_response, get_vector_index, list_sources_from_vector_index
+from deep_agent import agent_invoke
 
 # -----------------------------
 # CONFIGURACIÓN DE PÁGINA
@@ -140,13 +142,10 @@ with chat_col:
 
     if go_button and input_text.strip() != "":
         with st.spinner("Thinking..."):
-            answer, refs = rag_response(
-                index=st.session_state.vector_index,
-                question=input_text
-            )
+            answer, refs = agent_invoke(input_text)
             st.session_state.messages.append({
                 "user": input_text,
-                "bot": answer.content,
+                "bot": answer,
                 "refs": refs
             })
 
@@ -156,7 +155,7 @@ with chat_col:
         # Mensaje del bot
         st.markdown(f'<div class="chat-bubble-bot">{message["bot"]}</div>', unsafe_allow_html=True)
         # Referencias
-        if "refs" in message and message["refs"]:
+        if message.get("refs"):
             st.markdown("<div style='margin-top:4px; font-weight:bold;'>Sources used:</div>", unsafe_allow_html=True)
             for r in message["refs"]:
-                st.markdown(f"<div style='margin-left:12px;'>- `{r['source']}` — page <b>{r['page']}</b></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='margin-left:12px;'>- `{r['source']}` — page <b>{r.get('page','N/A')}</b></div>", unsafe_allow_html=True)
