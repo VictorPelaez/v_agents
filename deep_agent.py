@@ -1,9 +1,10 @@
 # deep agent
 import os
+from datetime import datetime, timezone
 from rag_pipeline import retrieve_context, get_vector_index
 from evaluation import print_subagent_tasks
 from config import TAVILY_API_KEY, OPENAI_API_KEY
-from tavily import TavilyClient # langchain.tools import DuckDuckGoSearchRun
+from tavily import TavilyClient  # langchain.tools import DuckDuckGoSearchRun
 from deepagents import create_deep_agent
 from langchain.chat_models import init_chat_model
 from langchain.tools import tool
@@ -100,11 +101,11 @@ def agent_invoke(question, index=None):
         Añade un header con timestamp y la pregunta (si se proporciona).
         """
         try:
-            # Construir ruta completa
+            # Root path
             reports_dir = os.path.join(os.path.dirname(__file__), "reports")
             os.makedirs(reports_dir, exist_ok=True)
             filepath = os.path.join(reports_dir, filename)
-            from datetime import datetime, timezone
+            # timestamp & header
             timestamp = datetime.now(timezone.utc).isoformat()
             qpart = f"**Question:** {question}\n\n" if question else ""
             header = "## " + timestamp + "\n\n" + qpart + "---\n\n"
@@ -112,6 +113,7 @@ def agent_invoke(question, index=None):
                 f.write(header)
                 f.write(response)
                 f.write("\n\n")
+            print(f"Response successfully appended to {filepath}")
             return f"Response successfully appended to {filepath}"
         except Exception as e:
             return f"Error saving file: {str(e)}"
@@ -142,7 +144,9 @@ def agent_invoke(question, index=None):
 
     file_writer_subagent = {
         "name": "file-writer",
-        "description": "Writes the final response to a persistent file",
+        "description": ("""This subagent must always finalize the process by
+                        appending the response to ‘response.md’, including
+                        an ISO 8601 timestamp header"""),
         "system_prompt": WRITE_INSTRUCTIONS,
         "tools": [write_response_to_file],
         "model": model_subagent
@@ -150,14 +154,14 @@ def agent_invoke(question, index=None):
     # ------------------------------------
     # Deep Agent
     # ------------------------------------
-    reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+    # reports_dir = os.path.join(os.path.dirname(__file__), "reports")
     agent = create_deep_agent(
         model=model_main,
         subagents=[retrieval_subagent,
                    research_subagent,
                    file_writer_subagent],
         system_prompt=MAIN_SYSTEM_PROMPT,
-        backend=FilesystemBackend(root_dir=reports_dir),
+        # backend=FilesystemBackend(root_dir=reports_dir),
     )
 
     result = agent.invoke({
@@ -180,22 +184,6 @@ def agent_invoke(question, index=None):
         elif "AIMessage" in str(type(m)) and content.strip():
             answer_text = content
     print_subagent_tasks(result)
-    
-    # Save response to file (append, do not overwrite) with question header
-    if answer_text:
-        reports_dir = os.path.join(os.path.dirname(__file__), "reports")
-        os.makedirs(reports_dir, exist_ok=True)
-        filepath = os.path.join(reports_dir, "response.md")
-        from datetime import datetime, timezone
-        timestamp = datetime.now(timezone.utc).isoformat()
-        qpart = f"**Question:** {question}\n\n" if question else ""
-        header = "## " + timestamp + "\n\n" + qpart + "---\n\n"
-        with open(filepath, "a", encoding="utf-8") as f:
-            f.write(header)
-            f.write(answer_text)
-            f.write("\n\n")
-        print(f"Response appended to {filepath}")
-    
     return answer_text, refs
 
 
@@ -204,8 +192,8 @@ def agent_invoke(question, index=None):
 # ============================
 if __name__ == "__main__":
     resp, refs = agent_invoke(
-        # "¿Cuál sería la solvencia CET de BBVA en junio 2025?"
-        "¿Cuál sería el beneficio de BBVA en junio 2025?"
+        "¿Cuál sería la solvencia CET de BBVA en junio 2025?"
+        # "¿Cuál sería el beneficio de BBVA en junio 2025?"
     )
-    print("\nRESPUESTA:\n", resp)
-    print("\nREFERENCIAS:\n", refs)
+    #print("\nRESPUESTA:\n", resp)
+    #print("\nREFERENCIAS:\n", refs)

@@ -44,7 +44,12 @@ Debes cumplir estas instrucciones de forma absoluta:
 6. La respuesta final debe ser concisa, clara y basada solo en la información
    proporcionada por el subagente correspondiente.
 7. Termina SIEMPRE la respuesta con el formato:
-   - Fuente: fuente1, fuente2, …, incluyendo URLs o rutas de documentos.
-8.Add response ass new lines to file:
-    - /reports/response.md 
+   7.1. Fuente: fuente1, fuente2, …, incluyendo URLs o rutas de documentos.
+8. TERMINA SIEMPRE cada pregunta/respuesta añadiendo (APPEND) al report final response.md
+   usando file_writer_subagent y con estas reglas:
+   8.1. Usa como filename: "response.md". 
+   8.2. Añade un header con timestamp ISO 8601.
+   8.3. Incluye la pregunta original como parte del header.
+   8.4. Añade la respuesta completa debajo del header.
+   8.5. Añade la fuentes al final de la respuesta.
 """

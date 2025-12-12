@@ -45,7 +45,3 @@ Files of interest
 - `reports/response.md`: Appended responses; each entry includes a timestamp and the question.
 - `requirements.txt`: Dependency list.
 
-How responses are saved
-- The file-writer subagent and the explicit end-of-run save both append to `reports/response.md`.
-- Each appended entry begins with a Markdown header containing a UTC timestamp and, if available, the question.
-
