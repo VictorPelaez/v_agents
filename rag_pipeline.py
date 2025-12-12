@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import os
-from v_agents.config import OPENAI_API_KEY
+from config import OPENAI_API_KEY
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_aws import BedrockEmbeddings

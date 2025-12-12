@@ -1,115 +1,172 @@
 # deep agent
 import os
 from rag_pipeline import retrieve_context, get_vector_index
+from evaluation import print_subagent_tasks
 from config import TAVILY_API_KEY, OPENAI_API_KEY
 from tavily import TavilyClient # langchain.tools import DuckDuckGoSearchRun
 from deepagents import create_deep_agent
 from langchain.chat_models import init_chat_model
 from langchain.tools import tool
+from deepagents.backends import FilesystemBackend
 
+from prompts import (
+    RESEARCH_INSTRUCTIONS,
+    RETRIEVAL_INSTRUCTIONS,
+    WRITE_INSTRUCTIONS,
+    MAIN_SYSTEM_PROMPT,
+)
 
+# ============================
+# ENVIRONMENT
+# ============================
 os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
 
+# ============================
+# MAIN AGENT FUNCTION
+# ============================
 def agent_invoke(question, index=None):
-    model_simple = init_chat_model("gpt-4o", temperature=0.0, max_tokens=500)
-    model_advanced = init_chat_model("gpt-5.1", temperature=0.0, max_tokens=500)
+    model_subagent = init_chat_model(
+        model="gpt-4o",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=500
+    )
 
+    model_main = init_chat_model(
+        model="gpt-5.1",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=500
+    )
+
+    # ------------------------------------
     # Web search tool
+    # ------------------------------------
     @tool
     def internet_search_tool(query: str, max_results: int = 2,
-                            topic: str = "finance",
-                            include_raw_content: bool = False):
-        """Realiza una búsqueda en internet para obtener datos financieros."""
-        return tavily_client.search(query, max_results=max_results,
-                                    include_raw_content=include_raw_content,
-                                    topic=topic)
+                             topic: str = "finance",
+                             include_raw_content: bool = False):
+        """Web search tool using Tavily API"""
+        return tavily_client.search(
+            query,
+            max_results=max_results,
+            include_raw_content=include_raw_content,
+            topic=topic
+        )
 
-    # Retrieval tool
+    # ------------------------------------
+    # Vector store retrieval tool
+    # ------------------------------------
     @tool
     def retrieve_context_tool(query: str):
-        """Recupera información del vector store (estados financieros)."""
+        """Vector store retrieval tool"""
         index = get_vector_index()
-        serialized, retrieved_docs, ref_metadata = retrieve_context(query, index)
+        serialized, retrieved_docs, ref_metadata = retrieve_context(query,
+                                                                    index)
+
         if not retrieved_docs:
-            return {"response": "No hay datos en el vector store.", "docs": [], "metadata": ref_metadata, "found": False} 
-        return {"response": serialized,
-                "docs": [{"content": doc.page_content, 
-                          "source": doc.metadata.get("source", "")} for doc in retrieved_docs],
+            return {
+                "response": "Non data in vector store.",
+                "docs": [],
                 "metadata": ref_metadata,
-                "found": True}
+                "found": False
+            }
 
-    # Prompts
-    research_instructions = (
-        "Eres un analista experto en finanzas. "
-        "Tu tarea es investigar en internet el BPA (beneficio por acción) de una empresa, "
-        "o en su defecto, su número de acciones y beneficio neto. "
-        "Usa herramientas de búsqueda online para obtener información precisa y actualizada. "
-        "Luego redacta un informe claro y conciso con los datos encontrados junto con las fuentes consultadas. "
-        "No preguntar si necesitas más información, simplemente realiza la búsqueda y proporciona los resultados."
-    )
+        return {
+            "response": serialized,
+            "docs": [
+                {
+                    "content": doc.page_content,
+                    "source": doc.metadata.get("source", "")
+                } for doc in retrieved_docs
+            ],
+            "metadata": ref_metadata,
+            "found": True
+        }
 
-    retrieval_instructions = (
-        "Actúas como un sistema RAG ESTRICTO de información financiera.\n"
-        "REGLAS OBLIGATORIAS:\n"
-        "1. Solo puedes responder usando EXACTAMENTE la información que venga en los documentos recuperados.\n"
-        "2. Si los documentos pertenecen a una empresa distinta a la preguntada (por ejemplo BBVA vs Santander), "
-        "debes responder: 'No hay datos en el vector store para esa empresa'.\n"
-        "3. Está prohibido deducir, inferir o completar con conocimiento del modelo.\n"
-        "4. Si falta información, debes decirlo literalmente.\n"
-        "5. No puedes mezclar datos de diferentes bancos.\n"
-        "6. Nunca uses datos de internet; eso es tarea del research-agent.\n"
-    )
-
-    # ----------------------------
+    # ------------------------------------
+    # File writer tool
+    # ------------------------------------
+    @tool
+    def write_response_to_file(response: str,
+                               filename: str = "response.md",
+                               question: str | None = None):
+        """
+        Guarda la respuesta en /reports para persistencia (append).
+        Añade un header con timestamp y la pregunta (si se proporciona).
+        """
+        try:
+            # Construir ruta completa
+            reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            filepath = os.path.join(reports_dir, filename)
+            from datetime import datetime, timezone
+            timestamp = datetime.now(timezone.utc).isoformat()
+            qpart = f"**Question:** {question}\n\n" if question else ""
+            header = "## " + timestamp + "\n\n" + qpart + "---\n\n"
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(header)
+                f.write(response)
+                f.write("\n\n")
+            return f"Response successfully appended to {filepath}"
+        except Exception as e:
+            return f"Error saving file: {str(e)}"
+    # ------------------------------------
     # Sub-agentes
-    # ----------------------------
+    # ------------------------------------
     research_subagent = {
         "name": "research-agent",
-        "description": "Busca información financiera en internet.",
-        "system_prompt": research_instructions,
+        "description": ("""Conducts in-depth research using multiple web
+                        searches to collect information.
+                        Use when the answer cannot be resolved
+                        from internal documents"""),
+        "system_prompt": RESEARCH_INSTRUCTIONS,
         "tools": [internet_search_tool],
-        "model": model_simple
+        "model": model_subagent
     }
 
     retrieval_subagent = {
         "name": "retrieval-agent",
-        "description": "Recupera datos del vector store.",
-        "system_prompt": retrieval_instructions,
+        "description": ("""Extracts relevant information from the vector
+                        database using semantic search.
+                        Use when the required knowledge should come from
+                        indexed internal documents"""),
+        "system_prompt": RETRIEVAL_INSTRUCTIONS,
         "tools": [retrieve_context_tool],
-        "model": model_simple
+        "model": model_subagent
     }
 
-    # ----------------------------
-    # Crear Deep Agent
-    # ----------------------------
+    file_writer_subagent = {
+        "name": "file-writer",
+        "description": "Writes the final response to a persistent file",
+        "system_prompt": WRITE_INSTRUCTIONS,
+        "tools": [write_response_to_file],
+        "model": model_subagent
+    }
+    # ------------------------------------
+    # Deep Agent
+    # ------------------------------------
+    reports_dir = os.path.join(os.path.dirname(__file__), "reports")
     agent = create_deep_agent(
-        model=model_advanced,  # 
-        subagents=[retrieval_subagent, research_subagent],
-        system_prompt=(
-            "Responde de froma concisa a las preguntas financieras, "
-            "delegando las tareas a los subagentes según corresponda. "
-            "Primero intenta obtener la información con retrieval-agent "
-            "usando los datos internos. Primero verifica el retrieval-agent. "
-            "Si devuelve datos, ÚNICAMENTE usa eso y no llames a ningún otro subagente. "
-            "Nunca inventes datos ni uses internet si hay información interna."
-            "Si retrieval-agent no devuelve suficiente información "
-            "(o devuelve vacío), "
-            "entonces delega la tarea a research-agent para buscar en internet"
-            "No termines pidiendo más información al usuario.  "
-            "No pongas simbolos markdown, ni iconos en tus respuestas. "
-            "Simplemente delega y responde con las fuentes consultadas." 
-            "Termina siempre la respuesta con - Fuente: fuente1, fuente2 "
-            "y los enlaces a los documentos o url"
-        ))
+        model=model_main,
+        subagents=[retrieval_subagent,
+                   research_subagent,
+                   file_writer_subagent],
+        system_prompt=MAIN_SYSTEM_PROMPT,
+        backend=FilesystemBackend(root_dir=reports_dir),
+    )
 
     result = agent.invoke({
         "messages": [{"role": "user", "content": question}]
-        })
+    })
 
-    # Extraer respuesta y referencias
+    # ------------------------------------
+    # Extraer respuesta
+    # ------------------------------------
     answer_text = ""
     refs = []
     print("\n\n", len(result["messages"]))
@@ -122,18 +179,33 @@ def agent_invoke(question, index=None):
                 answer_text = content["response"]
         elif "AIMessage" in str(type(m)) and content.strip():
             answer_text = content
-
-    # print subagent details
-    for m in result["messages"]:
-        # Identificar ToolMessage
-        if "ToolMessage" in str(type(m)):
-            print("Contenido completo:", m.content[:200], "...")  # preview
-            # Buscar el tool_call asociado
-            for t in result["messages"]:
-                if hasattr(t, "tool_calls"):
-                    for call in t.tool_calls:
-                        if call["id"] == m.tool_call_id:
-                            print("Sub-agente:", call["args"].get("subagent_type"))
-                            print("Descripción de la task:", call["args"].get("description"))
-                            print("\n")  
+    print_subagent_tasks(result)
+    
+    # Save response to file (append, do not overwrite) with question header
+    if answer_text:
+        reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        filepath = os.path.join(reports_dir, "response.md")
+        from datetime import datetime, timezone
+        timestamp = datetime.now(timezone.utc).isoformat()
+        qpart = f"**Question:** {question}\n\n" if question else ""
+        header = "## " + timestamp + "\n\n" + qpart + "---\n\n"
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(header)
+            f.write(answer_text)
+            f.write("\n\n")
+        print(f"Response appended to {filepath}")
+    
     return answer_text, refs
+
+
+# ============================
+# Test
+# ============================
+if __name__ == "__main__":
+    resp, refs = agent_invoke(
+        # "¿Cuál sería la solvencia CET de BBVA en junio 2025?"
+        "¿Cuál sería el beneficio de BBVA en junio 2025?"
+    )
+    print("\nRESPUESTA:\n", resp)
+    print("\nREFERENCIAS:\n", refs)

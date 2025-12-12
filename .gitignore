@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 # venv virtual environment
 myenv/
-config.
+config.py
 vector_index/
 
 # C extensions

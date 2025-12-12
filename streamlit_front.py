@@ -2,7 +2,8 @@
 # .\myenv\Scripts\activate
 # streamlit run streamlit_front.py
 import streamlit as st
-from rag_pipeline import ingestion_workflow_pdf, rag_response, get_vector_index, list_sources_from_vector_index
+from rag_pipeline import (ingestion_workflow_pdf,
+                          get_vector_index, list_sources_from_vector_index)
 from deep_agent import agent_invoke
 
 # -----------------------------
