@@ -6,9 +6,9 @@ from tavily import TavilyClient
 from deepagents import create_deep_agent
 from langchain.chat_models import init_chat_model
 from langchain.tools import tool
-from deepagents.backends import FilesystemBackend
 
-from rag_pipeline import retrieve_context, get_vector_index
+from rag_pipeline import (retrieve_context, get_vector_index,
+                          query_reports_md)
 from evaluation import print_subagent_tasks
 from config import TAVILY_API_KEY, OPENAI_API_KEY
 from prompts import (
@@ -30,7 +30,7 @@ tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 # MAIN AGENT FUNCTION
 # =====================================================
 def agent_invoke(question, index=None):
-    """Runs the deep agent with HITL interrupts."""
+    """Runs the deep agent."""
 
     # -------------------------------
     # Models
@@ -45,6 +45,11 @@ def agent_invoke(question, index=None):
     # -------------------------------
     # Tools
     # -------------------------------
+    @tool
+    def local_cache_tool(query: str):
+        """Tool wrapper for semantic search in response.md"""
+        return query_reports_md(query)
+
     @tool
     def internet_search_tool(
         query: str,
@@ -92,6 +97,15 @@ def agent_invoke(question, index=None):
     # -------------------------------
     # Sub-agents
     # -------------------------------
+    local_cache_subagent = {
+        "name": "local-cache-agent",
+        "description": ("""First checks response.md using semantic search
+                        embeddings before other subagents."""),
+        "system_prompt": ("""You are a local cache agent that
+                          responds only using response.md file content."""),
+        "tools": [local_cache_tool],
+        "model": model_subagent,
+    }
     research_subagent = {
         "name": "research-agent",
         "description": (
@@ -117,15 +131,16 @@ def agent_invoke(question, index=None):
     # -------------------------------
     # Deep Agent
     # -------------------------------
-    memories_dir = os.path.join(os.path.dirname(__file__), "memories")
+    # memories_dir = os.path.join(os.path.dirname(__file__), "memories")
     agent = create_deep_agent(
         model=model_main,
         subagents=[
+            local_cache_subagent,
             retrieval_subagent,
             research_subagent
         ],
         system_prompt=MAIN_SYSTEM_PROMPT,
-        backend=FilesystemBackend(root_dir=memories_dir),
+        # backend=FilesystemBackend(root_dir=memories_dir),
     )
 
     # -------------------------------

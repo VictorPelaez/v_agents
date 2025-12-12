@@ -12,6 +12,51 @@ from langchain_community.vectorstores.faiss import FAISS
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 
+def load_reports_chunks(filepath):
+    """Load and split reports.md into chunks."""
+    if not os.path.exists(filepath):
+        print(f"{filepath} does not exist.")
+        return []
+    with open(filepath, "r", encoding="utf-8") as f:
+        content = f.read()
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", " ", ""],
+        chunk_size=500,
+        chunk_overlap=50
+    )
+    return splitter.split_text(content)
+
+
+def create_reports_vector_store(chunks):
+    """Create in-memory FAISS vector store using Titan embeddings."""
+    embeddings = BedrockEmbeddings(
+        credentials_profile_name="default",
+        model_id="amazon.titan-embed-text-v2:0"
+    )
+    return FAISS.from_texts(chunks, embeddings)
+
+
+def query_reports_md(query, filename="response.md"):
+    """Query reports.md semantically and return top chunk if found."""
+    reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+    filepath = os.path.join(reports_dir, filename)
+    chunks = load_reports_chunks(filepath)
+    if not chunks:
+        print("No chunks found in reports.md")
+        return {"response": None, "found": False, "docs": []}
+    vector_store = create_reports_vector_store(chunks)
+    retrieved_docs = vector_store.similarity_search(query, k=1)
+    if not retrieved_docs:
+        print("No relevant documents found in reports.md")
+        return {"response": None, "found": False, "docs": []}
+    best_doc = retrieved_docs[0]
+    return {
+        "response": f"Found in response.md:\n{best_doc.page_content}",
+        "found": True,
+        "docs": [{"content": best_doc.page_content, "source": "response.md"}]
+    }
+
+
 def ingestion_workflow_pdf(doc_url):
     """
     Load a PDF, split into chunks preserving metadata (source & page), 

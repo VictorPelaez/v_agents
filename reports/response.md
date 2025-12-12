@@ -23,17 +23,30 @@ Moneda: euros.
 
 Fuente: Informe 2T 2025 de BBVA, pág. 13 – https://accionistaseinversores.bbva.com/wp-content/uploads/2025/07/Informe-2T-2025_esp.pdf
 
-## 2025-12-12T18:10:28.428893+00:00
 
-**Question:** ¿Cuál sería la solvencia CET1 de BBVA en junio 2023?
+## 2025-12-12T19:16:49.878389+00:00
+
+**Question:** ¿Cuál fue el beneficio de Sabadell en 2S 2025?
 
 ---
 
-No dispongo, ni en la base interna ni en la búsqueda externa, del dato numérico concreto de la ratio de solvencia CET1 de BBVA a junio de 2023 (ni en versión fully loaded ni phased‑in) procedente de los informes oficiales del banco.
+Los últimos datos publicados hacen referencia solo al primer semestre de 2025, en el que Banco Sabadell registró un beneficio neto de 975 millones de euros, un 23,3% más que en el mismo periodo del año anterior.
 
-Para obtener el dato exacto, es necesario acudir directamente a:
-- La web de BBVA, sección Accionistas e Inversores / Información financiera / Resultados 2T23 o Informe financiero 1S23.
-- Los comunicados de resultados y presentaciones para analistas del 2T23, donde se recoge normalmente la ratio CET1 a 30/06/2023.
+Fuente: Yahoo Finanzas, https://es.finance.yahoo.com/noticias/bancos-ibex-35-examen-resultados-041000718.html
 
-Fuente: retrieval-agent (sin resultados útiles), research-agent (sin datos numéricos localizables en los informes 2T23/1S23 publicados en web pública).
+## 2025-12-12T19:20:54.863339+00:00
+
+**Question:** ¿Cuál sería la solvencia CET1 del Santander en junio 2025?
+
+---
+
+Con la información disponible, la mejor estimación es que la solvencia CET1 fully loaded de Banco Santander en torno a junio de 2025 se sitúe alrededor del 13%, en la parte alta de su rango objetivo de 12%-13%.
+
+En concreto:
+- Q1 2025: CET1 ≈ 12,9%, en el extremo superior del rango operativo 12%-13%.  
+- Q2 2025: CET1 ≈ 13%, manteniéndose en el extremo superior del rango 12%-13%.  
+
+Por tanto, para junio de 2025 la referencia razonable es una CET1 fully loaded en torno al 13%.
+
+Fuente: https://finance.yahoo.com/news/banco-santander-sa-san-q1-070246613.html/, https://finance.yahoo.com/quote/SAN/earnings/SAN-Q2-2025-earnings_call-311428.html/
 
