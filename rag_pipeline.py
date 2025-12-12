@@ -145,3 +145,31 @@ def list_sources_from_vector_index(index_path="vector_index"):
             unique_sources.add(source)
 
     return list(unique_sources)
+    """
+    Load a FAISS vector index and return unique sources of the documents
+    along with page information if available.
+
+    Args:
+        index_path (str): Path to the FAISS index folder.
+
+    Returns:
+        sources_info (list of dict): [{'source': ..., 'page': ...}, ...]
+    """
+    embeddings = BedrockEmbeddings(
+        credentials_profile_name='default',
+        model_id='amazon.titan-embed-text-v2:0')
+    # Load the FAISS vector store
+    vector_store = FAISS.load_local(
+        index_path,
+        embeddings,
+        allow_dangerous_deserialization=True)
+    docs = list(vector_store.docstore._dict.values())
+
+    # Collect unique sources
+    unique_sources = set()
+    for doc in docs:
+        source = doc.metadata.get("source")
+        if source:
+            unique_sources.add(source)
+
+    return list(unique_sources)

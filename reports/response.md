@@ -1,48 +1,39 @@
-## 2025-12-12T07:53:38.248996+00:00
+## 2025-12-12T17:56:29.987722+00:00
 
-**Question:** ¿Cuál sería la solvencia CET de BBVA en junio 2025?
-
----
-
-La solvencia CET1 de BBVA a junio de 2025 (30/06/2025) es del 13,34%. 
-
-Este nivel supone un colchón amplio sobre el requerimiento regulatorio de CET1 del 9,12% a esa fecha y está por encima del rango objetivo de gestión comunicado por el Grupo (11,5%-12,0%). La documentación consultada no especifica si el ratio está calculado en base fully loaded o phased-in.
-
-Fuente: Informe 2T 2025 de BBVA, pág. 6, https://accionistaseinversores.bbva.com/wp-content/uploads/2025/07/Informe-2T-2025_esp.pdf
-
-## 2025-12-12T07:57:45.276478+00:00
-
-**Question:** ¿Cuál sería la solvencia CET de BBVA en junio 2025?
+**Question:** ¿Cuál sería la solvencia CET1 de BBVA en junio 2025?
 
 ---
 
-La solvencia CET1 de BBVA a 30 de junio de 2025 es del 13,34%. Este nivel está claramente por encima del requerimiento de CET1 del Grupo (9,12%) y también por encima del rango objetivo interno de gestión (11,5%–12,0%), lo que refleja una posición de capital holgada frente a las exigencias regulatorias y los objetivos del propio banco.
+La ratio de solvencia CET1 de BBVA a 30 de junio de 2025 se sitúa en el *13,34%*.
 
-Fuente: Informe 2T 2025 de BBVA, pág. 6, https://accionistaseinversores.bbva.com/wp-content/uploads/2025/07/Informe-2T-2025_esp.pdf
+Esta cifra supone un colchón holgado sobre el requerimiento regulatorio de CET1 del Grupo en esa fecha (9,12%) y se sitúa por encima del rango de gestión objetivo de BBVA (11,5%–12,0% de CET1).  
 
-## 2025-12-12T08:02:00.550686+00:00
+Fuente: Informe 2T 2025 de BBVA, página 6: https://accionistaseinversores.bbva.com/wp-content/uploads/2025/07/Informe-2T-2025_esp.pdf
 
-**Question:** ¿Cuál sería el beneficio de BBVA en junio 2025?
+## 2025-12-12T17:57:57.318049+00:00
 
----
-
-El beneficio atribuido de BBVA acumulado a cierre de junio de 2025 fue de 5.447 millones de euros, lo que supone un crecimiento del 9,1% interanual (31,4% a tipos de cambio constantes). Este resultado se apoya en el buen comportamiento de los ingresos recurrentes del negocio bancario y se recoge en el informe de resultados del segundo trimestre de 2025, publicado en julio de 2025.
-
-- Fuente: Informe de resultados 2T 2025 de BBVA (julio 2025), https://accionistaseinversores.bbva.com/wp-content/uploads/2025/07/Informe-2T-2025_esp.pdf
-
-## 2025-12-12T08:04:07.553467+00:00
+**Question:** ¿Cuál es el beneficio de BBVA en junio 2025?
 
 ---
 
-Beneficio de Atresmedia en 2024: 63,835 millones de euros (beneficio del ejercicio).
+El beneficio de BBVA a cierre de junio de 2025 (resultado acumulado del primer semestre de 2025) es de 5.447 millones de euros.
 
-## 2025-12-12T08:04:11.274532+00:00
+Periodo exacto: primer semestre de 2025, con datos a 30 de junio de 2025.  
+Moneda: euros.  
 
-**Question:** cual es el beneficio de atresmedia en 2024?
+Fuente: Informe 2T 2025 de BBVA, pág. 13 – https://accionistaseinversores.bbva.com/wp-content/uploads/2025/07/Informe-2T-2025_esp.pdf
+
+## 2025-12-12T18:10:28.428893+00:00
+
+**Question:** ¿Cuál sería la solvencia CET1 de BBVA en junio 2023?
 
 ---
 
-El beneficio de Atresmedia en 2024 fue de 63,835 millones de euros (beneficio del ejercicio).
+No dispongo, ni en la base interna ni en la búsqueda externa, del dato numérico concreto de la ratio de solvencia CET1 de BBVA a junio de 2023 (ni en versión fully loaded ni phased‑in) procedente de los informes oficiales del banco.
 
-Fuente: Atresmedia Resultados 1S25 CNMV, página 3, https://www.atresmediacorporacion.com/documents/2025/07/23/07F36852-3550-47A5-8571-8DF591543756/atresmedia_resultados_1s25cnmv.pdf
+Para obtener el dato exacto, es necesario acudir directamente a:
+- La web de BBVA, sección Accionistas e Inversores / Información financiera / Resultados 2T23 o Informe financiero 1S23.
+- Los comunicados de resultados y presentaciones para analistas del 2T23, donde se recoge normalmente la ratio CET1 a 30/06/2023.
+
+Fuente: retrieval-agent (sin resultados útiles), research-agent (sin datos numéricos localizables en los informes 2T23/1S23 publicados en web pública).
 
