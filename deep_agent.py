@@ -24,13 +24,18 @@ os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+_agent_instance = None
 
 
 # =====================================================
 # MAIN AGENT FUNCTION
 # =====================================================
-def agent_invoke(question, index=None):
-    """Runs the deep agent."""
+def get_agent():
+    """Get deep agent."""
+
+    global _agent_instance
+    if _agent_instance is not None:
+        return _agent_instance
 
     # -------------------------------
     # Models
@@ -142,59 +147,27 @@ def agent_invoke(question, index=None):
         system_prompt=MAIN_SYSTEM_PROMPT,
         # backend=FilesystemBackend(root_dir=memories_dir),
     )
+    _agent_instance = agent
+    return agent
 
-    # -------------------------------
-    # Agent Invocation
-    # -------------------------------
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": question}]}
-    )
 
-    # =====================================================
-    # Extract Final Answer (subagent output)
-    # =====================================================
-    answer_text = ""
-    refs = []
+# -------------------------------
+# Agent Invocation
+# -------------------------------
+def agent_invoke(messages: list):
+    """
+    messages = [
+        {"role": "user", "content": "..."},
+        {"role": "assistant", "content": "..."},
+    ]
+    """
 
-    # Search through all messages for answer text
-    messages = result.get("messages", [])
-    
-    for msg in messages:
-        content = getattr(msg, "content", "")
-        # Try to parse string content as JSON (ToolMessage with dict response)
-        if isinstance(content, str) and content:
-            # Check if it looks like JSON
-            if content.strip().startswith("{"):
-                try:
-                    parsed = json.loads(content)
-                    if isinstance(parsed, dict):
-                        if "response" in parsed and parsed.get("response"):
-                            answer_text = parsed.get("response")
-                        if "docs" in parsed:
-                            refs.extend(parsed.get("docs", []))
-                        if answer_text:
-                            continue
-                except Exception:
-                    pass
-            else:
-                # Plain text content
-                if content.strip() and len(content.strip()) > 10:
-                    answer_text = content
-        
-        # Direct dict content
-        elif isinstance(content, dict):
-            if "response" in content and content.get("response"):
-                answer_text = content.get("response")
-            if "docs" in content:
-                refs.extend(content.get("docs", []))
+    agent = get_agent()
 
-    # Debug: show which subagents ran
+    result = agent.invoke({"messages": messages})
+
     print_subagent_tasks(result)
-    return {
-        "answer": answer_text,
-        "refs": refs,
-    }
-
+    return result
 
 # =====================================================
 # Manual Test

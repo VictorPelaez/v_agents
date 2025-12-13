@@ -50,3 +50,15 @@ Por tanto, para junio de 2025 la referencia razonable es una CET1 fully loaded e
 
 Fuente: https://finance.yahoo.com/news/banco-santander-sa-san-q1-070246613.html/, https://finance.yahoo.com/quote/SAN/earnings/SAN-Q2-2025-earnings_call-311428.html/
 
+## 2025-12-13T07:23:30.486526+00:00
+
+**Question:** dirigiéndote a mi por mi nombre, responde a ¿Cuál fue el beneficio de Caixabank en 2S 2025? 
+
+---
+
+Víctor, no he encontrado una cifra oficial publicada específicamente como “beneficio de CaixaBank en el segundo semestre de 2025 (2S 2025)”.
+
+Lo que sí se recoge en las fuentes consultadas es que CaixaBank obtuvo un beneficio neto de 4.397 millones de euros entre enero y septiembre de 2025 (9M 2025), un 3,5% más que en el mismo periodo del año anterior. Es decir, la información pública disponible llega, como máximo, hasta los primeros nueve meses de 2025, sin un desglose oficial separado para el segundo semestre completo.
+
+Fuente: Yahoo Finanzas – noticia sobre resultados de CaixaBank a septiembre de 2025: https://es.finance.yahoo.com/noticias/banco-ibex-35-potencial-doble-094000463.html
+

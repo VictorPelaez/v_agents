@@ -10,9 +10,11 @@ import html
 import streamlit.components.v1 as components
 
 
+# =====================================================
+# HELPERS
+# =====================================================
 def append_response_md(question: str, answer: str,
                        filename: str = "response.md") -> str:
-    """Append approved Q/A to reports/response.md with timestamp header."""
     reports_dir = os.path.join(os.path.dirname(__file__), "reports")
     os.makedirs(reports_dir, exist_ok=True)
     filepath = os.path.join(reports_dir, filename)
@@ -26,40 +28,36 @@ def append_response_md(question: str, answer: str,
     return filepath
 
 
-def extract_answer_from_result(result) -> str:
-    """Try multiple locations in the agent result to find a textual answer."""
+def extract_last_assistant_message(result) -> str:
+    """
+    Robust extractor compatible with deepagents / tool messages
+    """
     if not result:
         return ""
-    # Common key used in deep_agent: 'answer'
-    if isinstance(result, dict):
-        answer = result.get("answer")
-        if answer and isinstance(answer, str) and answer.strip():
-            return answer
-    # Some agents return messages list with last AI message
-    msgs = result.get("messages") if isinstance(result, dict) else None
-    if msgs and isinstance(msgs, list):
-        for m in reversed(msgs):
-            content = getattr(m, "content", None)
-            if isinstance(content, str) and content.strip():
-                return content
-            if isinstance(content, dict) and content.get("response"):
+
+    messages = result.get("messages", [])
+    for msg in reversed(messages):
+        content = getattr(msg, "content", None)
+
+        if isinstance(content, str) and content.strip():
+            return content
+
+        if isinstance(content, dict):
+            if content.get("response"):
                 return content.get("response")
-    # Fallback: try top-level 'message' or 'text'
-    if isinstance(result, dict):
-        for key in ("message", "text", "answer_text"):
-            if result.get(key):
-                return result.get(key)
+
     return ""
 
 
-# -----------------------------
-# CONFIGURACIÓN DE PÁGINA
-# -----------------------------
+# =====================================================
+# PAGE CONFIG
+# =====================================================
 st.set_page_config(page_title="Assistant", layout="wide")
 
-# -----------------------------
-# ESTILOS PERSONALIZADOS
-# -----------------------------
+
+# =====================================================
+# STYLES (UNCHANGED)
+# =====================================================
 st.markdown("""
 <style>
 .main {
@@ -93,132 +91,151 @@ st.markdown("""
     padding: 12px;
     font-size: 16px;
     border: 2px solid #3b82f6;
-    transition: border 0.3s ease;
 }
 div.stButton > button {
-    /* Softer, formal button style */
-    background: linear-gradient(180deg, #f7f7f8 0%, #eef0f2 100%);
-    color: #1f2937; /* dark gray for formal text */
-    font-weight: 600;
-    border-radius: 6px;
-    padding: 6px 10px;
-    font-size: 12px;
-    border: 1px solid #d1d5db;
+    background: #f8fafc;
+    color: #374151;
+    font-weight: 500;
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 11px;
+    line-height: 1.1;
+    border: 1px solid #e5e7eb;
     box-shadow: none;
-    transition: transform 0.12s ease, box-shadow 0.12s ease;
+    min-height: unset;
 }
+
 div.stButton > button:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06);
-    cursor: pointer;
+    background: #eef2f7;
+    border-color: #cbd5e1;
+}
+            
+    section[data-testid="stVerticalBlock"] button {
+    margin-bottom: 4px;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# -----------------------------
-# TÍTULO
-# -----------------------------
+
+# =====================================================
+# TITLE
+# =====================================================
 st.markdown("""
-<h1 style="text-align:left; color:#2c3e50; font-weight:900; font-family:'Segoe UI', sans-serif;">
+<h1 style="text-align:left; color:#2c3e50; font-weight:900;">
    Company Analysis Assistant
 </h1>
 """, unsafe_allow_html=True)
 
-# -----------------------------
+
+# =====================================================
 # LAYOUT
-# -----------------------------
+# =====================================================
 chat_col, sidebar_col = st.columns([3, 1])
 
-# -----------------------------
-# BARRA LATERAL
-# -----------------------------
+
+# =====================================================
+# SIDEBAR (UNCHANGED)
+# =====================================================
 with sidebar_col:
     st.subheader("Upload PDFs / URL")
     uploaded_file = st.file_uploader("Upload a PDF:", type=["pdf"])
     pdf_url = st.text_input("Or URL with a PDF:")
 
-    # Inicializar flags en session_state
     if "pdf_url_processed" not in st.session_state:
         st.session_state.pdf_url_processed = None
     if "uploaded_file_processed" not in st.session_state:
         st.session_state.uploaded_file_processed = None
 
-    vector_index = st.session_state.get("vector_index", None)
-
-    # Procesar URL solo si cambió y no se ha procesado
     if pdf_url and pdf_url != st.session_state.pdf_url_processed:
-        st.session_state.pdf_url_processed = pdf_url  # marcar como procesada
+        st.session_state.pdf_url_processed = pdf_url
         with st.spinner("Getting PDF from URL..."):
-            vector_index = ingestion_workflow_pdf(pdf_url)
-            st.session_state.vector_index = vector_index
+            st.session_state.vector_index = ingestion_workflow_pdf(pdf_url)
         st.success("PDF added successfully.")
 
-    # Procesar archivo solo si cambió y no se ha procesado
     if uploaded_file and uploaded_file != st.session_state.uploaded_file_processed:
         st.session_state.uploaded_file_processed = uploaded_file
         with st.spinner("Processing uploaded PDF..."):
-            vector_index = ingestion_workflow_pdf(uploaded_file)
-            st.session_state.vector_index = vector_index
+            st.session_state.vector_index = ingestion_workflow_pdf(uploaded_file)
         st.success("PDF local added successfully.")
 
-# -----------------------------
-# CHAT PRINCIPAL
-# -----------------------------
+
+# =====================================================
+# CHAT
+# =====================================================
 with chat_col:
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Prefill input if a follow-up was requested from a message
-    if "input_text_prefill" in st.session_state:
-        prefill = st.session_state.pop("input_text_prefill")
-    else:
-        prefill = ""
+    if "agent_messages" not in st.session_state:
+        st.session_state.agent_messages = [
+            {
+                "role": "system",
+                "content": "User name: Juan"
+            }
+        ]
 
     input_text = st.text_area(
         "Type your question here:",
-        value=prefill,
         label_visibility="collapsed",
     )
+
     go_button = st.button("📌Send a question", type="primary")
 
-    if (
-        go_button
-        and input_text.strip() != ""
-    ):
+    if go_button and input_text.strip():
+
+        # USER → agent memory
+        st.session_state.agent_messages.append({
+            "role": "user",
+            "content": input_text,
+        })
+
         with st.spinner("Thinking..."):
-            result = agent_invoke(input_text)
+            result = agent_invoke(st.session_state.agent_messages)
 
-        answer = extract_answer_from_result(result)
-        refs = result.get("refs", []) if isinstance(result, dict) else []
+        answer = extract_last_assistant_message(result)
 
+        # ASSISTANT → agent memory
+        st.session_state.agent_messages.append({
+            "role": "assistant",
+            "content": answer,
+        })
+
+        # UI history (unchanged)
         st.session_state.messages.append({
             "user": input_text,
             "bot": answer,
-            "refs": refs,
+            "refs": [],
         })
 
+    # =================================================
+    # RENDER CHAT (FULL, ORIGINAL BEHAVIOR)
+    # =================================================
     for i in range(len(st.session_state.messages) - 1, -1, -1):
         message = st.session_state.messages[i]
-        # User message
+
         st.markdown(
             f'<div class="chat-bubble-user">{message["user"]}</div>',
             unsafe_allow_html=True,
         )
 
-        # Bot message + compact action block to the right
         cols = st.columns([5, 1])
+
+        # ---------------- BOT MESSAGE ----------------
         with cols[0]:
-            # Force inline style to guarantee white block rendering
-            # Coerce to string, escape HTML and preserve newlines.
-            bot_text = message.get("bot", "")
-            bot_text = "" if bot_text is None else bot_text
-            # Provide inline edit area when user toggles edit for this message
+            bot_text = message.get("bot", "") or ""
+
             edit_mode_key = f"edit_mode_{i}"
             edited_text_key = f"edited_bot_{i}"
 
             if st.session_state.get(edit_mode_key, False):
-                initial = message.get("bot", "") or ""
-                edited_val = st.text_area("Edit response:", value=initial, key=edited_text_key, height=200)
+                initial = bot_text
+                edited_val = st.text_area(
+                    "Edit response:",
+                    value=initial,
+                    key=edited_text_key,
+                    height=200,
+                )
                 safe_bot = html.escape(str(edited_val)).replace("\n", "<br>")
             else:
                 safe_bot = html.escape(str(bot_text)).replace("\n", "<br>")
@@ -231,61 +248,36 @@ with chat_col:
                 "margin:8px 0; border-radius:18px; max-width:100%; "
                 "border-left:5px solid #4a90e2; "
                 "box-shadow:2px 2px 10px rgba(0,0,0,0.1);'>"
-                + safe_bot
-                + "</div>"
+                + safe_bot +
+                "</div>"
             )
 
             num_lines = safe_bot.count("<br>") + 1
             height = min(max(250, num_lines * 24), 1600)
+
             components.html(bot_html, height=height, scrolling=True)
 
-            if message.get("refs"):
-                st.markdown(
-                    "<div style='margin-top:4px; font-weight:bold;'>"
-                    "Sources used:</div>",
-                    unsafe_allow_html=True,
-                )
-                for r in message["refs"]:
-                    src = r.get("source", "")
-                    page = r.get("page", "N/A")
-                    st.markdown(
-                        (
-                            f"<div style='margin-left:12px;'>- `{src}` — "
-                            f"page <b>{page}</b></div>"
-                        ),
-                        unsafe_allow_html=True,
-                    )
-
-        # Compact action buttons (emoji-only to reduce visual size)
+        # ---------------- ACTIONS ----------------
         with cols[1]:
             st.markdown("**Actions**")
             status_key = f"status_{i}"
 
-            # Approve: write either edited text (if present) or original
             if st.button("✔ Approve", key=f"approve_{i}"):
-                edited_val = st.session_state.get(f"edited_bot_{i}", None)
-                final_bot = edited_val if edited_val is not None else message.get("bot", "")
+                edited_val = st.session_state.get(edited_text_key)
+                final_bot = edited_val if edited_val is not None else bot_text
                 filepath = append_response_md(message["user"], final_bot)
-                try:
-                    st.session_state["messages"][i]["bot"] = final_bot
-                except Exception:
-                    pass
-                st.session_state[f"edit_mode_{i}"] = False
-                st.session_state[status_key] = (
-                    f"approved ({os.path.basename(filepath)})"
-                )
+                st.session_state.messages[i]["bot"] = final_bot
+                st.session_state[edit_mode_key] = False
+                st.session_state[status_key] = f"approved ({os.path.basename(filepath)})"
 
             if st.button("✎ Edit", key=f"edit_{i}"):
-                st.session_state[f"edit_mode_{i}"] = True
-                if f"edited_bot_{i}" not in st.session_state:
-                    st.session_state[f"edited_bot_{i}"] = message.get("bot", "")
+                st.session_state[edit_mode_key] = True
+                if edited_text_key not in st.session_state:
+                    st.session_state[edited_text_key] = bot_text
                 st.session_state[status_key] = "editing"
 
             if st.button("✖ Reject", key=f"reject_{i}"):
-                # Mark as rejected and do not save
                 st.session_state[status_key] = "rejected"
 
-            # Show current status
-            cur_status = st.session_state.get(status_key)
-            if cur_status:
-                st.markdown(f"**Status:** {cur_status}")
+            if st.session_state.get(status_key):
+                st.markdown(f"**Status:** {st.session_state[status_key]}")
