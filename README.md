@@ -1,13 +1,20 @@
 # v_agents
 
-Lightweight deep-agent toolkit for research and retrieval workflows.
+Lightweight toolkit for building deep-agent workflows for research and retrieval.
+It allows a main agent to coordinate specialized subagents while keeping strict control over data sources.
 
-Features
-- Create and run a main deep agent with subagents for retrieval, web research, and file writing.
-- Saves final answers to `reports/response.md` with a UTC timestamp and the original question.
-- Uses Tavily for web search and a local vector index for retrieval.
+## Features
+- Create and run a main deep agent with subagents for retrieval and web research
+- Main deep agent with specialized subagents (local cache, vector retrieval, web research)
+- Source selection follows a fixed hierarchy: local cache → vector store → web search
+- Semantic search over approved answers stored in `reports/response.md`
+- Vector-based retrieval from local document indexes
+- Web search using Tavily
+- Multi-turn conversation support
+- Approved answers are saved with UTC timestamp and original question
+- Easy integration with a Streamlit chat frontend
 
-Getting started
+## Getting started
 
 Prerequisites
 - Python 3.10+ (project uses virtualenv)
