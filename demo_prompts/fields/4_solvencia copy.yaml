@@ -1,0 +1,34 @@
+version: "1.0"
+field: "Solvencia"
+description: "El ratio de solvencia CET1"
+task: "Extraer el valor concreto del ratio de solvencia CET1 de la empresa {company}"
+
+scope:
+  include:
+    - "Solvencia"
+    - "CET1"
+    - "Ratios de capital"
+  exclude:
+    - ""
+
+rules:
+  table_detection:
+    include_titles:
+      - "Solvencia"
+      - "CET1"
+
+    exclude_titles:
+      - "-"
+
+  exclusions:
+    categories:
+      - "-"
+
+value_expectation:
+  type: "object"
+  description: "El ratio de solvencia CET1"
+  example:
+    value: 14.5
+    currency: "%"
+
+

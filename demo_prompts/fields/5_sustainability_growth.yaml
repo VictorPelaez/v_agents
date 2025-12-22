@@ -1,0 +1,36 @@
+version: "1.0"
+field: "sustainability_growth"
+description: "Importe de negocio canalizado de sostenibilidad."
+task: "Extraer el importe como valor de negocio canalizado de negocio sostenible de la empresa {company}"
+
+scope:
+  include:
+    - "Sostenibilidad"
+  exclude:
+    - ""
+
+rules:
+  table_detection:
+    include_titles:
+      - "Sostenibilidad"
+
+    exclude_titles:
+      - "-"
+
+  exclusions:
+    categories:
+      - "-"
+normalization:
+  unit_multipliers:
+    miles: 1000
+    millones: 1000000
+    thousands: 1000
+    millions: 1000000
+
+value_expectation:
+  type: "object"
+  description: "Importe canalizado de negocio sostenible en millones"
+  example:
+    value: 54.447
+    currency: "Millones EUR"
+

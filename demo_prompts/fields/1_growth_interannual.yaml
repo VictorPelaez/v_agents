@@ -1,0 +1,43 @@
+version: "1.0"
+field: "growth_interannual"
+description: "Evolución interanual de los resultados"
+task: "Extraer la evolución interanual de los resultados de la empresa {company}."
+
+scope:
+  include:
+    - "Cuentas de resultados"
+    - "Evolución de cuentas de resultados"
+    - "Resultado interanual"
+    - "growth interannual"
+  exclude:
+    - ""
+
+rules:
+  table_detection:
+    include_titles:
+      - "Cuentas de resultados"
+      - "Evolución de cuentas de resultados"
+      - "Resultado interanual"
+
+    exclude_titles:
+      - "-"
+
+  exclusions:
+    categories:
+      - "-"
+
+normalization:
+  unit_multipliers:
+    miles: 1000
+    millones: 1000000
+    thousands: 1000
+    millions: 1000000
+
+value_expectation:
+  type: "object"
+  description: "Evolución interanual de los resultados en millones"
+  example:
+    value: 5.447
+    currency: "Millones EUR"
+
+

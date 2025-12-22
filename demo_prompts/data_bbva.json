@@ -1,0 +1,105 @@
+[
+    {
+        "path": "fields\\1_growth_interannual.yaml",
+        "question": "Extraer la evolución interanual de los resultados de la empresa BBVA.",
+        "response": {
+            "field": "growth_interannual",
+            "value": {
+                "currency": "Millones EUR",
+                "value": 5447
+            },
+            "justification": "El Grupo BBVA obtuvo un resultado de 5.447 millones de euros acumulados a cierre de junio de 2025, lo que representa un incremento interanual del 9,1%.",
+            "synonyms_found": [
+                "Evolución interanual de los resultados",
+                "incremento interanual",
+                "resultado acumulado a cierre de junio de 2025"
+            ],
+            "text_source": [
+                {
+                    "chunk_id": "chunk_1",
+                    "chunk_document": "Informe-2T-2025_esp.pdf",
+                    "chunk_page": [
+                        13
+                    ],
+                    "text": "El Grupo BBVA obtuvo un resultado de  5.447 millones de euros  acumulados a cierre de junio de 2025, lo que representa un incremento interanual del 9,1%."
+                }
+            ]
+        },
+        "time_seconds": 6.341321200001403,
+        "tokens_used": 2209
+    },
+    {
+        "path": "fields\\4_solvencia copy.yaml",
+        "question": "Extraer el valor concreto del ratio de solvencia CET1 de la empresa BBVA",
+        "response": {
+            "field": "ratio de solvencia CET1",
+            "value": {
+                "currency": "%",
+                "value": 13.34
+            },
+            "justification": "El ratio CET1 del Grupo BBVA se ha situado en el 13,34% a 30 de junio de 2025, superando el requerimiento regulatorio y el rango objetivo de gestión.",
+            "synonyms_found": [
+                "ratio CET1",
+                "ratio de capital CET1",
+                "ratio de solvencia CET1"
+            ],
+            "text_source": [
+                {
+                    "chunk_id": "1",
+                    "chunk_document": "Informe-2T-2025_esp.pdf",
+                    "chunk_page": [
+                        21
+                    ],
+                    "text": "El ratio CET1 8 del Grupo BBVA se ha situado en el 13,34% a 30 de junio de 2025 , lo que permite mantener un amplio colchón de gestión sobre el requerimiento de CET1 del Grupo a esa fecha (9,12% 9), y situándose asimismo por encima del rango de gestión objetivo del Grupo establecido en el 11,5% - 12,0% de CET1."
+                },
+                {
+                    "chunk_id": "2",
+                    "chunk_document": "Informe-2T-2025_esp.pdf",
+                    "chunk_page": [
+                        6
+                    ],
+                    "text": "El ratio CET12 del Grupo BBVA se ha situado en el 13,34% a 30 de junio de 2025, lo que permite mantener un amplio colchón de gestión sobre el requerimiento de CET1 del Grupo a esa fecha (9,12%3), y situándose asimismo por encima del rango de gestión objetivo del Grupo establecido en el 11,5% - 12,0% de CET1."
+                }
+            ]
+        },
+        "time_seconds": 6.342611799998849,
+        "tokens_used": 2101
+    },
+    {
+        "path": "fields\\5_sustainability_growth.yaml",
+        "question": "Extraer el importe como valor de negocio canalizado de negocio sostenible de la empresa BBVA",
+        "response": {
+            "field": "sustainability_growth",
+            "value": {
+                "currency": "Millones EUR",
+                "value": 63000
+            },
+            "justification": "El informe indica un importe aproximado de 63.000 millones de euros canalizados en negocio sostenible en el primer semestre de 2025, reflejando un crecimiento del 48%.",
+            "synonyms_found": [
+                "canalización de negocio sostenible",
+                "negocio sostenible canalizado",
+                "importes de negocio sostenible canalizado"
+            ],
+            "text_source": [
+                {
+                    "chunk_id": "chunk_1",
+                    "chunk_document": "Informe-2T-2025_esp.pdf",
+                    "chunk_page": [
+                        9
+                    ],
+                    "text": "importe aproximado de 63.000 millones de euros en el primer semestre de 2025, esto supone un 48% de crecimiento."
+                },
+                {
+                    "chunk_id": "chunk_2",
+                    "chunk_document": "Informe-2T-2025_esp.pdf",
+                    "chunk_page": [
+                        9
+                    ],
+                    "text": "La canalización de negocio sostenible en BBVA incluye aspectos relacionados con el cambio climático y el capital natural, así como la promoción y financiación de iniciativas sociales."
+                }
+            ]
+        },
+        "time_seconds": 6.958637899999303,
+        "tokens_used": 1948
+    }
+]

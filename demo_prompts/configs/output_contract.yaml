@@ -1,0 +1,43 @@
+version: "1.0"
+
+output_contract:
+  type: "object"
+
+  required:
+    - field
+    - value
+    - justification
+
+  properties:
+  
+    field:
+      type: "string"
+      description: "Nombre del campo"
+
+    value:
+      nullable: true
+      description: "Valor extraído (estructura dependiente del campo)"
+
+    text_source:
+      type: "array"
+      description: "Evidencia mínima que soporta la extracción"
+      items:
+        type: "object"
+        properties:
+          text:
+            type: "string"
+          chunk_id:
+            type: "string"
+          chunk_page:
+            type: "array"
+            items: { type: "integer" }
+          chunk_document:
+            type: "string"
+
+    synonyms_found:
+      type: "array"
+      items: { type: "string" }
+
+    justification:
+      type: "string"
+      description: "Razonamiento breve basado en evidencia"

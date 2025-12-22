@@ -1,0 +1,32 @@
+version: "1.0"
+type: "extract"
+
+template: |
+
+  {{ base_system_prompt }}
+
+  Campo: {{ field }}
+  Descripción: {{ description }}
+  Objetivo: {{ task }}
+
+  Ámbito permitido:
+  - Incluir:
+
+    {% for i in scope.include %}
+    - {{ i }}
+    {% endfor %}
+
+  - Excluir:
+
+    {% for e in scope.exclude %}
+    - {{ e }}
+    {% endfor %}
+
+  Reglas específicas del campo:  {{ rules | tojson }}
+  El valor esperado debe seguir (orientativo): {{ value_expectation | tojson }}
+
+  Usa obligatoriamente el siguiente contrato de salida:
+  {{ output_contract | tojson }}
+
+  Extrae la información únicamente a partir de los siguientes fragmentos:
+  {{ chunks }}
