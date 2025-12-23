@@ -13,31 +13,25 @@ scope:
     - ""
 
 rules:
+  semantics: # Semantics rules about the field
+    - "Debe ser interanual"
+
   table_detection:
     include_titles:
       - "Cuentas de resultados"
       - "Evolución de cuentas de resultados"
       - "Resultado interanual"
 
-    exclude_titles:
-      - "-"
-
-  exclusions:
-    categories:
-      - "-"
-
-normalization:
-  unit_multipliers:
-    miles: 1000
-    millones: 1000000
-    thousands: 1000
-    millions: 1000000
-
 value_expectation:
-  type: "object"
-  description: "Evolución interanual de los resultados en millones"
+  type: "number"
+  description: "Evolución interanual de los resultados"
   example:
     value: 5.447
     currency: "Millones EUR"
+
+normalization:
+  enabled: true
+  target_unit: "millones"
+  currency: "EUR"
 
 

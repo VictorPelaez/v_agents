@@ -11,19 +11,26 @@ template: |
 
   Ámbito permitido:
   - Incluir:
-
     {% for i in scope.include %}
     - {{ i }}
     {% endfor %}
 
   - Excluir:
-
     {% for e in scope.exclude %}
     - {{ e }}
     {% endfor %}
 
-  Reglas específicas del campo:  {{ rules | tojson }}
-  El valor esperado debe seguir (orientativo): {{ value_expectation | tojson }}
+  {% if normalization and normalization.enabled %}
+  Normalización requerida:
+  - Unidad objetivo: {{ normalization.target_unit }}
+  - Moneda: {{ normalization.currency }}
+  {% endif %}
+
+  Reglas específicas del campo:  
+  {{ rules | tojson }}
+  
+  El valor esperado debe seguir (orientativo): 
+  {{ value_expectation | tojson }}
 
   Usa obligatoriamente el siguiente contrato de salida:
   {{ output_contract | tojson }}

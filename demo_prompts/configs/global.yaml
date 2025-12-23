@@ -23,3 +23,17 @@ Reglas globales: |
 
   Responde siempre en {{ language }}.
   Formato de salida obligatorio: {{ output_format }}.
+
+# Capacidades disponibles (NO obligatorias)
+normalization_capabilities:
+  numeric_units:
+    unit_multipliers:
+      miles: 0.001
+      millares: 0.001
+      millones: 1
+      thousands: 0.001
+      millions: 1
+
+  currencies:
+    default: "EUR"
+

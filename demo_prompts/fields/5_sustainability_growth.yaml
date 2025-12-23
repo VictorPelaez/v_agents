@@ -14,23 +14,14 @@ rules:
     include_titles:
       - "Sostenibilidad"
 
-    exclude_titles:
-      - "-"
-
-  exclusions:
-    categories:
-      - "-"
-normalization:
-  unit_multipliers:
-    miles: 1000
-    millones: 1000000
-    thousands: 1000
-    millions: 1000000
-
 value_expectation:
-  type: "object"
-  description: "Importe canalizado de negocio sostenible en millones"
+  type: "number"
+  description: "Importe canalizado de negocio sostenible"
   example:
     value: 54.447
     currency: "Millones EUR"
 
+normalization:
+  enabled: true
+  target_unit: "millones"
+  currency: "EUR"

@@ -6,13 +6,13 @@
             "field": "growth_interannual",
             "value": {
                 "currency": "Millones EUR",
-                "value": 5447
+                "value": 5.447
             },
-            "justification": "El Grupo BBVA obtuvo un resultado de 5.447 millones de euros acumulados a cierre de junio de 2025, lo que representa un incremento interanual del 9,1%.",
+            "justification": "El Grupo BBVA obtuvo un resultado de 5.447 millones de euros acumulados a cierre de junio de 2025, lo que representa un incremento interanual del 9,1%, según se indica explícitamente en la sección 'Evolución interanual de los resultados' del informe.",
             "synonyms_found": [
                 "Evolución interanual de los resultados",
                 "incremento interanual",
-                "resultado acumulado a cierre de junio de 2025"
+                "Resultado interanual"
             ],
             "text_source": [
                 {
@@ -25,45 +25,42 @@
                 }
             ]
         },
-        "time_seconds": 6.341321200001403,
-        "tokens_used": 2209
+        "time_seconds": 7.448221799997555,
+        "tokens_used": 2218
     },
     {
-        "path": "fields\\4_solvencia copy.yaml",
+        "path": "fields\\4_cet1_ratio.yaml",
         "question": "Extraer el valor concreto del ratio de solvencia CET1 de la empresa BBVA",
         "response": {
-            "field": "ratio de solvencia CET1",
-            "value": {
-                "currency": "%",
-                "value": 13.34
-            },
-            "justification": "El ratio CET1 del Grupo BBVA se ha situado en el 13,34% a 30 de junio de 2025, superando el requerimiento regulatorio y el rango objetivo de gestión.",
+            "field": "cet1_ratio",
+            "value": 13.34,
+            "justification": "El ratio CET1 del Grupo BBVA se ha situado en el 13,34% a 30 de junio de 2025, según se indica explícitamente en las páginas 6 y 21 del informe, superando el requerimiento regulatorio y el rango objetivo de gestión.",
             "synonyms_found": [
                 "ratio CET1",
-                "ratio de capital CET1",
-                "ratio de solvencia CET1"
+                "ratio de solvencia CET1",
+                "ratio CET1 fully loaded"
             ],
             "text_source": [
                 {
-                    "chunk_id": "1",
-                    "chunk_document": "Informe-2T-2025_esp.pdf",
+                    "chunk_id": "page_21",
                     "chunk_page": [
                         21
                     ],
+                    "chunk_document": "Informe-2T-2025_esp.pdf",
                     "text": "El ratio CET1 8 del Grupo BBVA se ha situado en el 13,34% a 30 de junio de 2025 , lo que permite mantener un amplio colchón de gestión sobre el requerimiento de CET1 del Grupo a esa fecha (9,12% 9), y situándose asimismo por encima del rango de gestión objetivo del Grupo establecido en el 11,5% - 12,0% de CET1."
                 },
                 {
-                    "chunk_id": "2",
-                    "chunk_document": "Informe-2T-2025_esp.pdf",
+                    "chunk_id": "page_6",
                     "chunk_page": [
                         6
                     ],
+                    "chunk_document": "Informe-2T-2025_esp.pdf",
                     "text": "El ratio CET12 del Grupo BBVA se ha situado en el 13,34% a 30 de junio de 2025, lo que permite mantener un amplio colchón de gestión sobre el requerimiento de CET1 del Grupo a esa fecha (9,12%3), y situándose asimismo por encima del rango de gestión objetivo del Grupo establecido en el 11,5% - 12,0% de CET1."
                 }
             ]
         },
-        "time_seconds": 6.342611799998849,
-        "tokens_used": 2101
+        "time_seconds": 9.512286000004678,
+        "tokens_used": 2087
     },
     {
         "path": "fields\\5_sustainability_growth.yaml",
@@ -74,7 +71,7 @@
                 "currency": "Millones EUR",
                 "value": 63000
             },
-            "justification": "El informe indica un importe aproximado de 63.000 millones de euros canalizados en negocio sostenible en el primer semestre de 2025, reflejando un crecimiento del 48%.",
+            "justification": "El informe indica un importe aproximado de 63.000 millones de euros canalizados en negocio sostenible en el primer semestre de 2025, reflejando la cifra acumulada y validada por criterios internos y externos.",
             "synonyms_found": [
                 "canalización de negocio sostenible",
                 "negocio sostenible canalizado",
@@ -87,7 +84,7 @@
                     "chunk_page": [
                         9
                     ],
-                    "text": "importe aproximado de 63.000 millones de euros en el primer semestre de 2025, esto supone un 48% de crecimiento."
+                    "text": "importe aproximado de 63.000 millones de euros en el  primer semestre de 20255, esto supone un 48%6 de crecimiento. De esta canalización el 76% corresponde al ámbito del impacto medioambiental y el restante 24% a oportunidades en el ámbito social."
                 },
                 {
                     "chunk_id": "chunk_2",
@@ -95,11 +92,11 @@
                     "chunk_page": [
                         9
                     ],
-                    "text": "La canalización de negocio sostenible en BBVA incluye aspectos relacionados con el cambio climático y el capital natural, así como la promoción y financiación de iniciativas sociales."
+                    "text": "La canalización de negocio sostenible en BBVA incluye aspectos relacionados con el cambio climático y el capital natural (que comprende actividades vinculadas al agua, la agricultura y la economía circular), así como la promoción y financiación de iniciativas sociales (que incluyen infraestructuras sociales, educativas, de salud, etc.; apoyo a emprendedores y empresas jóvenes; y la inclusión financiera de los colectivos más desfavorecidos)."
                 }
             ]
         },
-        "time_seconds": 6.958637899999303,
-        "tokens_used": 1948
+        "time_seconds": 7.476177500000631,
+        "tokens_used": 1946
     }
 ]
