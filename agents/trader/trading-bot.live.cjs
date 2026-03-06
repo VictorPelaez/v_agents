@@ -61,6 +61,7 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
   const CSV_PATH = configuredCsvPath || path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'TRADE_LOG_ad.csv');
 
   const openTrades=[]; // {id,entryPrice,stopLoss,takeProfit,openedAt,size,reason}
+  const lastOpenBySymbol = {}; // symbol -> timestamp (ms) to enforce cooldown between opens
   let lastDecision = {}; // stores last decision snapshot (momentum, priceAboveSMA, shouldEnter)
   // Backfill: load persisted open trades at startup so monitor can pick up previously-opened positions
   try{
@@ -205,10 +206,17 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       // final logic: require momentum AND (trend up OR price near/above SMA)
       const shouldEnter = momentumOk && (trendUp || priceNearSMA);
       lastDecision = {momentum_pct: Number((momentum_pct).toFixed(6)), sma: sma?Number(sma.toFixed(2)):null, smaSlope: Number(smaSlope.toFixed(6)), priceNearSMA: !!priceNearSMA, trendUp: !!trendUp, shouldEnter: !!shouldEnter, effective_min_momentum: Number(effectiveMinMom.toFixed(6)), green_run: green_run};
-      if(shouldEnter && openTrades.length<maxPositions){
+      // prevent near-duplicate opens: if an open with almost the same entryPrice already exists, skip
+      const DUP_TOLERANCE_PCT = parseFloat(process.env.DUP_TOLERANCE_PCT || skillCfg.DUP_TOLERANCE_PCT || 1e-6);
+      const entryCandidate = candle ? candle.close : null;
+      const alreadySimilar = (entryCandidate !== null) && openTrades.some(ot => ot.entryPrice && Math.abs(ot.entryPrice - entryCandidate) <= Math.abs(entryCandidate) * DUP_TOLERANCE_PCT);
+      const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || skillCfg.SYMBOL_COOLDOWN_SECONDS || 0,10);
+      const lastOpenTs = lastOpenBySymbol[symbol] || 0;
+      const nowTs = Date.now();
+      const withinCooldown = (cooldown_s>0) && ((nowTs - lastOpenTs) < cooldown_s*1000);
+      if(shouldEnter && openTrades.length<maxPositions && !alreadySimilar && !withinCooldown){
           const entryPrice=candle.close; const ktp=k_tp; const ksl=k_sl;
-          const MIN_SL_PCT = parseFloat(process.env.MIN_SL_PCT || skillCfg.MIN_SL_PCT || 0.002);
-          const effectiveATR = Math.max(atr_pct, MIN_SL_PCT);
+          const effectiveATR = atr_pct; // usar ATR calculado directamente (fórmula simple)
           let stopLoss = entryPrice * (1 - ksl * effectiveATR);
           const takeProfit = entryPrice * (1 + ktp * effectiveATR);
           const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || skillCfg.MIN_SL_USD || 50);
@@ -317,12 +325,14 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       return `${Y}-${M}-${D} ${h}:${m}:${s}`;
     }
     const tsHuman = fmtDateUtc1(new Date());
-    // Expanded, human-friendly ITER summary
+    // Expanded, human-friendly ITER summary (forced verbose)
     const ld = lastDecision || {};
-    console.log('ITER_SUMMARY:', tsHuman, 'momentum='+(ld.momentum_pct||0),'sma='+(ld.sma||'null'),'smaSlope='+(ld.smaSlope||0),'priceNearSMA='+(ld.priceNearSMA?1:0),'trendUp='+(ld.trendUp?1:0),'shouldEnter='+(ld.shouldEnter?1:0),'effective_min_momentum='+(ld.effective_min_momentum||0),'green_run='+(ld.green_run||0),'openTrades='+openTrades.length);
-    console.log('TRACE_DETAILS: params={k_tp:'+k_tp+',k_sl:'+k_sl+',k_tp_src:'+_k_tp_src+',k_sl_src:'+_k_sl_src+'} momentum='+(ld.momentum_pct||0)+' sma='+(ld.sma||'null')+' trendUp='+(ld.trendUp?1:0));
-    // print full openTrades (multi-line) so Watch returns the same style as before
-    if(openTrades && openTrades.length>0) {
-      for(const ot of openTrades) console.log('OPEN_TRADE:', JSON.stringify(ot));
-    }
+    try{
+      console.log('ITER_SUMMARY:', tsHuman, 'momentum='+(ld.momentum_pct||0),'sma='+(ld.sma||'null'),'smaSlope='+(ld.smaSlope||0),'priceNearSMA='+(ld.priceNearSMA?1:0),'trendUp='+(ld.trendUp?1:0),'shouldEnter='+(ld.shouldEnter?1:0),'effective_min_momentum='+(ld.effective_min_momentum||0),'green_run='+(ld.green_run||0),'openTrades='+openTrades.length);
+      console.log('TRACE_DETAILS_JSON:', JSON.stringify({params:{k_tp:k_tp,k_sl:k_sl,k_tp_src:_k_tp_src,k_sl_src:_k_sl_src}, decision: ld, openTradesCount: openTrades.length}));
+      // print full openTrades (multi-line) so Watch returns the same style as before
+      if(openTrades && openTrades.length>0) {
+        for(const ot of openTrades) console.log('OPEN_TRADE:', JSON.stringify(ot));
+      }
+    }catch(e){ console.error('verbose log failed', e.message) }
 })();
