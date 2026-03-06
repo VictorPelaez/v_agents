@@ -1,0 +1,7 @@
+
+# Do not commit runtime data or logs
+agents/trader/skills/live-forward-v4.2/*.csv
+agents/trader/skills/live-forward-v4.2/*.csv.*
+agents/trader/skills/live-forward-v4.2/open_trades.json
+agents/trader/logs/*
+agents/trader/skills/live-forward-v4.2/backups/*
