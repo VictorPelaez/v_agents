@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 const fs=require('fs'); const path=require('path'); const axios=require('axios'); const child_process = require('child_process');
-const astBase = process.env.ASTER_API_BASE || 'https://fapi.asterdex.com';
-const ASTER_API_KEY = process.env.ASTER_API_KEY || '';
+const astBase = process.env.BINANCE_API_BASE || 'https://api.binance.com';
+let BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
+try{ if(!BINANCE_API_KEY){ const keyPath = path.join(__dirname,'API_KEYS.md'); if(fs.existsSync(keyPath)){ BINANCE_API_KEY = fs.readFileSync(keyPath,'utf8').split(/\r?\n/)[0].trim(); } } }catch(e){ BINANCE_API_KEY=''; }
 const LABEL = process.env.LABEL || 'V4.2';
 const CSV_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'TRADE_LOG_ad.csv');
 let pythonScriptPath = process.env.PYTHON_SCRIPT_PATH || path.join(__dirname,'tools','csv_writer.py');
@@ -117,9 +118,9 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
   }
   // helper: fetch latest 1m klines and return last completed candle
   async function getLatestCompletedCandle(){
-    const url=`${astBase}/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=3`;
+    const url=`${astBase}/api/v3/klines?symbol=${symbol}&interval=1m&limit=3`;
     try{
-      const r=await httpGetWithRetry(url,{headers:{Authorization: ASTER_API_KEY?`Bearer ${ASTER_API_KEY}`:undefined}});
+      const r=await httpGetWithRetry(url,{headers: (BINANCE_API_KEY? {'X-MBX-APIKEY': BINANCE_API_KEY} : {})});
       if(r.data && Array.isArray(r.data) && r.data.length>=2){
         const c=r.data[r.data.length-2]; return {ts:c[0],open:+c[1],high:+c[2],low:+c[3],close:+c[4]};
       }
@@ -127,9 +128,9 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
     return null;
   }
   async function getTicker(){
-    const url=`${astBase}/fapi/v1/ticker/price?symbol=${symbol}`;
+    const url=`${astBase}/api/v3/ticker/price?symbol=${symbol}`;
     try{
-      const r=await httpGetWithRetry(url,{headers:{Authorization: ASTER_API_KEY?`Bearer ${ASTER_API_KEY}`:undefined}});
+      const r=await httpGetWithRetry(url,{headers: (BINANCE_API_KEY? {'X-MBX-APIKEY': BINANCE_API_KEY} : {})});
       if(r.data && (r.data.price || r.data.price===0)) return +r.data.price;
     }catch(e){ console.error('getTicker failed', e.message); }
     return null;
@@ -142,8 +143,8 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
         // compute recent klines to derive SMA, momentum and ATR-like pct
         async function getRecentKlines(limit){
           try{
-            const url = `${astBase}/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=${limit}`;
-            const r = await httpGetWithRetry(url,{headers:{Authorization: ASTER_API_KEY?`Bearer ${ASTER_API_KEY}`:undefined}});
+            const url = `${astBase}/api/v3/klines?symbol=${symbol}&interval=1m&limit=${limit}`;
+            const r = await httpGetWithRetry(url,{headers: (BINANCE_API_KEY? {'X-MBX-APIKEY': BINANCE_API_KEY} : {})});
             return r.data;
           }catch(e){ return null }
         }
