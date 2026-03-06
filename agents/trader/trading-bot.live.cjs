@@ -125,8 +125,17 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
     return null;
   }
 
-  while(true){
+  // helper: fetch recent klines (candles) from Binance
+  async function getRecentKlines(limit, interval='1m'){
     try{
+      const url = `${astBase}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+      const r = await httpGetWithRetry(url,{headers: (BINANCE_API_KEY? {'X-MBX-APIKEY': BINANCE_API_KEY} : {})});
+      if(r && r.data) return r.data;
+    }catch(e){ console.error('getRecentKlines failed', e.message); }
+    return null;
+  }
+
+  while(true){
       const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || skillCfg.SMA_WINDOW || 60,10);
       const limit = SMA_WINDOW + 2; // enough candles for SMA window + previous closed candle + one extra
       const klines = await getRecentKlines(limit);
@@ -227,23 +236,24 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
           const qty = Number((riskUSD / stopDistanceUSD).toFixed(8));
 
           // intrabar validation: if the candle low already touches the stopLoss, skip opening (would have died inside the candle)
+          let trade = null;
           if(candle && typeof candle.low !== 'undefined' && candle.low <= stopLoss){
             console.log('trade skipped: SL inside candle (would have triggered before entry)', {entryPrice, stopLoss, candleLow:candle.low});
           } else {
-            const trade={id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};
+            const exposureUSD = Number((entryPrice * qty).toFixed(2));
+            trade = {id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};
             openTrades.push(trade);
+            console.log('OPEN (paper):',trade.id,trade.entryPrice,'SL',trade.stopLoss,'TP',trade.takeProfit,'REASON',reasonTag,reasonDet);
+            try{
+              const payloadOpen = JSON.stringify({id:trade.id,label:LABEL,symbol:'BTC',open_time_iso:trade.openedAt,close_time_iso:'',duration_s:'',side:trade.type,qty:trade.size,entry_price:trade.entryPrice,exit_price:'',sl:trade.stopLoss,tp:trade.takeProfit,profit:'',profit_pct:'',mfe:'',mae:'',reason_tag:trade.reasonTag,reason_details:trade.reasonDetails,tag:LABEL});
+              const pOpen = child_process.spawn('python3',[pythonScriptPath,'open',payloadOpen], {stdio:['ignore','pipe','pipe']});
+              pOpen.stdout.on('data',(d)=>{ console.log('csv_open stdout:', d.toString().trim()); });
+              pOpen.stderr.on('data',(d)=>{ console.error('csv_open stderr:', d.toString().trim()); });
+              pOpen.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_open exited non-zero',code,signal); });
+            }catch(e){console.error('csv open write failed',e.message)}
           }
-          console.log('OPEN (paper):',trade.id,trade.entryPrice,'SL',trade.stopLoss,'TP',trade.takeProfit,'REASON',reasonTag,reasonDet);
-          try{
-            const payloadOpen = JSON.stringify({id:trade.id,label:LABEL,symbol:'BTC',open_time_iso:trade.openedAt,close_time_iso:'',duration_s:'',side:trade.type,qty:trade.size,entry_price:trade.entryPrice,exit_price:'',sl:trade.stopLoss,tp:trade.takeProfit,profit:'',profit_pct:'',mfe:'',mae:'',reason_tag:trade.reasonTag,reason_details:trade.reasonDetails,tag:LABEL});
-            const pOpen = child_process.spawn('python3',[pythonScriptPath,'open',payloadOpen], {stdio:['ignore','pipe','pipe']});
-            pOpen.stdout.on('data',(d)=>{ console.log('csv_open stdout:', d.toString().trim()); });
-            pOpen.stderr.on('data',(d)=>{ console.error('csv_open stderr:', d.toString().trim()); });
-            pOpen.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_open exited non-zero',code,signal); });
-          }catch(e){console.error('csv open write failed',e.message)}
         }
-      }
-    }catch(e){console.error('signal err',e.message)}
+    }
 
     // monitor open trades by price every 5s for up to minHoldS
     const monitorStart=Date.now();
@@ -294,5 +304,4 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       await sleep(5000);
     }
     console.log('ok end iter', new Date().toISOString(), 'decision', JSON.stringify(lastDecision), 'openTrades', openTrades.length);
-  }
 })();
