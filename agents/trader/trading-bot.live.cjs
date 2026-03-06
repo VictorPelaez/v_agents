@@ -53,7 +53,7 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
   // Use a single canonical risk variable: skillCfg.RISK_PCT (or env RISK_PCT); default 0.01
   const riskPct = parseFloat(process.env.RISK_PCT || skillCfg.RISK_PCT || 0.01);
 
-  const monitorInterval = parseInt(process.env.MONITOR_INTERVAL_MS || skillCfg.MONITOR_INTERVAL_MS || 5000,10);
+  const monitorInterval = parseInt(process.env.MONITOR_INTERVAL_MS || skillCfg.MONITOR_INTERVAL_MS || 1000,10);
   const defaultSide = process.env.DEFAULT_SIDE || skillCfg.DEFAULT_SIDE || 'LONG';
   // CSV_PATH and python script path configurable
   const configuredCsvPath = (process.env.CSV_PATH || skillCfg.CSV_PATH) || '';
@@ -208,7 +208,16 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       lastDecision = {momentum_pct: Number((momentum_pct).toFixed(6)), sma: sma?Number(sma.toFixed(2)):null, smaSlope: Number(smaSlope.toFixed(6)), priceNearSMA: !!priceNearSMA, trendUp: !!trendUp, shouldEnter: !!shouldEnter, effective_min_momentum: Number(effectiveMinMom.toFixed(6)), green_run: green_run};
       if(shouldEnter && openTrades.length<maxPositions){
           const entryPrice=candle.close; const ktp=k_tp; const ksl=k_sl;
-          const stopLoss=entryPrice*(1-ksl*atr_pct); const takeProfit=entryPrice*(1+ktp*atr_pct);
+          const MIN_SL_PCT = parseFloat(process.env.MIN_SL_PCT || skillCfg.MIN_SL_PCT || 0.002);
+          const effectiveATR = Math.max(atr_pct, MIN_SL_PCT);
+          let stopLoss = entryPrice * (1 - ksl * effectiveATR);
+          const takeProfit = entryPrice * (1 + ktp * effectiveATR);
+          const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || skillCfg.MIN_SL_USD || 50);
+          // enforce a minimum absolute stop distance in USD
+          const stopDistance = entryPrice - stopLoss;
+          if(stopDistance < MIN_SL_USD){
+            stopLoss = entryPrice - MIN_SL_USD;
+          }
           const reasonDet = {
             momentum_pct: Number((momentum_pct).toFixed(6)),
             sma: sma?Number(sma.toFixed(2)):null,
@@ -220,11 +229,21 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
           };
           // mark a concise reason tag
           const reasonTag = (green_run>=GREEN_KLINES && MOM_REDUCTION_PCT>0) ? 'momentum_with_green_run' : 'momentum_standard';
-          // size in base asset units = USD risk exposure / entryPrice
-          const exposureUSD = skillCapital * riskPct;
-          const qty = Number((exposureUSD / entryPrice).toFixed(8));
-          const trade={id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};
-          openTrades.push(trade);
+          // proper risk-controlled sizing: risk in USD divided by stop distance (USD)
+          const riskUSD = skillCapital * riskPct;
+          const stopDistanceUSD = entryPrice - stopLoss;
+          if(stopDistanceUSD <= 0){
+            console.error('invalid stop distance, skipping trade', {entryPrice, stopLoss});
+          }
+          const qty = Number((riskUSD / stopDistanceUSD).toFixed(8));
+
+          // intrabar validation: if the candle low already touches the stopLoss, skip opening (would have died inside the candle)
+          if(candle && typeof candle.low !== 'undefined' && candle.low <= stopLoss){
+            console.log('trade skipped: SL inside candle (would have triggered before entry)', {entryPrice, stopLoss, candleLow:candle.low});
+          } else {
+            const trade={id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};
+            openTrades.push(trade);
+          }
           console.log('OPEN (paper):',trade.id,trade.entryPrice,'SL',trade.stopLoss,'TP',trade.takeProfit,'REASON',reasonTag,reasonDet);
           try{
             const payloadOpen = JSON.stringify({id:trade.id,label:LABEL,symbol:'BTC',open_time_iso:trade.openedAt,close_time_iso:'',duration_s:'',side:trade.type,qty:trade.size,entry_price:trade.entryPrice,exit_price:'',sl:trade.stopLoss,tp:trade.takeProfit,profit:'',profit_pct:'',mfe:'',mae:'',reason_tag:trade.reasonTag,reason_details:trade.reasonDetails,tag:LABEL});
