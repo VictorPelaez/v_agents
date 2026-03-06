@@ -116,17 +116,6 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
     }
     throw new Error('httpGetWithRetry failed after '+retries+' attempts');
   }
-  // helper: fetch latest 1m klines and return last completed candle
-  async function getLatestCompletedCandle(){
-    const url=`${astBase}/api/v3/klines?symbol=${symbol}&interval=1m&limit=3`;
-    try{
-      const r=await httpGetWithRetry(url,{headers: (BINANCE_API_KEY? {'X-MBX-APIKEY': BINANCE_API_KEY} : {})});
-      if(r.data && Array.isArray(r.data) && r.data.length>=2){
-        const c=r.data[r.data.length-2]; return {ts:c[0],open:+c[1],high:+c[2],low:+c[3],close:+c[4]};
-      }
-    }catch(e){ console.error('getLatestCompletedCandle failed',e.message); }
-    return null;
-  }
   async function getTicker(){
     const url=`${astBase}/api/v3/ticker/price?symbol=${symbol}`;
     try{
