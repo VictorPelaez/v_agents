@@ -1,0 +1,267 @@
+#!/usr/bin/env node
+const fs=require('fs'); const path=require('path'); const axios=require('axios'); const child_process = require('child_process');
+const astBase = process.env.ASTER_API_BASE || 'https://fapi.asterdex.com';
+const ASTER_API_KEY = process.env.ASTER_API_KEY || '';
+const LABEL = process.env.LABEL || 'V4.2';
+const CSV_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'TRADE_LOG_ad.csv');
+let pythonScriptPath = process.env.PYTHON_SCRIPT_PATH || path.join(__dirname,'tools','csv_writer.py');
+
+
+function writeTradeCsv(entry){
+  // Unified CSV writer: delegate to csv_writer.py to keep format consistent
+  try{
+    const payload = {
+      id: entry.id,
+      label: LABEL,
+      symbol: 'BTC',
+      open_time_iso: entry.openedAt || '',
+      close_time_iso: entry.closedAt || entry.timestamp || '',
+      duration_s: entry.duration_s || Math.round((new Date(entry.closedAt||entry.timestamp||new Date()).getTime() - new Date(entry.openedAt||new Date()).getTime())/1000),
+      side: entry.type || 'LONG',
+      qty: entry.size || entry.qty || '',
+      entry_price: entry.entryPrice || entry.entry_price || '',
+      exit_price: entry.exitPrice || entry.exit_price || '',
+      sl: entry.stopLoss || entry.sl || '',
+      tp: entry.takeProfit || entry.tp || '',
+      profit: entry.profit || '',
+      profit_pct: entry.profit_pct || '',
+      reason_details: entry.reasonDetails || ''
+    };
+    const cmd = `python3 ${pythonScriptPath} ${entry.action||'close'} '${JSON.stringify(payload)}'`;
+    child_process.execSync(cmd);
+  }catch(e){ console.error('writeTradeCsv (unified) err', e.message) }
+}
+
+async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+
+(async ()=>{
+  console.log('starting live service (paper decisions)');
+  // load per-skill config (already read above for MAX_POSITIONS); reuse cfg if available
+  let skillCfg={};
+  try{
+    const cfgPath = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'config.json');
+    if(fs.existsSync(cfgPath)) skillCfg = JSON.parse(fs.readFileSync(cfgPath,'utf8'));
+  }catch(e){ console.error('skill cfg read err',e.message) }
+  const symbol = process.env.SYMBOL || skillCfg.SYMBOL || 'BTCUSDT';
+  const skillCapital = parseFloat(process.env.CAPITAL || skillCfg.CAPITAL || 1000);
+  // Use a single canonical risk variable: skillCfg.RISK_PCT (or env RISK_PCT); default 0.01
+  const riskPct = parseFloat(process.env.RISK_PCT || skillCfg.RISK_PCT || 0.01);
+
+  const monitorInterval = parseInt(process.env.MONITOR_INTERVAL_MS || skillCfg.MONITOR_INTERVAL_MS || 5000,10);
+  const defaultSide = process.env.DEFAULT_SIDE || skillCfg.DEFAULT_SIDE || 'LONG';
+  // CSV_PATH and python script path configurable
+  const configuredCsvPath = (process.env.CSV_PATH || skillCfg.CSV_PATH) || '';
+  // CSV_PATH default (if not configured) falls back to skills folder
+  const CSV_PATH = configuredCsvPath || path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'TRADE_LOG_ad.csv');
+
+  const openTrades=[]; // {id,entryPrice,stopLoss,takeProfit,openedAt,size,reason}
+  let lastDecision = {}; // stores last decision snapshot (momentum, priceAboveSMA, shouldEnter)
+  // Backfill: load persisted open trades at startup so monitor can pick up previously-opened positions
+  try{
+    const opensPath = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'open_trades.json');
+    if(fs.existsSync(opensPath)){
+      const data = JSON.parse(fs.readFileSync(opensPath,'utf8'));
+      if(Array.isArray(data)){
+        for(const o of data){
+          try{
+            const t = {
+              id: o.id || (Date.now()),
+              entryPrice: parseFloat(o.entry_price) || 0,
+              stopLoss: o.sl ? parseFloat(o.sl) : null,
+              takeProfit: o.tp ? parseFloat(o.tp) : null,
+              openedAt: o.open_time || new Date().toISOString(),
+              size: o.qty || 0,
+              type: 'LONG',
+              reasonTag: 'backfill',
+              reasonDetails: {}
+            };
+            openTrades.push(t);
+            console.log('backfilled open trade', t.id, t.entryPrice, 'SL', t.stopLoss, 'TP', t.takeProfit);
+          }catch(e){ console.error('backfill parse err',e.message) }
+        }
+      }
+    }
+  }catch(e){ console.error('backfill err', e.message) }
+  // load skill config (per-skill config.json) if present
+  let maxPositionsDefault = 2;
+  try{
+    const cfgPath = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'config.json');
+    if(fs.existsSync(cfgPath)){
+      const cfg = JSON.parse(fs.readFileSync(cfgPath,'utf8'));
+      if(cfg && cfg.MAX_POSITIONS) maxPositionsDefault = parseInt(cfg.MAX_POSITIONS,10);
+    }
+  }catch(e){ console.error('config load err', e.message) }
+  const maxPositions = parseInt(process.env.MAX_POSITIONS || maxPositionsDefault,10);
+  // Use skillCapital and riskPct computed above (from env or skill config)
+  const minHoldS = parseInt(process.env.MIN_HOLD_SECONDS || skillCfg.MIN_HOLD_SECONDS || '60',10);
+  const timeStopMinutes = parseInt(process.env.TIME_STOP_MINUTES || skillCfg.TIME_STOP_MINUTES || 10,10);
+
+
+  // helper: http GET with retries
+  async function httpGetWithRetry(url, opts={}, retries=3, delayMs=300){
+    for(let i=0;i<retries;i++){
+      try{
+        const r = await axios.get(url, opts);
+        return r;
+      }catch(e){
+        console.error('httpGetWithRetry attempt',i+1,'failed',e.message);
+        if(i<retries-1) await sleep(delayMs);
+      }
+    }
+    throw new Error('httpGetWithRetry failed after '+retries+' attempts');
+  }
+  // helper: fetch latest 1m klines and return last completed candle
+  async function getLatestCompletedCandle(){
+    const url=`${astBase}/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=3`;
+    try{
+      const r=await httpGetWithRetry(url,{headers:{Authorization: ASTER_API_KEY?`Bearer ${ASTER_API_KEY}`:undefined}});
+      if(r.data && Array.isArray(r.data) && r.data.length>=2){
+        const c=r.data[r.data.length-2]; return {ts:c[0],open:+c[1],high:+c[2],low:+c[3],close:+c[4]};
+      }
+    }catch(e){ console.error('getLatestCompletedCandle failed',e.message); }
+    return null;
+  }
+  async function getTicker(){
+    const url=`${astBase}/fapi/v1/ticker/price?symbol=${symbol}`;
+    try{
+      const r=await httpGetWithRetry(url,{headers:{Authorization: ASTER_API_KEY?`Bearer ${ASTER_API_KEY}`:undefined}});
+      if(r.data && (r.data.price || r.data.price===0)) return +r.data.price;
+    }catch(e){ console.error('getTicker failed', e.message); }
+    return null;
+  }
+
+  while(true){
+    try{
+      const candle=await getLatestCompletedCandle();
+      if(candle){
+        // compute recent klines to derive SMA, momentum and ATR-like pct
+        async function getRecentKlines(limit){
+          try{
+            const url = `${astBase}/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=${limit}`;
+            const r = await httpGetWithRetry(url,{headers:{Authorization: ASTER_API_KEY?`Bearer ${ASTER_API_KEY}`:undefined}});
+            return r.data;
+          }catch(e){ return null }
+        }
+        const klines = await getRecentKlines(60);
+        let momentum_pct = 0; let sma = null; let atr_pct = 0;
+        if(klines && Array.isArray(klines) && klines.length>=2){
+          const closes = klines.map(c=>+c[4]);
+          const last = closes[closes.length-1];
+          const prev = closes[closes.length-2] || last;
+          momentum_pct = (last - prev)/prev;
+          // SMA over a fixed window (configurable)
+          const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || skillCfg.SMA_WINDOW || 60,10);
+          if(closes.length >= SMA_WINDOW){
+            const lastWindow = closes.slice(-SMA_WINDOW);
+            const sumWindow = lastWindow.reduce((a,b)=>a+b,0);
+            sma = sumWindow / lastWindow.length;
+            // smaPrev: same window shifted by one candle
+            const prevWindow = closes.slice(-(SMA_WINDOW+1), -1);
+            const sumPrev = prevWindow.reduce((a,b)=>a+b,0);
+            smaPrev = sumPrev / prevWindow.length;
+          } else {
+            const sum = closes.reduce((a,b)=>a+b,0); sma = sum/closes.length;
+            smaPrev = null;
+          }
+          // simple ATR-like pct = avg absolute returns over last N
+          const returns = [];
+          for(let i=1;i<closes.length;i++) returns.push(Math.abs((closes[i]-closes[i-1])/closes[i-1]));
+          const avg = returns.reduce((a,b)=>a+b,0)/Math.max(1,returns.length);
+          atr_pct = avg || 0.01;
+        }
+        // base momentum and configurable reduction on green runs
+        const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || skillCfg.MIN_MOMENTUM_PCT || 0.005);
+        const MOM_REDUCTION_PCT = parseFloat(process.env.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || skillCfg.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || 0.0);
+        const GREEN_KLINES = parseInt(process.env.GREEN_KLINES_FOR_REDUCTION || skillCfg.GREEN_KLINES_FOR_REDUCTION || 0,10);
+        const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || skillCfg.SMA_WINDOW || 60,10);
+        const smaSlope = (sma !== null && smaPrev !== null) ? (sma - smaPrev) : 0;
+        const smaTol = parseFloat(process.env.SMA_TOLERANCE || skillCfg.SMA_TOLERANCE || 0.001);
+        const priceNearSMA = (sma!==null) ? (candle.close >= sma * (1 - smaTol)) : true; // tolerance from config
+        const trendUp = smaSlope > 0;
+        // determine how many consecutive green candles up to GREEN_KLINES
+        let green_run = 0;
+        if(GREEN_KLINES>0 && Array.isArray(klines)){
+          // check the last GREEN_KLINES candles (most recent completed ones)
+          for(let j=klines.length-1;j>0 && green_run < GREEN_KLINES;j--){
+            const cur = +klines[j][4]; const op = +klines[j][1];
+            if(cur>op) green_run++; else break;
+          }
+        }
+        let effectiveMinMom = BASE_MIN_MOM;
+        if(green_run>=GREEN_KLINES && GREEN_KLINES>0 && MOM_REDUCTION_PCT>0){
+          effectiveMinMom = BASE_MIN_MOM * (1 - MOM_REDUCTION_PCT);
+        }
+        const momentumOk = momentum_pct >= effectiveMinMom;
+        const k_tp = parseFloat(process.env.K_TP || (skillCfg && skillCfg.K_TP) || '2.0');
+        const k_sl = parseFloat(process.env.K_SL || (skillCfg && skillCfg.K_SL) || '1.2');
+        // log effective TP/SL factors and their source
+        const _k_tp_src = process.env.K_TP ? 'env' : (skillCfg && skillCfg.K_TP ? 'config' : 'default');
+        const _k_sl_src = process.env.K_SL ? 'env' : (skillCfg && skillCfg.K_SL ? 'config' : 'default');
+        console.log('PARAMS: k_tp=',k_tp,'(source=',_k_tp_src+') k_sl=',k_sl,'(source=',_k_sl_src+')');
+        // final logic: require momentum AND (trend up OR price near/above SMA)
+        const shouldEnter = momentumOk && (trendUp || priceNearSMA);
+        lastDecision = {momentum_pct: Number((momentum_pct).toFixed(6)), sma: sma?Number(sma.toFixed(2)):null, smaSlope: Number(smaSlope.toFixed(6)), priceNearSMA: !!priceNearSMA, trendUp: !!trendUp, shouldEnter: !!shouldEnter, effective_min_momentum: Number(effectiveMinMom.toFixed(6)), green_run: green_run};
+        if(shouldEnter && openTrades.length<maxPositions){
+          const entryPrice=candle.close; const ktp=k_tp; const ksl=k_sl;
+          const stopLoss=entryPrice*(1-ksl*atr_pct); const takeProfit=entryPrice*(1+ktp*atr_pct);
+          const reasonDet = {
+            momentum_pct: Number((momentum_pct).toFixed(6)),
+            sma: sma?Number(sma.toFixed(2)):null,
+            atr_pct: Number(atr_pct.toFixed(6)),
+            base_min_momentum: BASE_MIN_MOM,
+            effective_minimum: Number(effectiveMinMom.toFixed(6)),
+            green_run_len: green_run,
+            reduction_pct: MOM_REDUCTION_PCT
+          };
+          // mark a concise reason tag
+          const reasonTag = (green_run>=GREEN_KLINES && MOM_REDUCTION_PCT>0) ? 'momentum_with_green_run' : 'momentum_standard';
+          // size in base asset units = USD risk exposure / entryPrice
+          const exposureUSD = skillCapital * riskPct;
+          const qty = Number((exposureUSD / entryPrice).toFixed(8));
+          const trade={id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};
+          openTrades.push(trade);
+          console.log('OPEN (paper):',trade.id,trade.entryPrice,'SL',trade.stopLoss,'TP',trade.takeProfit,'REASON',reasonTag,reasonDet);
+          try{ child_process.execSync(`python3 ${pythonScriptPath} open '${JSON.stringify({id:trade.id,label:LABEL,symbol:'BTC',open_time_iso:trade.openedAt,close_time_iso:'',duration_s:'',side:trade.type,qty:trade.size,entry_price:trade.entryPrice,exit_price:'',sl:trade.stopLoss,tp:trade.takeProfit,profit:'',profit_pct:'',mfe:'',mae:'',reason_tag:trade.reasonTag,reason_details:trade.reasonDetails,tag:LABEL})}'`); }catch(e){console.error('csv open write failed',e.message)}
+        }
+      }
+    }catch(e){console.error('signal err',e.message)}
+
+    // monitor open trades by price every 5s for up to minHoldS
+    const monitorStart=Date.now();
+    while(Date.now()-monitorStart < 60*1000){ // check up to 1 minute before next candle fetch
+      try{
+        const market=await getTicker();
+        if(market!==null){
+          for(let i=openTrades.length-1;i>=0;i--){
+            const t=openTrades[i];
+            const age=(Date.now()-new Date(t.openedAt).getTime())/1000;
+            if(age<minHoldS) continue; // enforce minimal hold
+            if(age > timeStopMinutes*60){
+              // time-stop forced close
+              const profit = (market - t.entryPrice) * (t.size || 0);
+              t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
+              console.log('CLOSE TIME_STOP (paper):',t.id,t.exitPrice,t.profit,'age_s',Math.round(age));
+              try{ child_process.execSync(`python3 ${pythonScriptPath} close '${JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:'time_stop',close_reason:'time_stop',reason_details:t.reasonDetails,tag:LABEL})}'`); }catch(e){console.error('csv time_stop write failed',e.message)}
+              openTrades.splice(i,1);
+            } else if(t.stopLoss && market<=t.stopLoss){
+              // close
+              const profit = (market - t.entryPrice) * (t.size || 0);
+              t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
+              console.log('CLOSE SL (paper):',t.id,t.exitPrice,t.profit);
+              try{ child_process.execSync(`python3 ${pythonScriptPath} close '${JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:t.reasonTag,close_reason:(t.exitPrice<=t.stopLoss? 'SL' : (t.exitPrice>=t.takeProfit? 'TP' : 'OTHER')),reason_details:t.reasonDetails,tag:LABEL})}'`); }catch(e){console.error('csv close write failed',e.message)}
+              openTrades.splice(i,1);
+            } else if(t.takeProfit && market>=t.takeProfit){
+              const profit = (market - t.entryPrice) * (t.size || 0);
+              t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
+              console.log('CLOSE TP (paper):',t.id,t.exitPrice,t.profit);
+              writeTradeCsv({...t, action:'close', timestamp:new Date().toISOString()});
+              openTrades.splice(i,1);
+            }
+          }
+        }
+      }catch(e){console.error('monitor err',e.message)}
+      await sleep(5000);
+    }
+    console.log('ok end iter', new Date().toISOString(), 'decision', JSON.stringify(lastDecision), 'openTrades', openTrades.length);
+  }
+})();
