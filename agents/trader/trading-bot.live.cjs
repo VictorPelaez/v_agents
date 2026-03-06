@@ -138,87 +138,75 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
   while(true){
     try{
-      const candle=await getLatestCompletedCandle();
-      if(candle){
-        // compute recent klines to derive SMA, momentum and ATR-like pct
-        async function getRecentKlines(limit){
-          try{
-            const url = `${astBase}/api/v3/klines?symbol=${symbol}&interval=1m&limit=${limit}`;
-            const r = await httpGetWithRetry(url,{headers: (BINANCE_API_KEY? {'X-MBX-APIKEY': BINANCE_API_KEY} : {})});
-            return r.data;
-          }catch(e){ return null }
+      const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || skillCfg.SMA_WINDOW || 60,10);
+      const limit = SMA_WINDOW + 2; // enough candles for SMA window + previous closed candle + one extra
+      const klines = await getRecentKlines(limit);
+      // compute candle, SMA, momentum and ATR from the same klines array (single API call)
+      let momentum_pct = 0; let sma = null; let smaPrev = null; let atr_pct = 0;
+      let candle = null;
+      if(klines && Array.isArray(klines) && klines.length>=2){
+        // last closed candle is the penultimate entry
+        const lastClosed = klines[klines.length-2];
+        candle = { ts: lastClosed[0], open:+lastClosed[1], high:+lastClosed[2], low:+lastClosed[3], close:+lastClosed[4] };
+        const closes = klines.map(c=>+c[4]);
+        const last = closes[closes.length-2]; // last closed
+        const prev = closes[closes.length-3] || last;
+        momentum_pct = prev ? (last - prev)/prev : 0;
+        // SMA over window
+        if(closes.length >= SMA_WINDOW){
+          const lastWindow = closes.slice(-SMA_WINDOW-1, -1); // take the last SMA_WINDOW closed closes
+          const sumWindow = lastWindow.reduce((a,b)=>a+b,0);
+          sma = sumWindow / lastWindow.length;
+          const prevWindow = closes.slice(-SMA_WINDOW-2, -2);
+          const sumPrev = prevWindow.reduce((a,b)=>a+b,0);
+          smaPrev = prevWindow.length? (sumPrev / prevWindow.length) : null;
+        } else {
+          const sum = closes.reduce((a,b)=>a+b,0); sma = sum/closes.length; smaPrev = null;
         }
-        const klines = await getRecentKlines(60);
-        let momentum_pct = 0; let sma = null; let atr_pct = 0;
-        if(klines && Array.isArray(klines) && klines.length>=2){
-          const closes = klines.map(c=>+c[4]);
-          const last = closes[closes.length-1];
-          const prev = closes[closes.length-2] || last;
-          momentum_pct = (last - prev)/prev;
-          // SMA over a fixed window (configurable)
-          const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || skillCfg.SMA_WINDOW || 60,10);
-          if(closes.length >= SMA_WINDOW){
-            const lastWindow = closes.slice(-SMA_WINDOW);
-            const sumWindow = lastWindow.reduce((a,b)=>a+b,0);
-            sma = sumWindow / lastWindow.length;
-            // smaPrev: same window shifted by one candle
-            const prevWindow = closes.slice(-(SMA_WINDOW+1), -1);
-            const sumPrev = prevWindow.reduce((a,b)=>a+b,0);
-            smaPrev = sumPrev / prevWindow.length;
-          } else {
-            const sum = closes.reduce((a,b)=>a+b,0); sma = sum/closes.length;
-            smaPrev = null;
-          }
-          // TRUE RANGE / ATR (Wilder-like simple average over available trs)
-          const trs = [];
-          for(let i=1;i<klines.length;i++){
-            const high = +klines[i][2];
-            const low = +klines[i][3];
-            const prevClose = +klines[i-1][4];
-            const tr = Math.max(
-              high - low,
-              Math.abs(high - prevClose),
-              Math.abs(low - prevClose)
-            );
-            trs.push(tr);
-          }
-          const sumTr = trs.reduce((a,b)=>a+b,0);
-          const atr = trs.length? (sumTr/trs.length) : 0;
-          atr_pct = atr / (last || 1);
+        // ATR using trs over klines
+        const trs = [];
+        for(let i=1;i<klines.length;i++){
+          const high = +klines[i][2];
+          const low = +klines[i][3];
+          const prevClose = +klines[i-1][4];
+          const tr = Math.max(high-low, Math.abs(high-prevClose), Math.abs(low-prevClose));
+          trs.push(tr);
         }
-        // base momentum and configurable reduction on green runs
-        const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || skillCfg.MIN_MOMENTUM_PCT || 0.005);
-        const MOM_REDUCTION_PCT = parseFloat(process.env.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || skillCfg.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || 0.0);
-        const GREEN_KLINES = parseInt(process.env.GREEN_KLINES_FOR_REDUCTION || skillCfg.GREEN_KLINES_FOR_REDUCTION || 0,10);
-        const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || skillCfg.SMA_WINDOW || 60,10);
-        const smaSlope = (sma !== null && smaPrev !== null) ? (sma - smaPrev) : 0;
-        const smaTol = parseFloat(process.env.SMA_TOLERANCE || skillCfg.SMA_TOLERANCE || 0.001);
-        const priceNearSMA = (sma!==null) ? (candle.close >= sma * (1 - smaTol)) : true; // tolerance from config
-        const trendUp = smaSlope > 0;
-        // determine how many consecutive green candles up to GREEN_KLINES
-        let green_run = 0;
-        if(GREEN_KLINES>0 && Array.isArray(klines)){
-          // check the last GREEN_KLINES candles (most recent completed ones)
-          for(let j=klines.length-1;j>0 && green_run < GREEN_KLINES;j--){
-            const cur = +klines[j][4]; const op = +klines[j][1];
-            if(cur>op) green_run++; else break;
-          }
+        const sumTr = trs.reduce((a,b)=>a+b,0);
+        const atr = trs.length? (sumTr/trs.length) : 0;
+        atr_pct = atr / (last || 1);
+      }
+      // base momentum and configurable reduction on green runs
+      const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || skillCfg.MIN_MOMENTUM_PCT || 0.005);
+      const MOM_REDUCTION_PCT = parseFloat(process.env.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || skillCfg.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || 0.0);
+      const GREEN_KLINES = parseInt(process.env.GREEN_KLINES_FOR_REDUCTION || skillCfg.GREEN_KLINES_FOR_REDUCTION || 0,10);
+      const smaSlope = (sma !== null && smaPrev !== null) ? (sma - smaPrev) : 0;
+      const smaTol = parseFloat(process.env.SMA_TOLERANCE || skillCfg.SMA_TOLERANCE || 0.001);
+      const priceNearSMA = (sma!==null && candle) ? (candle.close >= sma * (1 - smaTol)) : true; // tolerance from config
+      const trendUp = smaSlope > 0;
+      // determine how many consecutive green candles up to GREEN_KLINES
+      let green_run = 0;
+      if(GREEN_KLINES>0 && Array.isArray(klines)){
+        for(let j=klines.length-1;j>0 && green_run < GREEN_KLINES;j--){
+          const cur = +klines[j][4]; const op = +klines[j][1];
+          if(cur>op) green_run++; else break;
         }
-        let effectiveMinMom = BASE_MIN_MOM;
-        if(green_run>=GREEN_KLINES && GREEN_KLINES>0 && MOM_REDUCTION_PCT>0){
-          effectiveMinMom = BASE_MIN_MOM * (1 - MOM_REDUCTION_PCT);
-        }
-        const momentumOk = momentum_pct >= effectiveMinMom;
-        const k_tp = parseFloat(process.env.K_TP || (skillCfg && skillCfg.K_TP) || '2.0');
-        const k_sl = parseFloat(process.env.K_SL || (skillCfg && skillCfg.K_SL) || '1.2');
-        // log effective TP/SL factors and their source
-        const _k_tp_src = process.env.K_TP ? 'env' : (skillCfg && skillCfg.K_TP ? 'config' : 'default');
-        const _k_sl_src = process.env.K_SL ? 'env' : (skillCfg && skillCfg.K_SL ? 'config' : 'default');
-        console.log('PARAMS: k_tp=',k_tp,'(source=',_k_tp_src+') k_sl=',k_sl,'(source=',_k_sl_src+')');
-        // final logic: require momentum AND (trend up OR price near/above SMA)
-        const shouldEnter = momentumOk && (trendUp || priceNearSMA);
-        lastDecision = {momentum_pct: Number((momentum_pct).toFixed(6)), sma: sma?Number(sma.toFixed(2)):null, smaSlope: Number(smaSlope.toFixed(6)), priceNearSMA: !!priceNearSMA, trendUp: !!trendUp, shouldEnter: !!shouldEnter, effective_min_momentum: Number(effectiveMinMom.toFixed(6)), green_run: green_run};
-        if(shouldEnter && openTrades.length<maxPositions){
+      }
+      let effectiveMinMom = BASE_MIN_MOM;
+      if(green_run>=GREEN_KLINES && GREEN_KLINES>0 && MOM_REDUCTION_PCT>0){
+        effectiveMinMom = BASE_MIN_MOM * (1 - MOM_REDUCTION_PCT);
+      }
+      const momentumOk = momentum_pct >= effectiveMinMom;
+      const k_tp = parseFloat(process.env.K_TP || (skillCfg && skillCfg.K_TP) || '2.0');
+      const k_sl = parseFloat(process.env.K_SL || (skillCfg && skillCfg.K_SL) || '1.2');
+      // log effective TP/SL factors and their source
+      const _k_tp_src = process.env.K_TP ? 'env' : (skillCfg && skillCfg.K_TP ? 'config' : 'default');
+      const _k_sl_src = process.env.K_SL ? 'env' : (skillCfg && skillCfg.K_SL ? 'config' : 'default');
+      console.log('PARAMS: k_tp=',k_tp,'(source=',_k_tp_src+') k_sl=',k_sl,'(source=',_k_sl_src+')');
+      // final logic: require momentum AND (trend up OR price near/above SMA)
+      const shouldEnter = momentumOk && (trendUp || priceNearSMA);
+      lastDecision = {momentum_pct: Number((momentum_pct).toFixed(6)), sma: sma?Number(sma.toFixed(2)):null, smaSlope: Number(smaSlope.toFixed(6)), priceNearSMA: !!priceNearSMA, trendUp: !!trendUp, shouldEnter: !!shouldEnter, effective_min_momentum: Number(effectiveMinMom.toFixed(6)), green_run: green_run};
+      if(shouldEnter && openTrades.length<maxPositions){
           const entryPrice=candle.close; const ktp=k_tp; const ksl=k_sl;
           const stopLoss=entryPrice*(1-ksl*atr_pct); const takeProfit=entryPrice*(1+ktp*atr_pct);
           const reasonDet = {
@@ -238,7 +226,13 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
           const trade={id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};
           openTrades.push(trade);
           console.log('OPEN (paper):',trade.id,trade.entryPrice,'SL',trade.stopLoss,'TP',trade.takeProfit,'REASON',reasonTag,reasonDet);
-          try{ child_process.execSync(`python3 ${pythonScriptPath} open '${JSON.stringify({id:trade.id,label:LABEL,symbol:'BTC',open_time_iso:trade.openedAt,close_time_iso:'',duration_s:'',side:trade.type,qty:trade.size,entry_price:trade.entryPrice,exit_price:'',sl:trade.stopLoss,tp:trade.takeProfit,profit:'',profit_pct:'',mfe:'',mae:'',reason_tag:trade.reasonTag,reason_details:trade.reasonDetails,tag:LABEL})}'`); }catch(e){console.error('csv open write failed',e.message)}
+          try{
+            const payloadOpen = JSON.stringify({id:trade.id,label:LABEL,symbol:'BTC',open_time_iso:trade.openedAt,close_time_iso:'',duration_s:'',side:trade.type,qty:trade.size,entry_price:trade.entryPrice,exit_price:'',sl:trade.stopLoss,tp:trade.takeProfit,profit:'',profit_pct:'',mfe:'',mae:'',reason_tag:trade.reasonTag,reason_details:trade.reasonDetails,tag:LABEL});
+            const pOpen = child_process.spawn('python3',[pythonScriptPath,'open',payloadOpen], {stdio:['ignore','pipe','pipe']});
+            pOpen.stdout.on('data',(d)=>{ console.log('csv_open stdout:', d.toString().trim()); });
+            pOpen.stderr.on('data',(d)=>{ console.error('csv_open stderr:', d.toString().trim()); });
+            pOpen.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_open exited non-zero',code,signal); });
+          }catch(e){console.error('csv open write failed',e.message)}
         }
       }
     }catch(e){console.error('signal err',e.message)}
@@ -258,14 +252,26 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
               const profit = (market - t.entryPrice) * (t.size || 0);
               t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
               console.log('CLOSE TIME_STOP (paper):',t.id,t.exitPrice,t.profit,'age_s',Math.round(age));
-              try{ child_process.execSync(`python3 ${pythonScriptPath} close '${JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:'time_stop',close_reason:'time_stop',reason_details:t.reasonDetails,tag:LABEL})}'`); }catch(e){console.error('csv time_stop write failed',e.message)}
+              try{
+              const payloadCloseTime = JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:'time_stop',close_reason:'time_stop',reason_details:t.reasonDetails,tag:LABEL});
+              const pCloseTime = child_process.spawn('python3',[pythonScriptPath,'close',payloadCloseTime], {stdio:['ignore','pipe','pipe']});
+              pCloseTime.stdout.on('data',(d)=>{ console.log('csv_close_time stdout:', d.toString().trim()); });
+              pCloseTime.stderr.on('data',(d)=>{ console.error('csv_close_time stderr:', d.toString().trim()); });
+              pCloseTime.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_close_time exited non-zero',code,signal); });
+            }catch(e){console.error('csv time_stop write failed',e.message)}
               openTrades.splice(i,1);
             } else if(t.stopLoss && market<=t.stopLoss){
               // close
               const profit = (market - t.entryPrice) * (t.size || 0);
               t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
               console.log('CLOSE SL (paper):',t.id,t.exitPrice,t.profit);
-              try{ child_process.execSync(`python3 ${pythonScriptPath} close '${JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:t.reasonTag,close_reason:(t.exitPrice<=t.stopLoss? 'SL' : (t.exitPrice>=t.takeProfit? 'TP' : 'OTHER')),reason_details:t.reasonDetails,tag:LABEL})}'`); }catch(e){console.error('csv close write failed',e.message)}
+              try{
+              const payloadClose = JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:t.reasonTag,close_reason:(t.exitPrice<=t.stopLoss? 'SL' : (t.exitPrice>=t.takeProfit? 'TP' : 'OTHER')),reason_details:t.reasonDetails,tag:LABEL});
+              const pClose = child_process.spawn('python3',[pythonScriptPath,'close',payloadClose], {stdio:['ignore','pipe','pipe']});
+              pClose.stdout.on('data',(d)=>{ console.log('csv_close stdout:', d.toString().trim()); });
+              pClose.stderr.on('data',(d)=>{ console.error('csv_close stderr:', d.toString().trim()); });
+              pClose.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_close exited non-zero',code,signal); });
+            }catch(e){console.error('csv close write failed',e.message)}
               openTrades.splice(i,1);
             } else if(t.takeProfit && market>=t.takeProfit){
               const profit = (market - t.entryPrice) * (t.size || 0);
