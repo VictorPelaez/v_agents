@@ -5,3 +5,8 @@ agents/trader/skills/live-forward-v4.2/*.csv.*
 agents/trader/skills/live-forward-v4.2/open_trades.json
 agents/trader/logs/*
 agents/trader/skills/live-forward-v4.2/backups/*
+
+# additional runtime logs
+agents/trader/logs/*.out
+**/*.nohup.out
+agents/trader/skills/live-forward-v4.2/*.nohup.out
