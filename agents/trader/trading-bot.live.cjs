@@ -8,7 +8,7 @@ let pythonScriptPath = process.env.PYTHON_SCRIPT_PATH || path.join(__dirname,'to
 
 
 function writeTradeCsv(entry){
-  // Unified CSV writer: delegate to csv_writer.py to keep format consistent
+  // Unified CSV writer: delegate to csv_writer.py to keep format consistent (spawn, non-blocking)
   try{
     const payload = {
       id: entry.id,
@@ -27,9 +27,14 @@ function writeTradeCsv(entry){
       profit_pct: entry.profit_pct || '',
       reason_details: entry.reasonDetails || ''
     };
-    const cmd = `python3 ${pythonScriptPath} ${entry.action||'close'} '${JSON.stringify(payload)}'`;
-    child_process.execSync(cmd);
-  }catch(e){ console.error('writeTradeCsv (unified) err', e.message) }
+    const action = entry.action || 'close';
+    const p = child_process.spawn('python3',[pythonScriptPath,action,JSON.stringify(payload)], {stdio:['ignore','pipe','pipe']});
+    p.stdout.on('data',(d)=>{ console.log('csv_writer stdout:', d.toString().trim()); });
+    p.stderr.on('data',(d)=>{ console.error('csv_writer stderr:', d.toString().trim()); });
+    p.on('exit',(code,signal)=>{
+      if(code!==0) console.error('csv_writer exited non-zero',code,signal);
+    });
+  }catch(e){ console.error('writeTradeCsv (spawn) err', e.message) }
 }
 
 async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
@@ -163,11 +168,22 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
             const sum = closes.reduce((a,b)=>a+b,0); sma = sum/closes.length;
             smaPrev = null;
           }
-          // simple ATR-like pct = avg absolute returns over last N
-          const returns = [];
-          for(let i=1;i<closes.length;i++) returns.push(Math.abs((closes[i]-closes[i-1])/closes[i-1]));
-          const avg = returns.reduce((a,b)=>a+b,0)/Math.max(1,returns.length);
-          atr_pct = avg || 0.01;
+          // TRUE RANGE / ATR (Wilder-like simple average over available trs)
+          const trs = [];
+          for(let i=1;i<klines.length;i++){
+            const high = +klines[i][2];
+            const low = +klines[i][3];
+            const prevClose = +klines[i-1][4];
+            const tr = Math.max(
+              high - low,
+              Math.abs(high - prevClose),
+              Math.abs(low - prevClose)
+            );
+            trs.push(tr);
+          }
+          const sumTr = trs.reduce((a,b)=>a+b,0);
+          const atr = trs.length? (sumTr/trs.length) : 0;
+          atr_pct = atr / (last || 1);
         }
         // base momentum and configurable reduction on green runs
         const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || skillCfg.MIN_MOMENTUM_PCT || 0.005);
