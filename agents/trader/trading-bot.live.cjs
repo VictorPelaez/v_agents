@@ -304,6 +304,12 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       }catch(e){console.error('monitor err',e.message)}
       await sleep(5000);
     }
-    // Emit a compact, single-line JSON summary per iter that includes params, decision and openTrades (full array)
-    console.log('ITER_SUMMARY', JSON.stringify({ts:new Date().toISOString(), params:{k_tp:k_tp,k_sl:k_sl,k_tp_src:_k_tp_src,k_sl_src:_k_sl_src}, decision:lastDecision, openTrades:openTrades}));
+    // Restore historic multi-line tracing: ok end iter + detailed lines (momentum, sma, params, openTrades). Timestamps in UTC+1
+    const tsUtc1 = (new Date(Date.now()+60*60*1000)).toISOString().replace('Z','+01:00');
+    console.log('ok end iter', tsUtc1, 'decision', JSON.stringify(lastDecision), 'openTrades', openTrades.length);
+    console.log('TRACE_DETAILS: params={k_tp:'+k_tp+',k_sl:'+k_sl+',k_tp_src:'+_k_tp_src+',k_sl_src:'+_k_sl_src+'} momentum='+(lastDecision.momentum_pct||0)+' sma='+(lastDecision.sma||'null')+' trendUp='+(lastDecision.trendUp?1:0));
+    // print full openTrades (multi-line) so Watch returns the same style as before
+    if(openTrades && openTrades.length>0) {
+      for(const ot of openTrades) console.log('OPEN_TRADE:', JSON.stringify(ot));
+    }
 })();
