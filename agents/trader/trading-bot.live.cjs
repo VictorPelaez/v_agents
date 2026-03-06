@@ -244,13 +244,14 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
             const exposureUSD = Number((entryPrice * qty).toFixed(2));
             trade = {id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};
             openTrades.push(trade);
-            console.log('OPEN (paper):',trade.id,trade.entryPrice,'SL',trade.stopLoss,'TP',trade.takeProfit,'REASON',reasonTag,reasonDet);
+            console.log('OPEN (paper):', (trade.openedAt? trade.openedAt : new Date(trade.id).toISOString()), trade.entryPrice,'SL',trade.stopLoss,'TP',trade.takeProfit,'REASON',reasonTag,reasonDet);
             try{
               const payloadOpen = JSON.stringify({id:trade.id,label:LABEL,symbol:'BTC',open_time_iso:trade.openedAt,close_time_iso:'',duration_s:'',side:trade.type,qty:trade.size,entry_price:trade.entryPrice,exit_price:'',sl:trade.stopLoss,tp:trade.takeProfit,profit:'',profit_pct:'',mfe:'',mae:'',reason_tag:trade.reasonTag,reason_details:trade.reasonDetails,tag:LABEL});
-              const pOpen = child_process.spawn('python3',[pythonScriptPath,'open',payloadOpen], {stdio:['ignore','pipe','pipe']});
-              pOpen.stdout.on('data',(d)=>{ console.log('csv_open stdout:', d.toString().trim()); });
-              pOpen.stderr.on('data',(d)=>{ console.error('csv_open stderr:', d.toString().trim()); });
-              pOpen.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_open exited non-zero',code,signal); });
+              // unified CSV writer call for open (avoid duplicate python invocations)
+              try{
+                const csvPayload = { id: trade.id, label: LABEL, symbol: 'BTC', open_time_iso: trade.openedAt || new Date().toISOString(), close_time_iso: '', duration_s: '', side: trade.type, qty: trade.size, entry_price: trade.entryPrice, exit_price: '', sl: trade.stopLoss, tp: trade.takeProfit, profit: '', profit_pct: '', reason_details: trade.reasonDetails };
+                writeTradeCsv({ ...csvPayload, action: 'open' });
+              }catch(e){ console.error('writeTradeCsv open call failed', e.message); }
             }catch(e){console.error('csv open write failed',e.message)}
           }
         }
@@ -270,26 +271,26 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
               // time-stop forced close
               const profit = (market - t.entryPrice) * (t.size || 0);
               t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
-              console.log('CLOSE TIME_STOP (paper):',t.id,t.exitPrice,t.profit,'age_s',Math.round(age));
+              console.log('CLOSE TIME_STOP (paper):', (t.closedAt? t.closedAt : (t.id? new Date(t.id).toISOString() : '')), t.exitPrice,t.profit,'age_s',Math.round(age));
               try{
               const payloadCloseTime = JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:'time_stop',close_reason:'time_stop',reason_details:t.reasonDetails,tag:LABEL});
-              const pCloseTime = child_process.spawn('python3',[pythonScriptPath,'close',payloadCloseTime], {stdio:['ignore','pipe','pipe']});
-              pCloseTime.stdout.on('data',(d)=>{ console.log('csv_close_time stdout:', d.toString().trim()); });
-              pCloseTime.stderr.on('data',(d)=>{ console.error('csv_close_time stderr:', d.toString().trim()); });
-              pCloseTime.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_close_time exited non-zero',code,signal); });
+              // write unified CSV close record (time-stop)
+              try{
+                writeTradeCsv({ id: t.id, label: LABEL, symbol: 'BTC', open_time_iso: t.openedAt, close_time_iso: t.closedAt || new Date().toISOString(), duration_s: Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000), side: t.type, qty: t.size, entry_price: t.entryPrice, exit_price: t.exitPrice, sl: t.stopLoss, tp: t.takeProfit, profit: t.profit, reason_details: t.reasonDetails, action: 'close' });
+              }catch(e){ console.error('writeTradeCsv close time_stop failed', e.message); }
             }catch(e){console.error('csv time_stop write failed',e.message)}
               openTrades.splice(i,1);
             } else if(t.stopLoss && market<=t.stopLoss){
               // close
               const profit = (market - t.entryPrice) * (t.size || 0);
               t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
-              console.log('CLOSE SL (paper):',t.id,t.exitPrice,t.profit);
+              console.log('CLOSE SL (paper):', (t.closedAt? t.closedAt : (t.id? new Date(t.id).toISOString() : '')), t.exitPrice,t.profit);
               try{
               const payloadClose = JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:t.reasonTag,close_reason:(t.exitPrice<=t.stopLoss? 'SL' : (t.exitPrice>=t.takeProfit? 'TP' : 'OTHER')),reason_details:t.reasonDetails,tag:LABEL});
-              const pClose = child_process.spawn('python3',[pythonScriptPath,'close',payloadClose], {stdio:['ignore','pipe','pipe']});
-              pClose.stdout.on('data',(d)=>{ console.log('csv_close stdout:', d.toString().trim()); });
-              pClose.stderr.on('data',(d)=>{ console.error('csv_close stderr:', d.toString().trim()); });
-              pClose.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_close exited non-zero',code,signal); });
+              // write unified CSV close record (SL/OTHER)
+              try{
+                writeTradeCsv({ id: t.id, label: LABEL, symbol: 'BTC', open_time_iso: t.openedAt, close_time_iso: t.closedAt || new Date().toISOString(), duration_s: Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000), side: t.type, qty: t.size, entry_price: t.entryPrice, exit_price: t.exitPrice, sl: t.stopLoss, tp: t.takeProfit, profit: t.profit, reason_details: t.reasonDetails, action: 'close' });
+              }catch(e){ console.error('writeTradeCsv close failed', e.message); }
             }catch(e){console.error('csv close write failed',e.message)}
               openTrades.splice(i,1);
             } else if(t.takeProfit && market>=t.takeProfit){
@@ -302,12 +303,24 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
           }
         }
       }catch(e){console.error('monitor err',e.message)}
-      await sleep(5000);
+      await sleep(1000);
     }
-    // Restore historic multi-line tracing: ok end iter + detailed lines (momentum, sma, params, openTrades). Timestamps in UTC+1
-    const tsUtc1 = (new Date(Date.now()+60*60*1000)).toISOString().replace('Z','+01:00');
-    console.log('ok end iter', tsUtc1, 'decision', JSON.stringify(lastDecision), 'openTrades', openTrades.length);
-    console.log('TRACE_DETAILS: params={k_tp:'+k_tp+',k_sl:'+k_sl+',k_tp_src:'+_k_tp_src+',k_sl_src:'+_k_sl_src+'} momentum='+(lastDecision.momentum_pct||0)+' sma='+(lastDecision.sma||'null')+' trendUp='+(lastDecision.trendUp?1:0));
+    // Restore historic multi-line tracing: ok end iter + detailed lines (momentum, sma, params, openTrades). Print human-readable date (UTC+1)
+    function fmtDateUtc1(d){
+      const dt = new Date(d.getTime()+60*60*1000);
+      const Y = dt.getUTCFullYear();
+      const M = String(dt.getUTCMonth()+1).padStart(2,'0');
+      const D = String(dt.getUTCDate()).padStart(2,'0');
+      const h = String(dt.getUTCHours()).padStart(2,'0');
+      const m = String(dt.getUTCMinutes()).padStart(2,'0');
+      const s = String(dt.getUTCSeconds()).padStart(2,'0');
+      return `${Y}-${M}-${D} ${h}:${m}:${s}`;
+    }
+    const tsHuman = fmtDateUtc1(new Date());
+    // Expanded, human-friendly ITER summary
+    const ld = lastDecision || {};
+    console.log('ITER_SUMMARY:', tsHuman, 'momentum='+(ld.momentum_pct||0),'sma='+(ld.sma||'null'),'smaSlope='+(ld.smaSlope||0),'priceNearSMA='+(ld.priceNearSMA?1:0),'trendUp='+(ld.trendUp?1:0),'shouldEnter='+(ld.shouldEnter?1:0),'effective_min_momentum='+(ld.effective_min_momentum||0),'green_run='+(ld.green_run||0),'openTrades='+openTrades.length);
+    console.log('TRACE_DETAILS: params={k_tp:'+k_tp+',k_sl:'+k_sl+',k_tp_src:'+_k_tp_src+',k_sl_src:'+_k_sl_src+'} momentum='+(ld.momentum_pct||0)+' sma='+(ld.sma||'null')+' trendUp='+(ld.trendUp?1:0));
     // print full openTrades (multi-line) so Watch returns the same style as before
     if(openTrades && openTrades.length>0) {
       for(const ot of openTrades) console.log('OPEN_TRADE:', JSON.stringify(ot));
