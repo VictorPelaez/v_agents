@@ -200,7 +200,8 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       // log effective TP/SL factors and their source
       const _k_tp_src = process.env.K_TP ? 'env' : (skillCfg && skillCfg.K_TP ? 'config' : 'default');
       const _k_sl_src = process.env.K_SL ? 'env' : (skillCfg && skillCfg.K_SL ? 'config' : 'default');
-      console.log('PARAMS: k_tp=',k_tp,'(source=',_k_tp_src+') k_sl=',k_sl,'(source=',_k_sl_src+')');
+      // reduced logging: only report params in ITER_SUMMARY to avoid spamming the log
+      // console.log('PARAMS: k_tp=',k_tp,'(source=',_k_tp_src+') k_sl=',k_sl,'(source=',_k_sl_src+')');
       // final logic: require momentum AND (trend up OR price near/above SMA)
       const shouldEnter = momentumOk && (trendUp || priceNearSMA);
       lastDecision = {momentum_pct: Number((momentum_pct).toFixed(6)), sma: sma?Number(sma.toFixed(2)):null, smaSlope: Number(smaSlope.toFixed(6)), priceNearSMA: !!priceNearSMA, trendUp: !!trendUp, shouldEnter: !!shouldEnter, effective_min_momentum: Number(effectiveMinMom.toFixed(6)), green_run: green_run};
@@ -303,5 +304,6 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       }catch(e){console.error('monitor err',e.message)}
       await sleep(5000);
     }
-    console.log('ok end iter', new Date().toISOString(), 'decision', JSON.stringify(lastDecision), 'openTrades', openTrades.length);
+    // Emit a compact, single-line JSON summary per iter that includes params, decision and openTrades (full array)
+    console.log('ITER_SUMMARY', JSON.stringify({ts:new Date().toISOString(), params:{k_tp:k_tp,k_sl:k_sl,k_tp_src:_k_tp_src,k_sl_src:_k_sl_src}, decision:lastDecision, openTrades:openTrades}));
 })();
