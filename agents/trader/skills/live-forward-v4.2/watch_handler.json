@@ -1,0 +1,14 @@
+{
+  "type": "watch_handler",
+  "target_log": "/root/.openclaw/workspace/agents/trader/logs/trading-bot.live.out",
+  "lines": 10,
+  "filter": [
+    "ITER_SUMMARY",
+    "TRACE_DETAILS_JSON",
+    "OPEN (paper)",
+    "CLOSE TP (paper)",
+    "CLOSE SL (paper)",
+    "OPEN_TRADE:"
+  ],
+  "run_diagnostic": true
+}
