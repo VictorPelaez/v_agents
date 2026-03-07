@@ -57,8 +57,13 @@ function safeWriteJson(p,obj){ try{ fs.writeFileSync(p, JSON.stringify(obj, null
 
 function persistOpenTrade(t){
   try{
-    const arr = safeReadJson(OPEN_TRADES_PATH);
-    // normalize fields
+    // rotate by month: open_trades_YYYYMM.json
+    const dt = new Date(t.openedAt || Date.now());
+    const ym = dt.getUTCFullYear().toString() + String(dt.getUTCMonth()+1).padStart(2,'0');
+    const dir = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`);
+    const file = path.join(dir, `open_trades_${ym}.json`);
+    let arr = [];
+    try{ if(fs.existsSync(file)){ arr = JSON.parse(fs.readFileSync(file,'utf8')) || []; } }catch(e){ arr = []; }
     const rec = {
       id: t.id,
       label: LABEL,
@@ -74,14 +79,19 @@ function persistOpenTrade(t){
       exposure_usd: t.exposureUSD || null
     };
     arr.push(rec);
-    safeWriteJson(OPEN_TRADES_PATH, arr);
+    fs.writeFileSync(file, JSON.stringify(arr,null,2));
     return true;
-  }catch(e){ console.error('persistOpenTrade err', e.message); return false; }
+  }catch(e){ console.error('persistOpenTrade err', e && e.message? e.message : e); return false; }
 }
 
 function persistCloseTrade(t){
   try{
-    const arr = safeReadJson(CLOSE_TRADES_PATH);
+    const dt = new Date(t.closedAt || Date.now());
+    const ym = dt.getUTCFullYear().toString() + String(dt.getUTCMonth()+1).padStart(2,'0');
+    const dir = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`);
+    const file = path.join(dir, `close_trades_${ym}.json`);
+    let arr = [];
+    try{ if(fs.existsSync(file)){ arr = JSON.parse(fs.readFileSync(file,'utf8')) || []; } }catch(e){ arr = []; }
     const rec = {
       id: t.id,
       label: LABEL,
@@ -102,9 +112,9 @@ function persistCloseTrade(t){
       exposure_usd: t.exposureUSD || null
     };
     arr.push(rec);
-    safeWriteJson(CLOSE_TRADES_PATH, arr);
+    fs.writeFileSync(file, JSON.stringify(arr,null,2));
     return true;
-  }catch(e){ console.error('persistCloseTrade err', e.message); return false; }
+  }catch(e){ console.error('persistCloseTrade err', e && e.message? e.message : e); return false; }
 }
 
 async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
