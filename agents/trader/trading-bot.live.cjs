@@ -9,7 +9,7 @@ let pythonScriptPath = process.env.PYTHON_SCRIPT_PATH || path.join(__dirname,'to
 
 
 function writeTradeCsv(entry){
-  // Unified CSV writer: delegate to csv_writer.py to keep format consistent (spawn, non-blocking)
+  // Unified CSV writer: send command to csv_writer_daemon via FIFO (non-blocking append)
   try{
     const payload = {
       id: entry.id,
@@ -29,13 +29,82 @@ function writeTradeCsv(entry){
       reason_details: entry.reasonDetails || ''
     };
     const action = entry.action || 'close';
-    const p = child_process.spawn('python3',[pythonScriptPath,action,JSON.stringify(payload)], {stdio:['ignore','pipe','pipe']});
-    p.stdout.on('data',(d)=>{ console.log('csv_writer stdout:', d.toString().trim()); });
-    p.stderr.on('data',(d)=>{ console.error('csv_writer stderr:', d.toString().trim()); });
-    p.on('exit',(code,signal)=>{
-      if(code!==0) console.error('csv_writer exited non-zero',code,signal);
-    });
-  }catch(e){ console.error('writeTradeCsv (spawn) err', e.message) }
+    // write a single-line JSON command to FIFO
+    const fifoPath = process.env.CSV_FIFO_PATH || path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'csv_cmd.fifo');
+    try{
+      const stream = fs.createWriteStream(fifoPath,{flags:'a'});
+      const cmdObj = { cmd: action, data: payload };
+      stream.write(JSON.stringify(cmdObj) + '\n');
+      stream.end();
+    }catch(e){
+      // fallback to spawn if FIFO fails
+      try{
+        const p = child_process.spawn('python3',[pythonScriptPath,action,JSON.stringify(payload)], {stdio:['ignore','pipe','pipe']});
+        p.stdout.on('data',(d)=>{ console.log('csv_writer stdout:', d.toString().trim()); });
+        p.stderr.on('data',(d)=>{ console.error('csv_writer stderr:', d.toString().trim()); });
+        p.on('exit',(code,signal)=>{ if(code!==0) console.error('csv_writer exited non-zero',code,signal); });
+      }catch(err){ console.error('writeTradeCsv fallback spawn err', err.message) }
+    }
+  }catch(e){ console.error('writeTradeCsv err', e.message) }
+}
+
+// --- Persistencia directa en JSON para reducir lectura de logs y coste de contexto ---
+const OPEN_TRADES_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'open_trades.json');
+const CLOSE_TRADES_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'close_trades.json');
+
+function safeReadJson(p){ try{ if(fs.existsSync(p)){ return JSON.parse(fs.readFileSync(p,'utf8')) || []; } }catch(e){} return []; }
+function safeWriteJson(p,obj){ try{ fs.writeFileSync(p, JSON.stringify(obj, null, 2)); return true;}catch(e){ console.error('safeWriteJson err', e.message); return false; } }
+
+function persistOpenTrade(t){
+  try{
+    const arr = safeReadJson(OPEN_TRADES_PATH);
+    // normalize fields
+    const rec = {
+      id: t.id,
+      label: LABEL,
+      symbol: 'BTC',
+      open_time_iso: t.openedAt || new Date().toISOString(),
+      side: t.type || 'LONG',
+      qty: t.size || t.qty || 0,
+      entry_price: t.entryPrice || t.entry_price || null,
+      sl: t.stopLoss || t.sl || null,
+      tp: t.takeProfit || t.tp || null,
+      reason_tag: t.reasonTag || '',
+      reason_details: t.reasonDetails || {},
+      exposure_usd: t.exposureUSD || null
+    };
+    arr.push(rec);
+    safeWriteJson(OPEN_TRADES_PATH, arr);
+    return true;
+  }catch(e){ console.error('persistOpenTrade err', e.message); return false; }
+}
+
+function persistCloseTrade(t){
+  try{
+    const arr = safeReadJson(CLOSE_TRADES_PATH);
+    const rec = {
+      id: t.id,
+      label: LABEL,
+      symbol: 'BTC',
+      open_time_iso: t.openedAt || '',
+      close_time_iso: t.closedAt || new Date().toISOString(),
+      duration_s: t.duration_s || (t.closedAt && t.openedAt ? Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000) : null),
+      side: t.type || 'LONG',
+      qty: t.size || t.qty || 0,
+      entry_price: t.entryPrice || t.entry_price || null,
+      exit_price: t.exitPrice || t.exit_price || null,
+      sl: t.stopLoss || t.sl || null,
+      tp: t.takeProfit || t.tp || null,
+      profit: t.profit || null,
+      profit_pct: t.profit_pct || null,
+      reason_tag: t.reasonTag || '',
+      reason_details: t.reasonDetails || {},
+      exposure_usd: t.exposureUSD || null
+    };
+    arr.push(rec);
+    safeWriteJson(CLOSE_TRADES_PATH, arr);
+    return true;
+  }catch(e){ console.error('persistCloseTrade err', e.message); return false; }
 }
 
 async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
@@ -206,10 +275,58 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       // final logic: require momentum AND (trend up OR price near/above SMA)
       const shouldEnter = momentumOk && (trendUp || priceNearSMA);
       lastDecision = {momentum_pct: Number((momentum_pct).toFixed(6)), sma: sma?Number(sma.toFixed(2)):null, smaSlope: Number(smaSlope.toFixed(6)), priceNearSMA: !!priceNearSMA, trendUp: !!trendUp, shouldEnter: !!shouldEnter, effective_min_momentum: Number(effectiveMinMom.toFixed(6)), green_run: green_run};
+      // EVALUATION_DETAIL: dump decision inputs and protections for debugging (throttled)
+      const entryCandidate = candle ? candle.close : null;
+      // throttle logging: print eval detail only if decision changes or every LOG_INTERVAL_MS
+      if(typeof globalThis.__lastEvalLogTs === 'undefined') globalThis.__lastEvalLogTs = 0;
+      if(typeof globalThis.__lastDecisionSnap === 'undefined') globalThis.__lastDecisionSnap = '';
+      try{
+        const snapshot = JSON.stringify({momentum_pct:lastDecision.momentum_pct, sma:lastDecision.sma, smaSlope:lastDecision.smaSlope, shouldEnter:lastDecision.shouldEnter, openTrades_count: openTrades.length});
+        const LOG_INTERVAL_MS = parseInt(process.env.EVAL_LOG_INTERVAL_MS || skillCfg.EVAL_LOG_INTERVAL_MS || 60000,10);
+        const now = Date.now();
+        const shouldLog = (snapshot !== globalThis.__lastDecisionSnap) || (now - globalThis.__lastEvalLogTs > LOG_INTERVAL_MS);
+        if(shouldLog){
+          globalThis.__lastDecisionSnap = snapshot;
+          globalThis.__lastEvalLogTs = now;
+          const _entryCandidate = (typeof entryCandidate !== 'undefined') ? entryCandidate : null;
+          const evalDetail = {
+            ts: new Date().toISOString(),
+            entryCandidate: _entryCandidate,
+            momentum_pct: lastDecision.momentum_pct,
+            sma: lastDecision.sma,
+            smaSlope: lastDecision.smaSlope,
+            priceNearSMA: lastDecision.priceNearSMA,
+            trendUp: lastDecision.trendUp,
+            effective_min_momentum: lastDecision.effective_min_momentum,
+            green_run: lastDecision.green_run,
+            openTrades_count: openTrades.length,
+            maxPositions: maxPositions,
+            dup_tolerance_pct: parseFloat(process.env.DUP_TOLERANCE_PCT || skillCfg.DUP_TOLERANCE_PCT || 1e-6),
+            symbol_cooldown_s: parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || skillCfg.SYMBOL_COOLDOWN_SECONDS || 0,10)
+          };
+          console.log('EVALUATION_DETAIL_JSON:', JSON.stringify(evalDetail));
+        }
+      }catch(e){ 
+        console.error('eval detail failed', e.stack || e.message);
+        try{ console.error('EVAL_TRACE_PRE', {entryCandidate: (typeof entryCandidate!=='undefined'? entryCandidate : '<undef>'), openTradesLen: openTrades.length, lastDecision: lastDecision}); }catch(xx){ console.error('EVAL_TRACE_PRE failed', xx && xx.stack? xx.stack : xx);
+        }
+      }
+
       // prevent near-duplicate opens: if an open with almost the same entryPrice already exists, skip
       const DUP_TOLERANCE_PCT = parseFloat(process.env.DUP_TOLERANCE_PCT || skillCfg.DUP_TOLERANCE_PCT || 1e-6);
-      const entryCandidate = candle ? candle.close : null;
-      const alreadySimilar = (entryCandidate !== null) && openTrades.some(ot => ot.entryPrice && Math.abs(ot.entryPrice - entryCandidate) <= Math.abs(entryCandidate) * DUP_TOLERANCE_PCT);
+      const CANDLE_MS = parseInt(process.env.CANDLE_MS || skillCfg.CANDLE_MS || 60000,10);
+      const alreadySimilar = (entryCandidate !== null) && openTrades.some(ot => {
+        if(!ot.entryPrice) return false;
+        const similarPrice = Math.abs(ot.entryPrice - entryCandidate) <= Math.abs(entryCandidate) * DUP_TOLERANCE_PCT;
+        if(!similarPrice) return false;
+        // only treat as duplicate if opened within the same candle window (prevent duplicate in same candle)
+        try{
+          const openedTs = new Date(ot.openedAt).getTime();
+          return (Date.now() - openedTs) <= CANDLE_MS;
+        }catch(e){
+          return false;
+        }
+      });
       const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || skillCfg.SYMBOL_COOLDOWN_SECONDS || 0,10);
       const lastOpenTs = lastOpenBySymbol[symbol] || 0;
       const nowTs = Date.now();
@@ -261,6 +378,7 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
                 writeTradeCsv({ ...csvPayload, action: 'open' });
               }catch(e){ console.error('writeTradeCsv open call failed', e.message); }
             }catch(e){console.error('csv open write failed',e.message)}
+            try{ persistOpenTrade(trade); }catch(e){ console.error('persistOpenTrade failed', e && e.message ? e.message : e); }
           }
         }
     }
@@ -287,6 +405,7 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
                 writeTradeCsv({ id: t.id, label: LABEL, symbol: 'BTC', open_time_iso: t.openedAt, close_time_iso: t.closedAt || new Date().toISOString(), duration_s: Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000), side: t.type, qty: t.size, entry_price: t.entryPrice, exit_price: t.exitPrice, sl: t.stopLoss, tp: t.takeProfit, profit: t.profit, reason_details: t.reasonDetails, action: 'close' });
               }catch(e){ console.error('writeTradeCsv close time_stop failed', e.message); }
             }catch(e){console.error('csv time_stop write failed',e.message)}
+            try{ persistCloseTrade(t); }catch(e){ console.error('persistCloseTrade failed', e && e.message? e.message : e); }
               openTrades.splice(i,1);
             } else if(t.stopLoss && market<=t.stopLoss){
               // close
@@ -300,6 +419,7 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
                 writeTradeCsv({ id: t.id, label: LABEL, symbol: 'BTC', open_time_iso: t.openedAt, close_time_iso: t.closedAt || new Date().toISOString(), duration_s: Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000), side: t.type, qty: t.size, entry_price: t.entryPrice, exit_price: t.exitPrice, sl: t.stopLoss, tp: t.takeProfit, profit: t.profit, reason_details: t.reasonDetails, action: 'close' });
               }catch(e){ console.error('writeTradeCsv close failed', e.message); }
             }catch(e){console.error('csv close write failed',e.message)}
+            try{ persistCloseTrade(t); }catch(e){ console.error('persistCloseTrade failed', e && e.message? e.message : e); }
               openTrades.splice(i,1);
             } else if(t.takeProfit && market>=t.takeProfit){
               const profit = (market - t.entryPrice) * (t.size || 0);
