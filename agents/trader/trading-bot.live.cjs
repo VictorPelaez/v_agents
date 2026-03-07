@@ -4,6 +4,7 @@ const astBase = process.env.BINANCE_API_BASE || 'https://api.binance.com';
 let BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
 try{ if(!BINANCE_API_KEY){ const keyPath = path.join(__dirname,'API_KEYS.md'); if(fs.existsSync(keyPath)){ BINANCE_API_KEY = fs.readFileSync(keyPath,'utf8').split(/\r?\n/)[0].trim(); } } }catch(e){ BINANCE_API_KEY=''; }
 const LABEL = process.env.LABEL || 'V4.2';
+let lastTradeCandle = null;
 const CSV_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'TRADE_LOG_ad.csv');
 let pythonScriptPath = process.env.PYTHON_SCRIPT_PATH || path.join(__dirname,'tools','csv_writer.py');
 
@@ -49,19 +50,28 @@ function writeTradeCsv(entry){
 }
 
 // --- Persistencia directa en JSON para reducir lectura de logs y coste de contexto ---
-const OPEN_TRADES_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'open_trades.json');
-const CLOSE_TRADES_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'close_trades.json');
+// const OPEN_TRADES_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'open_trades.json');
+// const CLOSE_TRADES_PATH = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`,'close_trades.json');
 
-function safeReadJson(p){ try{ if(fs.existsSync(p)){ return JSON.parse(fs.readFileSync(p,'utf8')) || []; } }catch(e){} return []; }
-function safeWriteJson(p,obj){ try{ fs.writeFileSync(p, JSON.stringify(obj, null, 2)); return true;}catch(e){ console.error('safeWriteJson err', e.message); return false; } }
+// function safeReadJson(p){ try{ if(fs.existsSync(p)){ return JSON.parse(fs.readFileSync(p,'utf8')) || []; } }catch(e){} return []; }
+// function safeWriteJson(p,obj){ try{ fs.writeFileSync(p, JSON.stringify(obj, null, 2)); return true;}catch(e){ console.error('safeWriteJson err', e.message); return false; } }
 
 function persistOpenTrade(t){
   try{
     // rotate by month: open_trades_YYYYMM.json
     const dt = new Date(t.openedAt || Date.now());
-    const ym = dt.getUTCFullYear().toString() + String(dt.getUTCMonth()+1).padStart(2,'0');
+    const ymd = dt.getUTCFullYear().toString()
+          + String(dt.getUTCMonth()+1).padStart(2,'0')
+          + String(dt.getUTCDate()).padStart(2,'0'); // añade día
+        
     const dir = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`);
-    const file = path.join(dir, `open_trades_${ym}.json`);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+   
+    const file = path.join(dir, `open_trades_${ymd}.json`);
+    // Crear archivo con [] si no existe
+    if (!fs.existsSync(file)) { fs.writeFileSync(file, JSON.stringify([], null, 2)); }
+        
+    // const file = path.join(dir, `open_trades_${ym}.json`);
     let arr = [];
     try{ if(fs.existsSync(file)){ arr = JSON.parse(fs.readFileSync(file,'utf8')) || []; } }catch(e){ arr = []; }
     const rec = {
@@ -87,9 +97,18 @@ function persistOpenTrade(t){
 function persistCloseTrade(t){
   try{
     const dt = new Date(t.closedAt || Date.now());
-    const ym = dt.getUTCFullYear().toString() + String(dt.getUTCMonth()+1).padStart(2,'0');
+    // const ym = dt.getUTCFullYear().toString() + String(dt.getUTCMonth()+1).padStart(2,'0');
+    const ymd = dt.getUTCFullYear().toString()
+          + String(dt.getUTCMonth()+1).padStart(2,'0')
+          + String(dt.getUTCDate()).padStart(2,'0');
+
     const dir = path.join(__dirname,'skills',`live-forward-${LABEL.toLowerCase()}`);
-    const file = path.join(dir, `close_trades_${ym}.json`);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        
+    const file = path.join(dir, `close_trades_${ymd}.json`);
+    // Crear archivo con [] si no existe
+    if (!fs.existsSync(file)) { fs.writeFileSync(file, JSON.stringify([], null, 2)); }    
+
     let arr = [];
     try{ if(fs.existsSync(file)){ arr = JSON.parse(fs.readFileSync(file,'utf8')) || []; } }catch(e){ arr = []; }
     const rec = {
@@ -265,7 +284,7 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       // determine how many consecutive green candles up to GREEN_KLINES
       let green_run = 0;
       if(GREEN_KLINES>0 && Array.isArray(klines)){
-        for(let j=klines.length-1;j>0 && green_run < GREEN_KLINES;j--){
+        for(let j=klines.length-2;j>0 && green_run < GREEN_KLINES;j--){
           const cur = +klines[j][4]; const op = +klines[j][1];
           if(cur>op) green_run++; else break;
         }
@@ -322,7 +341,7 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
         console.error('eval detail failed', e.stack || e.message);
         try{ console.error('EVAL_TRACE_PRE', {entryCandidate: (typeof entryCandidate!=='undefined'? entryCandidate : '<undef>'), openTradesLen: openTrades.length, lastDecision: lastDecision}); }catch(xx){ console.error('EVAL_TRACE_PRE failed', xx && xx.stack? xx.stack : xx);
         }
-      }
+       }
 
       // prevent near-duplicate opens: if an open with almost the same entryPrice already exists, skip
       const DUP_TOLERANCE_PCT = parseFloat(process.env.DUP_TOLERANCE_PCT || skillCfg.DUP_TOLERANCE_PCT || 1e-6);
@@ -343,7 +362,13 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
       const lastOpenTs = lastOpenBySymbol[symbol] || 0;
       const nowTs = Date.now();
       const withinCooldown = (cooldown_s>0) && ((nowTs - lastOpenTs) < cooldown_s*1000);
-      if(shouldEnter && openTrades.length<maxPositions && !alreadySimilar && !withinCooldown){
+      
+      // Just one trade with this candle      
+      const candleMinute = Math.floor(candle.ts / 60000);
+      const alreadyOpenedThisCandle = lastTradeCandle === candleMinute;      
+      // if(lastTradeCandle === candleTs){console.log("skip: trade already opened in this candle"); return;}
+
+      if(shouldEnter && openTrades.length<maxPositions && !alreadySimilar && !withinCooldown && !alreadyOpenedThisCandle){
           const entryPrice=candle.close; const ktp=k_tp; const ksl=k_sl;
           const effectiveATR = atr_pct; // usar ATR calculado directamente (fórmula simple)
           let stopLoss = entryPrice * (1 - ksl * effectiveATR);
@@ -373,13 +398,15 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
           }
           const qty = Number((riskUSD / stopDistanceUSD).toFixed(8));
 
+          console.log('CHECK SL:', 'entry=',entryPrice, 'SL=',stopLoss, 'candleLow=', candle ? candle.low : 'null');
+
           // intrabar validation: if the candle low already touches the stopLoss, skip opening (would have died inside the candle)
           let trade = null;
           if(candle && typeof candle.low !== 'undefined' && candle.low <= stopLoss){
             console.log('trade skipped: SL inside candle (would have triggered before entry)', {entryPrice, stopLoss, candleLow:candle.low});
-          } else {
-            const exposureUSD = Number((entryPrice * qty).toFixed(2));
-            trade = {id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};
+          } else {lastTradeCandle = candleMinute; const exposureUSD = Number((entryPrice * qty).toFixed(2));
+            trade = {id:Date.now(),entryPrice,stopLoss,takeProfit,openedAt:new Date().toISOString(),size:qty,exposureUSD:exposureUSD,type:'LONG',reasonTag:reasonTag,reasonDetails:reasonDet};    
+          
             openTrades.push(trade);
             console.log('OPEN (paper):', (trade.openedAt? trade.openedAt : new Date(trade.id).toISOString()), trade.entryPrice,'SL',trade.stopLoss,'TP',trade.takeProfit,'REASON',reasonTag,reasonDet);
             try{
@@ -390,13 +417,14 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
                 writeTradeCsv({ ...csvPayload, action: 'open' });
               }catch(e){ console.error('writeTradeCsv open call failed', e.message); }
             }catch(e){console.error('csv open write failed',e.message)}
-            try{ persistOpenTrade(trade); }catch(e){ console.error('persistOpenTrade failed', e && e.message ? e.message : e); }
+            try{ persistOpenTrade(trade);}catch(e){ console.error('persistOpenTrade failed', e && e.message ? e.message : e); }
           }
-        }
-    }
+        } 
+    // } ERROR
 
-    // monitor open trades by price every 5s for up to minHoldS
+    // monitor open trades by price every 1s for up to minHoldS
     const monitorStart=Date.now();
+    console.log('ENTER MONITOR LOOP:', new Date().toISOString(), ' openTrades=', openTrades.length);
     while(Date.now()-monitorStart < 60*1000){ // check up to 1 minute before next candle fetch
       try{
         const market=await getTicker();
@@ -407,9 +435,10 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
             if(age<minHoldS) continue; // enforce minimal hold
             if(age > timeStopMinutes*60){
               // time-stop forced close
+              console.log('debug-time-stop forced close'); 
               const profit = (market - t.entryPrice) * (t.size || 0);
               t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
-              console.log('CLOSE TIME_STOP (paper):', (t.closedAt? t.closedAt : (t.id? new Date(t.id).toISOString() : '')), t.exitPrice,t.profit,'age_s',Math.round(age));
+              console.log('CLOSE TIME_STOP:', (t.closedAt? t.closedAt : (t.id? new Date(t.id).toISOString() : '')), t.exitPrice,t.profit,'age_s',Math.round(age));
               try{
               const payloadCloseTime = JSON.stringify({id:t.id,label:LABEL,symbol:'BTC',open_time_iso:t.openedAt,close_time_iso:t.closedAt,duration_s:Math.round((new Date(t.closedAt).getTime()-new Date(t.openedAt).getTime())/1000),side:t.type,qty:t.size,entry_price:t.entryPrice,exit_price:t.exitPrice,sl:t.stopLoss,tp:t.takeProfit,profit:t.profit,profit_pct:'',mfe:'',mae:'',reason_tag:'time_stop',close_reason:'time_stop',reason_details:t.reasonDetails,tag:LABEL});
               // write unified CSV close record (time-stop)
@@ -421,6 +450,7 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
               openTrades.splice(i,1);
             } else if(t.stopLoss && market<=t.stopLoss){
               // close
+              console.log('debug-sl close');
               const profit = (market - t.entryPrice) * (t.size || 0);
               t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
               console.log('CLOSE SL (paper):', (t.closedAt? t.closedAt : (t.id? new Date(t.id).toISOString() : '')), t.exitPrice,t.profit);
@@ -436,14 +466,16 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
             } else if(t.takeProfit && market>=t.takeProfit){
               const profit = (market - t.entryPrice) * (t.size || 0);
               t.exitPrice=market; t.profit=profit; t.closedAt=new Date().toISOString();
-              console.log('CLOSE TP (paper):',t.id,t.exitPrice,t.profit);
+              console.log('CLOSE TP:', (t.closedAt? t.closedAt : (t.id? new Date(t.id).toISOString() : '')), t.exitPrice,t.profit);              
+              // console.log('CLOSE TP (paper):',t.id,t.exitPrice,t.profit);
               writeTradeCsv({...t, action:'close', timestamp:new Date().toISOString()});
               openTrades.splice(i,1);
             }
           }
         }
       }catch(e){console.error('monitor err',e.message)}
-      await sleep(1000);
+      await sleep(500);
+    }
     }
     // Restore historic multi-line tracing: ok end iter + detailed lines (momentum, sma, params, openTrades). Print human-readable date (UTC+1)
     function fmtDateUtc1(d){
