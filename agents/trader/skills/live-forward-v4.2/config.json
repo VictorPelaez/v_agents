@@ -1,6 +1,6 @@
 {
   "SYMBOL_COOLDOWN_SECONDS": 180,
-  "MIN_MOMENTUM_PCT": 0.0005,
+  "MIN_MOMENTUM_PCT": 0.0003,
   "MAX_TRADES_PER_HOUR": 15,
   "CANDLE_MS": 60000,
   "TIME_STOP_MINUTES": 25,
@@ -8,7 +8,7 @@
   "K_SL": 1.0,
   "ASTER_API_BASE": "https://fapi.asterdex.com",
   "HISTORY_DAYS": 30,
-  "NO_BACKFILL": false,
+  "NO_BACKFILL": true,
   "strategy": {
     "asset": "BTC"
   },

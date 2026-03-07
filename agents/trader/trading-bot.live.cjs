@@ -302,6 +302,8 @@ async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
           const evalDetail = {
             ts: new Date().toISOString(),
             entryCandidate: _entryCandidate,
+            candle_price: _entryCandidate,
+            shouldEnter: !!lastDecision.shouldEnter,
             momentum_pct: lastDecision.momentum_pct,
             sma: lastDecision.sma,
             smaSlope: lastDecision.smaSlope,
