@@ -5,10 +5,6 @@
  *
  * Clean redesign principles:
  * - Single source of truth: daily append-only JSONL journal.
- * - No CSV.
- * - No FIFO.
- * - No runtime_state.json.
- * - No open_trades.json / close_trades.json arrays.
  * - Single-process lock.
  * - Rebuild open positions from the journal at startup.
  * - Deduplicate by logical signal key, not by id or open timestamp.
@@ -613,6 +609,8 @@ async function gracefulShutdown(signal) {
     const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfg.SMA_TOLERANCE || 0.001);
     const priceNearSMA = (sma !== null && candle) ? (candle.close >= sma * (1 - smaTol)) : true;
     const trendUp = smaSlope > 0;
+    // 09-03 adove SMA
+    const priceAboveSMA = (sma !== null && candle) ? (candle.close > sma) : true;
 
     let green_run = 0;
     if (GREEN_KLINES > 0 && Array.isArray(klines)) {
@@ -629,13 +627,14 @@ async function gracefulShutdown(signal) {
     }
 
     const momentumOk = momentum_pct >= effectiveMinMom;
-    const shouldEnter = momentumOk && (trendUp || priceNearSMA);
+    const shouldEnter = momentumOk && trendUp && priceNearSMA && priceAboveSMA;
 
     state.lastDecision = {
       momentum_pct: Number(momentum_pct.toFixed(6)),
       sma: sma != null ? Number(sma.toFixed(2)) : null,
       smaSlope: Number(smaSlope.toFixed(6)),
       priceNearSMA: !!priceNearSMA,
+      priceAboveSMA: !!priceAboveSMA,
       trendUp: !!trendUp,
       shouldEnter: !!shouldEnter,
       effective_min_momentum: Number(effectiveMinMom.toFixed(6)),
@@ -674,10 +673,14 @@ async function gracefulShutdown(signal) {
       const riskUSD = skillCapital * riskPct;
       const stopDistanceUSD = entryPrice - stopLoss;
 
+      // 09-03 filter inside candle
+      const current = klines[klines.length - 1];
+      const currentLow  = +current[3];
+
       if (stopDistanceUSD <= 0) {
         console.error('invalid stop distance, skipping trade', { entryPrice, stopLoss });
-      } else if (candle.low <= stopLoss) {
-        console.log('trade skipped: SL inside candle (would have triggered before entry)', { entryPrice, stopLoss, candleLow: candle.low });
+      } else if (currentLow <= stopLoss) {
+        console.log('Trade skipped: SL inside candle', { entryPrice, stopLoss, currentLow, candleLow: candle.low });
       } else {
         const qty = Number((riskUSD / stopDistanceUSD).toFixed(8));
         const reasonDet = {
@@ -750,18 +753,20 @@ async function gracefulShutdown(signal) {
       'sma=' + (state.lastDecision.sma || 'null'),
       'smaSlope=' + (state.lastDecision.smaSlope || 0),
       'priceNearSMA=' + (state.lastDecision.priceNearSMA ? 1 : 0),
+      'priceAboveSMA=' + (state.lastDecision.priceAboveSMA ? 1 : 0),      
       'trendUp=' + (state.lastDecision.trendUp ? 1 : 0),
       'shouldEnter=' + (state.lastDecision.shouldEnter ? 1 : 0),
       'effective_min_momentum=' + (state.lastDecision.effective_min_momentum || 0),
       'green_run=' + (state.lastDecision.green_run || 0),
       'openTrades=' + state.openTradesById.size
     );
+    console.log('---------------------------------------------\n');
 
-    console.log('TRACE_DETAILS_JSON:', JSON.stringify({
-      params: { k_tp, k_sl, k_tp_src: _k_tp_src, k_sl_src: _k_sl_src },
-      decision: state.lastDecision,
-      openTradesCount: state.openTradesById.size
-    }));
+    // console.log('TRACE_DETAILS_JSON:', JSON.stringify({
+    //  params: { k_tp, k_sl, k_tp_src: _k_tp_src, k_sl_src: _k_sl_src },
+    //  decision: state.lastDecision,
+    //  openTradesCount: state.openTradesById.size
+    // }));
 
     for (const ot of getOpenTradesArray()) {
       console.log('OPEN_TRADE:', JSON.stringify(ot));
