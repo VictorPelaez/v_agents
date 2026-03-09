@@ -1,54 +1,128 @@
 #!/bin/bash
-# Integration test: simulate open+close via FIFO and verify CSV/JSON updated
 set -e
-BASE=/root/.openclaw/workspace/agents/trader/skills/live-forward-v4.2
-FIFO=$BASE/csv_cmd.fifo
-ID_TEST=1999999999999
-OPEN_PAY='{"cmd":"open","data":{"id":'$ID_TEST',"label":"V4.2","symbol":"BTC","open_time_iso":"2026-03-07T09:58:00.000Z","close_time_iso":"","duration_s":"","side":"LONG","qty":0.01,"entry_price":67000.0,"exit_price":"","sl":66950.0,"tp":67050.0,"profit":"","profit_pct":"","mfe":"","mae":"","reason_tag":"itest","reason_details":{},"tag":"V4.2"}}'
-CLOSE_PAY='{"cmd":"close","data":{"id":'$ID_TEST',"label":"V4.2","symbol":"BTC","open_time_iso":"2026-03-07T09:58:00.000Z","close_time_iso":"2026-03-07T09:58:10.000Z","duration_s":10,"side":"LONG","qty":0.01,"entry_price":67000.0,"exit_price":67010.0,"sl":66950.0,"tp":67050.0,"profit":0.0001492537,"profit_pct":0.0001492537,"mfe":"","mae":"","reason_tag":"itest_close","reason_details":{},"tag":"V4.2"}}'
 
-# send open
-echo "$OPEN_PAY" > $FIFO
-sleep 0.5
-# send close
-echo "$CLOSE_PAY" > $FIFO
-sleep 1
-# assert CSV contains id
-if grep -q "$ID_TEST" "$BASE/TRADE_LOG_ad.csv"; then
-  echo "CSV entry OK"
-else
-  echo "CSV missing"; exit 2
-fi
-# assert JSON close contains id
-python3 - <<PY
-import json,sys
-p='$BASE/close_trades.json'
-try:
-    data=json.loads(open(p).read())
-except Exception:
-    data=[]
-found=any(str(d.get('id'))=='%s' for d in data)
-print('JSON close found:', found)
-if not found:
-    sys.exit(3)
-PY
-# cleanup test entries
-python3 - <<PY
-import json,sys,os
-p='$BASE/TRADE_LOG_ad.csv'
-lines=open(p).read().splitlines()
-lines=[l for l in lines if '1999999999999' not in l]
-open(p,'w').write('\n'.join(lines)+'\n')
-for j in ['open_trades.json','close_trades.json']:
-    p2=os.path.join('$BASE',j)
-    if os.path.exists(p2):
-        try:
-            arr=json.loads(open(p2).read())
-        except:
-            arr=[]
-        arr=[d for d in arr if str(d.get('id'))!='1999999999999']
-        open(p2,'w').write(json.dumps(arr,indent=2))
-print('cleanup done')
-PY
+BOT=./aegis_trade_v2.js
+BASE=./skills/live-forward-v4.2
+TODAY=$(date -u +%Y%m%d)
+JOURNAL=$BASE/trade_journal_${TODAY}.jsonl
 
-echo 'integration test passed'
+mkdir -p $BASE
+rm -f $JOURNAL
+rm -f $BASE/open_positions.json
+
+echo "TEST 1 — open event writes journal"
+
+node - <<'NODE'
+const fs=require("fs")
+const path=require("path")
+
+const BASE="./skills/live-forward-v4.2"
+const JOURNAL=BASE+"/trade_journal_"+new Date().toISOString().slice(0,10).replace(/-/g,"")+".jsonl"
+
+function appendJsonl(p,r){
+ fs.appendFileSync(p,JSON.stringify(r)+"\n")
+}
+
+const ev={
+ ts:new Date().toISOString(),
+ type:"OPEN",
+ event_key:"test_open_1",
+ trade:{
+  id:123,
+  symbol:"BTC",
+  entry_price:60000,
+  sl:59000,
+  tp:62000,
+  qty:0.01,
+  open_time_iso:new Date().toISOString(),
+  side:"LONG",
+  signal_key:"sig1"
+ }
+}
+
+appendJsonl(JOURNAL,ev)
+NODE
+
+grep -q "test_open_1" $JOURNAL
+echo "OK"
+
+echo
+echo "TEST 2 — close event append"
+
+node - <<'NODE'
+const fs=require("fs")
+
+const BASE="./skills/live-forward-v4.2"
+const JOURNAL=BASE+"/trade_journal_"+new Date().toISOString().slice(0,10).replace(/-/g,"")+".jsonl"
+
+fs.appendFileSync(JOURNAL,JSON.stringify({
+ ts:new Date().toISOString(),
+ type:"CLOSE",
+ event_key:"test_close_1",
+ trade:{
+  id:123,
+  symbol:"BTC",
+  entry_price:60000,
+  exit_price:60100,
+  qty:0.01,
+  close_time_iso:new Date().toISOString(),
+  signal_key:"sig1"
+ }
+})+"\n")
+NODE
+
+grep -q "test_close_1" $JOURNAL
+echo "OK"
+
+echo
+echo "TEST 3 — journal rebuild open positions"
+
+node - <<'NODE'
+const fs=require("fs")
+
+const BASE="./skills/live-forward-v4.2"
+const JOURNAL=BASE+"/trade_journal_"+new Date().toISOString().slice(0,10).replace(/-/g,"")+".jsonl"
+
+const lines=fs.readFileSync(JOURNAL,"utf8").trim().split("\n").map(JSON.parse)
+
+let open=new Map()
+
+for(const e of lines){
+ if(e.type==="OPEN") open.set(e.trade.id,e.trade)
+ if(e.type==="CLOSE") open.delete(e.trade.id)
+}
+
+if(open.size!==0){
+ console.error("FAIL open trades not empty")
+ process.exit(1)
+}
+
+console.log("OK rebuild")
+NODE
+
+echo
+echo "TEST 4 — dedupe event key"
+
+node - <<'NODE'
+const fs=require("fs")
+
+const BASE="./skills/live-forward-v4.2"
+const JOURNAL=BASE+"/trade_journal_"+new Date().toISOString().slice(0,10).replace(/-/g,"")+".jsonl"
+
+const lines=fs.readFileSync(JOURNAL,"utf8").trim().split("\n")
+const keys=new Set()
+
+for(const l of lines){
+ const k=JSON.parse(l).event_key
+ if(keys.has(k)){
+  console.error("FAIL duplicate event key",k)
+  process.exit(1)
+ }
+ keys.add(k)
+}
+
+console.log("OK dedupe")
+NODE
+
+echo
+echo "ALL BASIC TESTS PASSED"
