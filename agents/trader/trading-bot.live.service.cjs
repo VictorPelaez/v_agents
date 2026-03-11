@@ -542,6 +542,7 @@ async function gracefulShutdown(signal) {
   const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || cfg.HTTP_TIMEOUT_MS || 2500, 10);
   const candleBucketMs = parseInt(process.env.SIGNAL_BUCKET_MS || cfg.SIGNAL_BUCKET_MS || 60000, 10);
   const signalCooldownMs = parseInt(process.env.SIGNAL_COOLDOWN_MS || cfg.SIGNAL_COOLDOWN_MS || 180000, 10);
+  const explosiveCandlePct = parseFloat(process.env.EXPLOSIVE_CANDLE_PCT || cfg.EXPLOSIVE_CANDLE_PCT || 0.003);
 
   rebuildStateFromJournal();
   startSnapshotTimer();
@@ -561,7 +562,7 @@ async function gracefulShutdown(signal) {
     let smaPrev = null;
     let atr_pct = 0;
     let candle = null;
-
+    
     const k_tp = parseFloat(process.env.K_TP || cfg.K_TP || '2.0');
     const k_sl = parseFloat(process.env.K_SL || cfg.K_SL || '1.2');
     const _k_tp_src = process.env.K_TP ? 'env' : (cfg.K_TP ? 'config' : 'default');
@@ -609,7 +610,8 @@ async function gracefulShutdown(signal) {
     const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfg.SMA_TOLERANCE || 0.001);
     const priceNearSMA = (sma !== null && candle) ? (candle.close >= sma * (1 - smaTol)) : true;
     const trendUp = smaSlope > 0;
-    // 09-03 adove SMA
+    
+    // (09/03) Filter: Adove SMA
     const priceAboveSMA = (sma !== null && candle) ? (candle.close > sma) : true;
 
     let green_run = 0;
@@ -660,7 +662,44 @@ async function gracefulShutdown(signal) {
     const candleMinute = candle ? Math.floor(candle.ts / 60000) : null;
     const alreadyOpenedThisCandle = candleMinute !== null && lastTradeCandle === candleMinute;
 
-    if (candle && shouldEnter && state.openTradesById.size < maxPositions && !alreadySimilar && !withinCooldown && !alreadyOpenedThisCandle) {
+    // (10/03) FILTER: explosive previous candle
+    let candleExplosive = false
+    if (Array.isArray(klines) && klines.length >= 4 && candle) {
+      candleExplosive = [2,3].some(i => {
+      const k = klines[klines.length - i];
+      const range = (+k[2] - +k[3]) / +k[4];
+      return range > explosiveCandlePct;
+    });
+
+    if (candleExplosive) {
+      const ranges = [2,3].map(i => {
+        const k = klines[klines.length - i];
+        return (+k[2] - +k[3]) / +k[4];
+      });
+
+      console.log("Filter: explosive candle:", {
+        ranges: ranges.map(r => Number(r.toFixed(6))),
+        explosiveCandlePct: Number(explosiveCandlePct.toFixed(6))
+       });
+      }
+    }
+
+    // (11/03) FILTER: weak open (current candle opens below previous closes)
+    let weakOpen = false;
+
+    if (candle) {
+      weakOpen = candle.open < last && candle.open < prev;
+
+      if (weakOpen) {
+        console.log("Filter: weak open", {
+        open: Number(candle.open.toFixed(2)),
+        lastClose: Number(last.toFixed(2)),
+        prevClose: Number(prev.toFixed(2))
+        });
+      }
+    }
+
+    if (candle && shouldEnter && state.openTradesById.size < maxPositions && !alreadySimilar && !withinCooldown && !alreadyOpenedThisCandle && !candleExplosive && !weakOpen) {
       const entryPrice = candle.close;
       const effectiveATR = atr_pct;
       let stopLoss = entryPrice * (1 - k_sl * effectiveATR);
@@ -755,18 +794,13 @@ async function gracefulShutdown(signal) {
       'priceNearSMA=' + (state.lastDecision.priceNearSMA ? 1 : 0),
       'priceAboveSMA=' + (state.lastDecision.priceAboveSMA ? 1 : 0),      
       'trendUp=' + (state.lastDecision.trendUp ? 1 : 0),
+      'candleExplosive=' + (candleExplosive ? 1 : 0),
       'shouldEnter=' + (state.lastDecision.shouldEnter ? 1 : 0),
       'effective_min_momentum=' + (state.lastDecision.effective_min_momentum || 0),
       'green_run=' + (state.lastDecision.green_run || 0),
       'openTrades=' + state.openTradesById.size
     );
     console.log('---------------------------------------------\n');
-
-    // console.log('TRACE_DETAILS_JSON:', JSON.stringify({
-    //  params: { k_tp, k_sl, k_tp_src: _k_tp_src, k_sl_src: _k_sl_src },
-    //  decision: state.lastDecision,
-    //  openTradesCount: state.openTradesById.size
-    // }));
 
     for (const ot of getOpenTradesArray()) {
       console.log('OPEN_TRADE:', JSON.stringify(ot));
