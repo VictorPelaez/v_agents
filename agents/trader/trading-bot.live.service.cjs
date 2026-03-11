@@ -543,6 +543,7 @@ async function gracefulShutdown(signal) {
   const candleBucketMs = parseInt(process.env.SIGNAL_BUCKET_MS || cfg.SIGNAL_BUCKET_MS || 60000, 10);
   const signalCooldownMs = parseInt(process.env.SIGNAL_COOLDOWN_MS || cfg.SIGNAL_COOLDOWN_MS || 180000, 10);
   const explosiveCandlePct = parseFloat(process.env.EXPLOSIVE_CANDLE_PCT || cfg.EXPLOSIVE_CANDLE_PCT || 0.003);
+  const tradeUSD = parseFloat(process.env.TRADE_USD || cfg.TRADE_USD || 100.0);
 
   rebuildStateFromJournal();
   startSnapshotTimer();
@@ -551,6 +552,7 @@ async function gracefulShutdown(signal) {
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
   while (!shutdownRequested) {
+    const tsStartIter = fmtDateUtc1(new Date());
     cleanupRecentSignals();
 
     const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || cfg.SMA_WINDOW || 60, 10);
@@ -631,7 +633,7 @@ async function gracefulShutdown(signal) {
     const momentumOk = momentum_pct >= effectiveMinMom;
     const shouldEnter = momentumOk && trendUp && priceNearSMA && priceAboveSMA;
 
-    state.lastDecision = {
+    state.lastDectsStartIterision = {
       momentum_pct: Number(momentum_pct.toFixed(6)),
       sma: sma != null ? Number(sma.toFixed(2)) : null,
       smaSlope: Number(smaSlope.toFixed(6)),
@@ -684,18 +686,22 @@ async function gracefulShutdown(signal) {
       }
     }
 
-    // (11/03) FILTER: weak open (current candle opens below previous closes)
+    // (11/03) FILTER: weak open (current candle opens below previous candles)
     let weakOpen = false;
 
-    if (candle) {
-      weakOpen = candle.open < last && candle.open < prev;
+    if (Array.isArray(klines) && klines.length >= 4 && candle) {
+      const prev1 = klines[klines.length - 2];
+      const prev2 = klines[klines.length - 3];
+      const prev1Close = +prev1[4];
+      const prev2Close = +prev2[4];
+      weakOpen = candle.open < prev1Close && candle.open < prev2Close;
 
-      if (weakOpen) {
-        console.log("Filter: weak open", {
+    if (weakOpen) {
+      console.log("Filter: weak open detected", {
         open: Number(candle.open.toFixed(2)),
-        lastClose: Number(last.toFixed(2)),
-        prevClose: Number(prev.toFixed(2))
-        });
+        prev1Close: Number(prev1Close.toFixed(2)),
+        prev2Close: Number(prev2Close.toFixed(2))
+       });
       }
     }
 
@@ -704,8 +710,8 @@ async function gracefulShutdown(signal) {
       const effectiveATR = atr_pct;
       let stopLoss = entryPrice * (1 - k_sl * effectiveATR);
       const takeProfit = entryPrice * (1 + k_tp * effectiveATR);
-      const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || cfg.MIN_SL_USD || 50);
 
+      const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || cfg.MIN_SL_USD || 50);
       const stopDistance = entryPrice - stopLoss;
       if (stopDistance < MIN_SL_USD) stopLoss = entryPrice - MIN_SL_USD;
 
@@ -717,12 +723,13 @@ async function gracefulShutdown(signal) {
       const currentLow  = +current[3];
 
       if (stopDistanceUSD <= 0) {
-        console.error('invalid stop distance, skipping trade', { entryPrice, stopLoss });
+        console.error('Trade skipped: Invalid stop distance', { entryPrice, stopLoss });
       } else if (currentLow <= stopLoss) {
         console.log('Trade skipped: SL inside candle', { entryPrice, stopLoss, currentLow, candleLow: candle.low });
       } else {
-        const qty = Number((riskUSD / stopDistanceUSD).toFixed(8));
-        const reasonDet = {
+        // const qty = Number((riskUSD / stopDistanceUSD).toFixed(8));
+         const qty = Number((tradeUSD / entryPrice).toFixed(8));
+         const reasonDet = {
           momentum_pct: Number(momentum_pct.toFixed(6)),
           sma: sma != null ? Number(sma.toFixed(2)) : null,
           atr_pct: Number(atr_pct.toFixed(6)),
@@ -787,6 +794,7 @@ async function gracefulShutdown(signal) {
     const tsHuman = fmtDateUtc1(new Date());
     console.log(
       'ITER_SUMMARY:',
+      tsStartIter,
       tsHuman,
       'momentum=' + (state.lastDecision.momentum_pct || 0),
       'sma=' + (state.lastDecision.sma || 'null'),
