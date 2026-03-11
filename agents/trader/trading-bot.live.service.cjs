@@ -633,7 +633,7 @@ async function gracefulShutdown(signal) {
     const momentumOk = momentum_pct >= effectiveMinMom;
     const shouldEnter = momentumOk && trendUp && priceNearSMA && priceAboveSMA;
 
-    state.lastDectsStartIterision = {
+    state.lastDecision = {
       momentum_pct: Number(momentum_pct.toFixed(6)),
       sma: sma != null ? Number(sma.toFixed(2)) : null,
       smaSlope: Number(smaSlope.toFixed(6)),
