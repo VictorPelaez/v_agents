@@ -714,8 +714,8 @@ async function gracefulShutdown(signal) {
       // const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || cfg.MIN_SL_USD || 50);
       const stopDistance = entryPrice - stopLoss;
       // if (stopDistance < MIN_SL_USD) stopLoss = entryPrice - MIN_SL_USD;
-      // const riskUSD = skillCapital * riskPct;
-      // const stopDistanceUSD = entryPrice - stopLoss;
+      const riskUSD = skillCapital * riskPct;
+      const stopDistanceUSD = entryPrice - stopLoss;
 
       // 09-03 filter inside candle
       const current = klines[klines.length - 1];
