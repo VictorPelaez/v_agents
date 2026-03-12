@@ -545,6 +545,7 @@ async function gracefulShutdown(signal) {
   const explosiveCandlePct = parseFloat(process.env.EXPLOSIVE_CANDLE_PCT || cfg.EXPLOSIVE_CANDLE_PCT || 0.003);
   const tradeUSD = parseFloat(process.env.TRADE_USD || cfg.TRADE_USD || 100.0);
   const minCandleBody = parseFloat(process.env.MIN_BODY_CANDLE || cfg.MIN_BODY_CANDLE || 0.5);
+  const minSMASlope = parseFloat(process.env.MIN_SMA_SLOPE || cfg.MIN_SMA_SLOPE || 2.0);  
   
   rebuildStateFromJournal();
   startSnapshotTimer();
@@ -608,13 +609,14 @@ async function gracefulShutdown(signal) {
       atr_pct = atr / (last || 1);
     }
 
-    const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || cfg.MIN_MOMENTUM_PCT || 0.005);
+    const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || cfg.MIN_MOMENTUM_PCT || 0.0005);
+    const MAX_MOMENTUM_PCT = parseFloat(process.env.MAX_MOMENTUM_PCT || cfg.MAX_MOMENTUM_PCT || 0.0012);
     const MOM_REDUCTION_PCT = parseFloat(process.env.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || cfg.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || 0.0);
     const GREEN_KLINES = parseInt(process.env.GREEN_KLINES_FOR_REDUCTION || cfg.GREEN_KLINES_FOR_REDUCTION || 0, 10);
     const smaSlope = (sma !== null && smaPrev !== null) ? (sma - smaPrev) : 0;
     const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfg.SMA_TOLERANCE || 0.001);
     const priceNearSMA = (sma !== null && candle) ? (candle.close >= sma * (1 - smaTol)) : true;
-    const trendUp = smaSlope > 0;
+    const trendUp = smaSlope > minSMASlope;
     
     // (09/03) Filter: Adove SMA
     const priceAboveSMA = (sma !== null && candle) ? (candle.close > sma) : true;
@@ -632,7 +634,7 @@ async function gracefulShutdown(signal) {
       effectiveMinMom = BASE_MIN_MOM * (1 - MOM_REDUCTION_PCT);
     }
 
-    const momentumOk = momentum_pct >= effectiveMinMom;
+    const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= MAX_MOMENTUM_PCT;
     const shouldEnter = momentumOk && trendUp && priceNearSMA && priceAboveSMA;
 
     state.lastDecision = {
