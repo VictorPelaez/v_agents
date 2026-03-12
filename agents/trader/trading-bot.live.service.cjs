@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * AegisTrade v2
+ * AegisTrade v3
  *
  * Clean redesign principles:
  * - Single source of truth: daily append-only JSONL journal.
@@ -180,7 +180,7 @@ function normalizeOpenTrade(trade, candleBucketMs) {
   return {
     id: trade.id,
     label: LABEL,
-    symbol: trade.symbol || 'BTC',
+    symbol: trade.symbol || 'BTCUSDT',
     open_time_iso: trade.openedAt || new Date().toISOString(),
     signal_candle_ts: trade.signalCandleTs || null,
     side: trade.type || 'LONG',
@@ -201,7 +201,7 @@ function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
   return {
     id: trade.id,
     label: LABEL,
-    symbol: trade.symbol || 'BTC',
+    symbol: trade.symbol || 'BTCUSDT',
     open_time_iso: openedAt,
     close_time_iso: closedAt,
     duration_s: openedAt ? Math.round((new Date(closedAt).getTime() - new Date(openedAt).getTime()) / 1000) : null,
@@ -239,7 +239,7 @@ function applyJournalEvent(event) {
     const t = event.trade;
     const trade = {
       id: t.id,
-      symbol: t.symbol || 'BTC',
+      symbol: t.symbol || 'BTCUSDT',
       entryPrice: Number(t.entry_price ?? 0),
       stopLoss: t.sl != null ? Number(t.sl) : null,
       takeProfit: t.tp != null ? Number(t.tp) : null,
@@ -518,7 +518,7 @@ async function gracefulShutdown(signal) {
   try {
     if (snapshotTimer) clearInterval(snapshotTimer);
     flushOpenPositionsSnapshot();
-  } catch (e) {
+  } catch (e) {BTCUSDT
     console.error('shutdown flush err:', e.message);
   }
   releaseLock();
@@ -526,7 +526,7 @@ async function gracefulShutdown(signal) {
 }
 
 (async () => {
-  console.log('starting AegisTrade v2 (journal-only, paper mode)');
+  console.log('Starting v3-12-3 (paper mode)');
   ensureDir(BASE_DIR);
 
   if (!acquireLock()) process.exit(1);
@@ -577,7 +577,9 @@ async function gracefulShutdown(signal) {
         open: +lastClosed[1],
         high: +lastClosed[2],
         low: +lastClosed[3],
-        close: +lastClosed[4]
+        close: +lastClosed[4],
+        volume: +lastClosed[5],
+        tsclose: +lastClosed[6]
       };
 
       const closes = klines.map(c => +c[4]);
@@ -615,7 +617,6 @@ async function gracefulShutdown(signal) {
     
     // (09/03) Filter: Adove SMA
     const priceAboveSMA = (sma !== null && candle) ? (candle.close > sma) : true;
-
     let green_run = 0;
     if (GREEN_KLINES > 0 && Array.isArray(klines)) {
       for (let j = klines.length - 2; j > 0 && green_run < GREEN_KLINES; j--) {
@@ -688,7 +689,6 @@ async function gracefulShutdown(signal) {
 
     // (11/03) FILTER: weak open (current candle opens below previous candles)
     let weakOpen = false;
-
     if (Array.isArray(klines) && klines.length >= 4 && candle) {
       const prev1 = klines[klines.length - 2];
       const prev2 = klines[klines.length - 3];
@@ -711,12 +711,11 @@ async function gracefulShutdown(signal) {
       let stopLoss = entryPrice * (1 - k_sl * effectiveATR);
       const takeProfit = entryPrice * (1 + k_tp * effectiveATR);
 
-      const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || cfg.MIN_SL_USD || 50);
+      // const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || cfg.MIN_SL_USD || 50);
       const stopDistance = entryPrice - stopLoss;
-      if (stopDistance < MIN_SL_USD) stopLoss = entryPrice - MIN_SL_USD;
-
-      const riskUSD = skillCapital * riskPct;
-      const stopDistanceUSD = entryPrice - stopLoss;
+      // if (stopDistance < MIN_SL_USD) stopLoss = entryPrice - MIN_SL_USD;
+      // const riskUSD = skillCapital * riskPct;
+      // const stopDistanceUSD = entryPrice - stopLoss;
 
       // 09-03 filter inside candle
       const current = klines[klines.length - 1];
@@ -729,6 +728,11 @@ async function gracefulShutdown(signal) {
       } else {
         // const qty = Number((riskUSD / stopDistanceUSD).toFixed(8));
          const qty = Number((tradeUSD / entryPrice).toFixed(8));
+         const grossProfit = qty * (takeProfit - entryPrice);
+         const feeRate = 0.15;
+         const netProfit = grossProfit - feeRate;
+         console.error('Aprox. net profit: ', {grossProfit, netProfit});
+
          const reasonDet = {
           momentum_pct: Number(momentum_pct.toFixed(6)),
           sma: sma != null ? Number(sma.toFixed(2)) : null,
@@ -745,7 +749,7 @@ async function gracefulShutdown(signal) {
         } else {
           const trade = {
             id: Date.now(),
-            symbol: 'BTC',
+            symbol: symbol,
             entryPrice,
             stopLoss,
             takeProfit,
@@ -791,11 +795,11 @@ async function gracefulShutdown(signal) {
       await sleep(monitorInterval > 0 ? monitorInterval : 500);
     }
 
-    const tsHuman = fmtDateUtc1(new Date());
     console.log(
       'ITER_SUMMARY:',
-      tsStartIter,
-      tsHuman,
+      'Started at: ' + tsStartIter,
+      'with candle: ' + new Date(candle.ts + 3600000).toISOString().slice(11,16),
+      "volume last candle=" + candle.volume.toFixed(2),
       'momentum=' + (state.lastDecision.momentum_pct || 0),
       'sma=' + (state.lastDecision.sma || 'null'),
       'smaSlope=' + (state.lastDecision.smaSlope || 0),
