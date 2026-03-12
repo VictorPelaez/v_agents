@@ -544,7 +544,8 @@ async function gracefulShutdown(signal) {
   const signalCooldownMs = parseInt(process.env.SIGNAL_COOLDOWN_MS || cfg.SIGNAL_COOLDOWN_MS || 180000, 10);
   const explosiveCandlePct = parseFloat(process.env.EXPLOSIVE_CANDLE_PCT || cfg.EXPLOSIVE_CANDLE_PCT || 0.003);
   const tradeUSD = parseFloat(process.env.TRADE_USD || cfg.TRADE_USD || 100.0);
-
+  const minCandleBody = parseFloat(process.env.MIN_BODY_CANDLE || cfg.MIN_BODY_CANDLE || 0.5);
+  
   rebuildStateFromJournal();
   startSnapshotTimer();
 
@@ -704,8 +705,18 @@ async function gracefulShutdown(signal) {
        });
       }
     }
+    // (12/03) FILTER: weak candle body
+    let weakCandleBody = false
+    const body = Math.abs(candle.close - candle.open);
+    const range = candle.high - candle.low;
+    const bodyRatio = body / range;
 
-    if (candle && shouldEnter && state.openTradesById.size < maxPositions && !alreadySimilar && !withinCooldown && !alreadyOpenedThisCandle && !candleExplosive && !weakOpen) {
+    if (bodyRatio < minCandleBody) {
+      const weakCandleBody = bodyRatio < minCandleBody ;
+      console.log("Trade skipped: weak candle body: " , bodyRatio);
+    }
+
+    if (candle && shouldEnter && state.openTradesById.size < maxPositions && !alreadySimilar && !withinCooldown && !alreadyOpenedThisCandle && !candleExplosive && !weakOpen && !weakCandleBody) {
       const entryPrice = candle.close;
       const effectiveATR = atr_pct;
       let stopLoss = entryPrice * (1 - k_sl * effectiveATR);
@@ -731,7 +742,7 @@ async function gracefulShutdown(signal) {
          const grossProfit = qty * (takeProfit - entryPrice);
          const feeRate = 0.15;
          const netProfit = grossProfit - feeRate;
-         console.error('Aprox. net profit: ', {grossProfit, netProfit});
+         console.log('Aprox. net profit: ', {grossProfit, netProfit});
 
          const reasonDet = {
           momentum_pct: Number(momentum_pct.toFixed(6)),
