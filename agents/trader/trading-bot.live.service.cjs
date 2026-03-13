@@ -540,6 +540,7 @@ async function gracefulShutdown(signal) {
   const CANDLE_MS = parseInt(process.env.CANDLE_MS || cfg.CANDLE_MS || 60000, 10);
   const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || cfg.SYMBOL_COOLDOWN_SECONDS || 0, 10);
   const fees= parseFloat(process.env.FEE_RATE || cfg.FEE_RATE || 0.0015);
+  const ATR_WINDOW = parseInt(cfg.ATR_WINDOW || 14, 10);
   
   rebuildStateFromJournal();
   startSnapshotTimer();
@@ -589,7 +590,7 @@ async function gracefulShutdown(signal) {
 
       // ATR calculation
       const trs = [];
-      for (let i = 1; i < klines.length; i++) {
+      for (let i = klines.length - ATR_WINDOW - 1; i < klines.length - 1; i++) {
         const high = +klines[i][2];
         const low = +klines[i][3];
         const prevClose = +klines[i - 1][4];
@@ -700,7 +701,7 @@ async function gracefulShutdown(signal) {
     // Filter: weak candle body
     const body = Math.abs(candle.close - candle.open);
     const range = candle.high - candle.low;
-    const bodyRatio = body / range;
+    const bodyRatio = range > 0 ? body / range : 0;
     let weakCandleBody = bodyRatio < minCandleBody ;
 
     if (weakCandleBody) {
