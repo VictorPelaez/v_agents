@@ -1,15 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * AegisTrade v3
- *
- * Clean redesign principles:
- * - Single source of truth: daily append-only JSONL journal.
- * - Single-process lock.
- * - Rebuild open positions from the journal at startup.
- * - Deduplicate by logical signal key, not by id or open timestamp.
- * - Keep paper trading as default.
- * - Include commented live Binance order lines for future real trading.
+ * AegisTrade v3-13-3
  */
 
 const fs = require('fs');
@@ -17,18 +9,32 @@ const path = require('path');
 const crypto = require('crypto');
 const axios = require('axios');
 
-const API_BASE = process.env.BINANCE_API_BASE || 'https://api.binance.com';
+/* PATHS & CONFIG */
+
 const LABEL = process.env.LABEL || 'V4.2';
+const API_BASE = process.env.BINANCE_API_BASE || 'https://api.binance.com';
 const BASE_DIR = path.join(__dirname, 'skills', `live-forward-${LABEL.toLowerCase()}`);
 const CONFIG_PATH = path.join(BASE_DIR, 'config.json');
 const LOCK_PATH = path.join(BASE_DIR, 'bot.lock');
 const OPEN_POSITIONS_PATH = path.join(BASE_DIR, 'open_positions.json');
 
+/* STATE */
 let shutdownRequested = false;
 let lockFd = null;
 let snapshotTimer = null;
 let lastTradeCandle = null;
 
+const state = {
+  openTradesById: new Map(),
+  openTradeIdBySignalKey: new Map(),
+  seenEventKeys: new Set(),
+  recentSignalSeenAt: new Map(),
+  lastOpenBySymbol: {},
+  lastDecision: {},
+  lastTickerCache: { ts: 0, price: null }
+};
+
+/* BINANCE */
 let BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
 let BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || '';
 
@@ -39,21 +45,12 @@ try {
       BINANCE_API_KEY = fs.readFileSync(keyPath, 'utf8').split(/\r?\n/)[0].trim();
     }
   }
-} catch (_) {
-  BINANCE_API_KEY = '';
-}
+} catch (_) { BINANCE_API_KEY = ''; }
 
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function isValidNumber(n) {
-  return typeof n === 'number' && Number.isFinite(n);
-}
+/* HELPERS */
+function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function isValidNumber(n) { return typeof n === 'number' && Number.isFinite(n); }
 
 function readJsonFile(filePath, fallback) {
   try {
@@ -112,9 +109,7 @@ function loadJsonl(filePath) {
   }
 }
 
-function loadSkillConfig() {
-  return readJsonFile(CONFIG_PATH, {});
-}
+function loadSkillConfig() {return readJsonFile(CONFIG_PATH, {});}
 
 function getYmd(dateValue) {
   const dt = new Date(dateValue || Date.now());
@@ -123,9 +118,7 @@ function getYmd(dateValue) {
     String(dt.getUTCDate()).padStart(2, '0');
 }
 
-function getJournalPath(dateValue) {
-  return path.join(BASE_DIR, `trade_journal_${getYmd(dateValue)}.jsonl`);
-}
+function getJournalPath(dateValue) {return path.join(BASE_DIR, `trade_journal_${getYmd(dateValue)}.jsonl`);}
 
 function acquireLock() {
   ensureDir(BASE_DIR);
@@ -221,16 +214,18 @@ function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
   };
 }
 
-const state = {
-  openTradesById: new Map(),
-  openTradeIdBySignalKey: new Map(),
-  seenEventKeys: new Set(),
-  recentSignalSeenAt: new Map(),
-  lastOpenBySymbol: {},
-  lastDecision: {},
-  lastTickerCache: { ts: 0, price: null }
-};
+function fmtDateUtc1(d) {
+  const dt = new Date(d.getTime() + 60 * 60 * 1000);
+  const Y = dt.getUTCFullYear();
+  const M = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const D = String(dt.getUTCDate()).padStart(2, '0');
+  const h = String(dt.getUTCHours()).padStart(2, '0');
+  const m = String(dt.getUTCMinutes()).padStart(2, '0');
+  const s = String(dt.getUTCSeconds()).padStart(2, '0');
+  return `${Y}-${M}-${D} ${h}:${m}:${s}`;
+}
 
+/* JOURNAL STATE MANAGEMENT */
 function applyJournalEvent(event) {
   if (!event || !event.event_key) return;
   state.seenEventKeys.add(event.event_key);
@@ -286,9 +281,7 @@ function persistJournalEvent(event) {
   return true;
 }
 
-function getOpenTradesArray() {
-  return Array.from(state.openTradesById.values());
-}
+function getOpenTradesArray() {return Array.from(state.openTradesById.values());}
 
 function flushOpenPositionsSnapshot() {
   return writeJsonFileAtomic(OPEN_POSITIONS_PATH, getOpenTradesArray().map(t => ({
@@ -324,9 +317,7 @@ function cleanupRecentSignals(maxAgeMs = 10 * 60 * 1000) {
   }
 }
 
-function hasOpenSignal(signalKey) {
-  return state.openTradeIdBySignalKey.has(signalKey);
-}
+function hasOpenSignal(signalKey) {return state.openTradeIdBySignalKey.has(signalKey);}
 
 function canOpenSignal(signalKey, cooldownMs) {
   const now = Date.now();
@@ -420,6 +411,7 @@ async function maybePlaceLiveCloseOrder(trade, symbol) {
   // }
 }
 
+/* TRADE LOGINC */
 function buildCloseReason(trade, market) {
   if (trade.stopLoss && market <= trade.stopLoss) return 'SL';
   if (trade.takeProfit && market >= trade.takeProfit) return 'TP';
@@ -500,17 +492,7 @@ async function closeTrade(trade, market, closeReason, symbol, candleBucketMs) {
   return true;
 }
 
-function fmtDateUtc1(d) {
-  const dt = new Date(d.getTime() + 60 * 60 * 1000);
-  const Y = dt.getUTCFullYear();
-  const M = String(dt.getUTCMonth() + 1).padStart(2, '0');
-  const D = String(dt.getUTCDate()).padStart(2, '0');
-  const h = String(dt.getUTCHours()).padStart(2, '0');
-  const m = String(dt.getUTCMinutes()).padStart(2, '0');
-  const s = String(dt.getUTCSeconds()).padStart(2, '0');
-  return `${Y}-${M}-${D} ${h}:${m}:${s}`;
-}
-
+/* GRATEFUL SHUTDOWN */
 async function gracefulShutdown(signal) {
   if (shutdownRequested) return;
   shutdownRequested = true;
@@ -525,6 +507,7 @@ async function gracefulShutdown(signal) {
   process.exit(0);
 }
 
+/* MAIN */
 (async () => {
   console.log('Starting v3-12-3 (paper mode)');
   ensureDir(BASE_DIR);
@@ -533,8 +516,6 @@ async function gracefulShutdown(signal) {
 
   const cfg = loadSkillConfig();
   const symbol = process.env.SYMBOL || cfg.SYMBOL || 'BTCUSDT';
-  const skillCapital = parseFloat(process.env.CAPITAL || cfg.CAPITAL || 1000);
-  const riskPct = parseFloat(process.env.RISK_PCT || cfg.RISK_PCT || 0.01);
   const monitorInterval = parseInt(process.env.MONITOR_INTERVAL_MS || cfg.MONITOR_INTERVAL_MS || 1000, 10);
   const maxPositions = parseInt(process.env.MAX_POSITIONS || cfg.MAX_POSITIONS || 2, 10);
   const minHoldS = parseInt(process.env.MIN_HOLD_SECONDS || cfg.MIN_HOLD_SECONDS || '60', 10);
@@ -545,7 +526,20 @@ async function gracefulShutdown(signal) {
   const explosiveCandlePct = parseFloat(process.env.EXPLOSIVE_CANDLE_PCT || cfg.EXPLOSIVE_CANDLE_PCT || 0.003);
   const tradeUSD = parseFloat(process.env.TRADE_USD || cfg.TRADE_USD || 100.0);
   const minCandleBody = parseFloat(process.env.MIN_BODY_CANDLE || cfg.MIN_BODY_CANDLE || 0.5);
-  const minSMASlope = parseFloat(process.env.MIN_SMA_SLOPE || cfg.MIN_SMA_SLOPE || 2.0);  
+  const minSMASlope = parseFloat(process.env.MIN_SMA_SLOPE || cfg.MIN_SMA_SLOPE || 2.0);
+  const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || cfg.SMA_WINDOW || 60, 10);
+  const limit = SMA_WINDOW + 2;
+  const k_tp = parseFloat(process.env.K_TP || cfg.K_TP || '2.0');
+  const k_sl = parseFloat(process.env.K_SL || cfg.K_SL || '1.2');
+  const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || cfg.MIN_MOMENTUM_PCT || 0.0005);
+  const MAX_MOMENTUM_PCT = parseFloat(process.env.MAX_MOMENTUM_PCT || cfg.MAX_MOMENTUM_PCT || 0.0012);
+  const MOM_REDUCTION_PCT = parseFloat(process.env.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || cfg.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || 0.0);
+  const GREEN_KLINES = parseInt(process.env.GREEN_KLINES_FOR_REDUCTION || cfg.GREEN_KLINES_FOR_REDUCTION || 0, 10);
+  const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfg.SMA_TOLERANCE || 0.001);  
+  const DUP_TOLERANCE_PCT = parseFloat(process.env.DUP_TOLERANCE_PCT || cfg.DUP_TOLERANCE_PCT || 1e-6);
+  const CANDLE_MS = parseInt(process.env.CANDLE_MS || cfg.CANDLE_MS || 60000, 10);
+  const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || cfg.SYMBOL_COOLDOWN_SECONDS || 0, 10);
+  const fees= parseFloat(process.env.FEE_RATE || cfg.FEE_RATE || 0.0015);
   
   rebuildStateFromJournal();
   startSnapshotTimer();
@@ -556,9 +550,7 @@ async function gracefulShutdown(signal) {
   while (!shutdownRequested) {
     const tsStartIter = fmtDateUtc1(new Date());
     cleanupRecentSignals();
-
-    const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || cfg.SMA_WINDOW || 60, 10);
-    const limit = SMA_WINDOW + 2;
+    
     const klines = await getRecentKlines(symbol, limit, '1m', HTTP_TIMEOUT_MS);
 
     let momentum_pct = 0;
@@ -566,12 +558,8 @@ async function gracefulShutdown(signal) {
     let smaPrev = null;
     let atr_pct = 0;
     let candle = null;
-    
-    const k_tp = parseFloat(process.env.K_TP || cfg.K_TP || '2.0');
-    const k_sl = parseFloat(process.env.K_SL || cfg.K_SL || '1.2');
-    const _k_tp_src = process.env.K_TP ? 'env' : (cfg.K_TP ? 'config' : 'default');
-    const _k_sl_src = process.env.K_SL ? 'env' : (cfg.K_SL ? 'config' : 'default');
 
+    // Calculations based on klines
     if (Array.isArray(klines) && klines.length >= 3) {
       const lastClosed = klines[klines.length - 2];
       candle = {
@@ -589,6 +577,7 @@ async function gracefulShutdown(signal) {
       const prev = closes[closes.length - 3] || last;
       momentum_pct = prev ? (last - prev) / prev : 0;
 
+      // SMA calculation
       if (closes.length >= SMA_WINDOW + 1) {
         const lastWindow = closes.slice(-SMA_WINDOW - 1, -1);
         sma = lastWindow.reduce((a, b) => a + b, 0) / lastWindow.length;
@@ -598,6 +587,7 @@ async function gracefulShutdown(signal) {
         sma = closes.reduce((a, b) => a + b, 0) / closes.length;
       }
 
+      // ATR calculation
       const trs = [];
       for (let i = 1; i < klines.length; i++) {
         const high = +klines[i][2];
@@ -609,17 +599,14 @@ async function gracefulShutdown(signal) {
       atr_pct = atr / (last || 1);
     }
 
-    const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || cfg.MIN_MOMENTUM_PCT || 0.0005);
-    const MAX_MOMENTUM_PCT = parseFloat(process.env.MAX_MOMENTUM_PCT || cfg.MAX_MOMENTUM_PCT || 0.0012);
-    const MOM_REDUCTION_PCT = parseFloat(process.env.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || cfg.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || 0.0);
-    const GREEN_KLINES = parseInt(process.env.GREEN_KLINES_FOR_REDUCTION || cfg.GREEN_KLINES_FOR_REDUCTION || 0, 10);
     const smaSlope = (sma !== null && smaPrev !== null) ? (sma - smaPrev) : 0;
-    const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfg.SMA_TOLERANCE || 0.001);
     const priceNearSMA = (sma !== null && candle) ? (candle.close >= sma * (1 - smaTol)) : true;
     const trendUp = smaSlope > minSMASlope;
     
-    // (09/03) Filter: Adove SMA
+    // Filter above SMA 
     const priceAboveSMA = (sma !== null && candle) ? (candle.close > sma) : true;
+    
+    // Filter by momentum with dynamic reduction if we have a run of green candles
     let green_run = 0;
     if (GREEN_KLINES > 0 && Array.isArray(klines)) {
       for (let j = klines.length - 2; j > 0 && green_run < GREEN_KLINES; j--) {
@@ -633,14 +620,15 @@ async function gracefulShutdown(signal) {
     if (green_run >= GREEN_KLINES && GREEN_KLINES > 0 && MOM_REDUCTION_PCT > 0) {
       effectiveMinMom = BASE_MIN_MOM * (1 - MOM_REDUCTION_PCT);
     }
-
     const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= MAX_MOMENTUM_PCT;
+
+    // Final decision
     const shouldEnter = momentumOk && trendUp && priceNearSMA && priceAboveSMA;
 
     state.lastDecision = {
       momentum_pct: Number(momentum_pct.toFixed(6)),
       sma: sma != null ? Number(sma.toFixed(2)) : null,
-      smaSlope: Number(smaSlope.toFixed(6)),
+      smaSlope: Number(smaSlope.toFixed(2)),
       priceNearSMA: !!priceNearSMA,
       priceAboveSMA: !!priceAboveSMA,
       trendUp: !!trendUp,
@@ -650,25 +638,26 @@ async function gracefulShutdown(signal) {
     };
 
     const entryCandidate = candle ? candle.close : null;
-    const DUP_TOLERANCE_PCT = parseFloat(process.env.DUP_TOLERANCE_PCT || cfg.DUP_TOLERANCE_PCT || 1e-6);
-    const CANDLE_MS = parseInt(process.env.CANDLE_MS || cfg.CANDLE_MS || 60000, 10);
-    const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || cfg.SYMBOL_COOLDOWN_SECONDS || 0, 10);
 
-    const alreadySimilar = entryCandidate !== null && getOpenTradesArray().some(ot => {
-      if (!isValidNumber(ot.entryPrice)) return false;
-      const similarPrice = Math.abs(ot.entryPrice - entryCandidate) <= Math.abs(entryCandidate) * DUP_TOLERANCE_PCT;
-      if (!similarPrice) return false;
+    // Filter: duplicate entry price within last candle 
+    let alreadySimilar = false;
+    if (maxPositions > 1) {
+      alreadySimilar = entryCandidate !== null && getOpenTradesArray().some(ot => {
+        if (!isValidNumber(ot.entryPrice)) return false;
+        const similarPrice = Math.abs(ot.entryPrice - entryCandidate) <= Math.abs(entryCandidate) * DUP_TOLERANCE_PCT;
+        if (!similarPrice) return false;
       const openedTs = new Date(ot.openedAt).getTime();
       return (Date.now() - openedTs) <= CANDLE_MS;
     });
+  }
 
-    const lastOpenTs = state.lastOpenBySymbol[symbol] || 0;
     const nowTs = Date.now();
+    const lastOpenTs = state.lastOpenBySymbol[symbol] || 0;
     const withinCooldown = (cooldown_s > 0) && ((nowTs - lastOpenTs) < cooldown_s * 1000);
     const candleMinute = candle ? Math.floor(candle.ts / 60000) : null;
     const alreadyOpenedThisCandle = candleMinute !== null && lastTradeCandle === candleMinute;
 
-    // (10/03) FILTER: explosive previous candle
+    // Filter: explosive previous candle
     let candleExplosive = false
     if (Array.isArray(klines) && klines.length >= 4 && candle) {
       candleExplosive = [2,3].some(i => {
@@ -690,7 +679,7 @@ async function gracefulShutdown(signal) {
       }
     }
 
-    // (11/03) FILTER: weak open (current candle opens below previous candles)
+    // Filter: weak open whencurrent opens below previous candles
     let weakOpen = false;
     if (Array.isArray(klines) && klines.length >= 4 && candle) {
       const prev1 = klines[klines.length - 2];
@@ -700,51 +689,51 @@ async function gracefulShutdown(signal) {
       weakOpen = candle.open < prev1Close && candle.open < prev2Close;
 
     if (weakOpen) {
-      console.log("Filter: weak open detected", {
+      console.log("Trade skipped: detect a weak open-candle", {
         open: Number(candle.open.toFixed(2)),
         prev1Close: Number(prev1Close.toFixed(2)),
         prev2Close: Number(prev2Close.toFixed(2))
        });
       }
     }
-    // (12/03) FILTER: weak candle body
-    let weakCandleBody = false
+
+    // Filter: weak candle body
     const body = Math.abs(candle.close - candle.open);
     const range = candle.high - candle.low;
     const bodyRatio = body / range;
+    let weakCandleBody = bodyRatio < minCandleBody ;
 
-    if (bodyRatio < minCandleBody) {
-      const weakCandleBody = bodyRatio < minCandleBody ;
-      console.log("Trade skipped: weak candle body: " , bodyRatio);
+    if (weakCandleBody) {
+      console.log("Trade skipped: weak candle body:" , Number(bodyRatio.toFixed(2)) );
     }
 
+    // Final entry decision
     if (candle && shouldEnter && state.openTradesById.size < maxPositions && !alreadySimilar && !withinCooldown && !alreadyOpenedThisCandle && !candleExplosive && !weakOpen && !weakCandleBody) {
       const entryPrice = candle.close;
       const effectiveATR = atr_pct;
       let stopLoss = entryPrice * (1 - k_sl * effectiveATR);
       const takeProfit = entryPrice * (1 + k_tp * effectiveATR);
 
-      // const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || cfg.MIN_SL_USD || 50);
-      const stopDistance = entryPrice - stopLoss;
-      // if (stopDistance < MIN_SL_USD) stopLoss = entryPrice - MIN_SL_USD;
-      const riskUSD = skillCapital * riskPct;
       const stopDistanceUSD = entryPrice - stopLoss;
 
-      // 09-03 filter inside candle
+      // Filter: stop loss inside candle
       const current = klines[klines.length - 1];
       const currentLow  = +current[3];
+      
+      // Filter by profitability with fees
+      const qty = Number((tradeUSD / entryPrice).toFixed(8));
+      const grossProfit = qty * (takeProfit - entryPrice);
+      const feeRate = tradeUSD * fees;
+      const netProfit = grossProfit - feeRate;
+      console.log('Aprox. net profit: ', {grossProfit, netProfit});
 
       if (stopDistanceUSD <= 0) {
         console.error('Trade skipped: Invalid stop distance', { entryPrice, stopLoss });
       } else if (currentLow <= stopLoss) {
         console.log('Trade skipped: SL inside candle', { entryPrice, stopLoss, currentLow, candleLow: candle.low });
-      } else {
-        // const qty = Number((riskUSD / stopDistanceUSD).toFixed(8));
-         const qty = Number((tradeUSD / entryPrice).toFixed(8));
-         const grossProfit = qty * (takeProfit - entryPrice);
-         const feeRate = 0.15;
-         const netProfit = grossProfit - feeRate;
-         console.log('Aprox. net profit: ', {grossProfit, netProfit});
+      } else if (netProfit <= 0) { 
+        console.log('Trade skipped: Not profitable after fees', { entryPrice, takeProfit, grossProfit, netProfit, feeRate });
+      }else {
 
          const reasonDet = {
           momentum_pct: Number(momentum_pct.toFixed(6)),
