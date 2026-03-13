@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * AegisTrade v3-13-3
+ * AegisTrade v4-13-3
+ * Filter hierarchy
  */
 
 const fs = require('fs');
@@ -509,7 +510,7 @@ async function gracefulShutdown(signal) {
 
 /* MAIN */
 (async () => {
-  console.log('Starting v3-12-3 (paper mode)');
+  console.log('Starting v4 (paper mode)');
   ensureDir(BASE_DIR);
 
   if (!acquireLock()) process.exit(1);
@@ -559,6 +560,9 @@ async function gracefulShutdown(signal) {
     let smaPrev = null;
     let atr_pct = 0;
     let candle = null;
+    let weakCandleBody = false;
+    let weakOpen = false;
+    let candleExplosive = false;
 
     // Calculations based on klines
     if (Array.isArray(klines) && klines.length >= 3) {
@@ -578,33 +582,62 @@ async function gracefulShutdown(signal) {
       const prev = closes[closes.length - 3] || last;
       momentum_pct = prev ? (last - prev) / prev : 0;
 
+      // Filter I: weak candle body
+      const body = Math.abs(candle.close - candle.open);
+      const range = candle.high - candle.low;
+      const bodyRatio = range > 0 ? body / range : 0;
+      weakCandleBody = bodyRatio < minCandleBody ;
+
+      if (weakCandleBody) { console.log("Trade skipped: weak candle body:" , Number(bodyRatio.toFixed(2)) );}
+
+      // Filter II & III: weak open when current below previous candles AND explosive candle detection
+      if (Array.isArray(klines) && klines.length >= 4 && candle) {
+        // Weak open: current open below previous two closes
+        const prev1Close = +klines[klines.length - 2][4];
+        const prev2Close = +klines[klines.length - 3][4];
+        weakOpen = candle.open < prev1Close && candle.open < prev2Close;
+        // Explosive candle: check last 2 candles ranges
+        const ranges = [2, 3].map(i => {
+          const k = klines[klines.length - i];
+          return (+k[2] - +k[3]) / +k[4]; // (high - low) / close
+        });
+        candleExplosive = ranges.some(r => r > explosiveCandlePct);
+
+        if (weakOpen) { console.log("Trade skipped: detect a weak open-candle", Number(candle.open.toFixed(2)) ) ;}
+        if (candleExplosive) {console.log("Filter: explosive candle:", {ranges: ranges.map(r => Number(r.toFixed(6))) });}
+      }
+
       // SMA calculation
-      if (closes.length >= SMA_WINDOW + 1) {
-        const lastWindow = closes.slice(-SMA_WINDOW - 1, -1);
-        sma = lastWindow.reduce((a, b) => a + b, 0) / lastWindow.length;
-        const prevWindow = closes.slice(-SMA_WINDOW - 2, -2);
-        smaPrev = prevWindow.length ? prevWindow.reduce((a, b) => a + b, 0) / prevWindow.length : null;
-      } else {
-        sma = closes.reduce((a, b) => a + b, 0) / closes.length;
+      if (!weakCandleBody && !weakOpen && !candleExplosive) {
+        if (closes.length >= SMA_WINDOW + 1) {
+          const lastWindow = closes.slice(-SMA_WINDOW - 1, -1);
+          sma = lastWindow.reduce((a, b) => a + b, 0) / lastWindow.length;
+          const prevWindow = closes.slice(-SMA_WINDOW - 2, -2);
+          smaPrev = prevWindow.length ? prevWindow.reduce((a, b) => a + b, 0) / prevWindow.length : null;
+        } else {
+          sma = closes.reduce((a, b) => a + b, 0) / closes.length;
+          smaPrev = null;
+        }
       }
 
       // ATR calculation
-      const trs = [];
-      for (let i = klines.length - ATR_WINDOW - 1; i < klines.length - 1; i++) {
-        const high = +klines[i][2];
-        const low = +klines[i][3];
-        const prevClose = +klines[i - 1][4];
-        trs.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+      if (!weakCandleBody && !weakOpen && !candleExplosive) {
+        const trs = [];
+        for (let i = klines.length - ATR_WINDOW - 1; i < klines.length - 1; i++) {
+          const high = +klines[i][2];
+          const low = +klines[i][3];
+          const prevClose = +klines[i - 1][4];
+          trs.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+        }
+        const atr = trs.length ? trs.reduce((a, b) => a + b, 0) / trs.length : 0;
+        atr_pct = atr / (last || 1);
       }
-      const atr = trs.length ? trs.reduce((a, b) => a + b, 0) / trs.length : 0;
-      atr_pct = atr / (last || 1);
     }
 
+    // SMA slope y price near SMA
     const smaSlope = (sma !== null && smaPrev !== null) ? (sma - smaPrev) : 0;
     const priceNearSMA = (sma !== null && candle) ? (candle.close >= sma * (1 - smaTol)) : true;
     const trendUp = smaSlope > minSMASlope;
-    
-    // Filter above SMA 
     const priceAboveSMA = (sma !== null && candle) ? (candle.close > sma) : true;
     
     // Filter by momentum with dynamic reduction if we have a run of green candles
@@ -624,7 +657,13 @@ async function gracefulShutdown(signal) {
     const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= MAX_MOMENTUM_PCT;
 
     // Final decision
-    const shouldEnter = momentumOk && trendUp && priceNearSMA && priceAboveSMA;
+    const shouldEnter = momentumOk &&
+                    trendUp &&
+                    priceNearSMA &&
+                    priceAboveSMA &&
+                    !weakCandleBody &&
+                    !weakOpen &&
+                    !candleExplosive;
 
     state.lastDecision = {
       momentum_pct: Number(momentum_pct.toFixed(6)),
@@ -633,24 +672,13 @@ async function gracefulShutdown(signal) {
       priceNearSMA: !!priceNearSMA,
       priceAboveSMA: !!priceAboveSMA,
       trendUp: !!trendUp,
+      weakCandleBody: !!weakCandleBody,
+      weakOpen: !!weakOpen,
+      candleExplosive: !!candleExplosive,
       shouldEnter: !!shouldEnter,
       effective_min_momentum: Number(effectiveMinMom.toFixed(6)),
       green_run
     };
-
-    const entryCandidate = candle ? candle.close : null;
-
-    // Filter: duplicate entry price within last candle 
-    let alreadySimilar = false;
-    if (maxPositions > 1) {
-      alreadySimilar = entryCandidate !== null && getOpenTradesArray().some(ot => {
-        if (!isValidNumber(ot.entryPrice)) return false;
-        const similarPrice = Math.abs(ot.entryPrice - entryCandidate) <= Math.abs(entryCandidate) * DUP_TOLERANCE_PCT;
-        if (!similarPrice) return false;
-      const openedTs = new Date(ot.openedAt).getTime();
-      return (Date.now() - openedTs) <= CANDLE_MS;
-    });
-  }
 
     const nowTs = Date.now();
     const lastOpenTs = state.lastOpenBySymbol[symbol] || 0;
@@ -658,58 +686,8 @@ async function gracefulShutdown(signal) {
     const candleMinute = candle ? Math.floor(candle.ts / 60000) : null;
     const alreadyOpenedThisCandle = candleMinute !== null && lastTradeCandle === candleMinute;
 
-    // Filter: explosive previous candle
-    let candleExplosive = false
-    if (Array.isArray(klines) && klines.length >= 4 && candle) {
-      candleExplosive = [2,3].some(i => {
-      const k = klines[klines.length - i];
-      const range = (+k[2] - +k[3]) / +k[4];
-      return range > explosiveCandlePct;
-    });
-
-    if (candleExplosive) {
-      const ranges = [2,3].map(i => {
-        const k = klines[klines.length - i];
-        return (+k[2] - +k[3]) / +k[4];
-      });
-
-      console.log("Filter: explosive candle:", {
-        ranges: ranges.map(r => Number(r.toFixed(6))),
-        explosiveCandlePct: Number(explosiveCandlePct.toFixed(6))
-       });
-      }
-    }
-
-    // Filter: weak open whencurrent opens below previous candles
-    let weakOpen = false;
-    if (Array.isArray(klines) && klines.length >= 4 && candle) {
-      const prev1 = klines[klines.length - 2];
-      const prev2 = klines[klines.length - 3];
-      const prev1Close = +prev1[4];
-      const prev2Close = +prev2[4];
-      weakOpen = candle.open < prev1Close && candle.open < prev2Close;
-
-    if (weakOpen) {
-      console.log("Trade skipped: detect a weak open-candle", {
-        open: Number(candle.open.toFixed(2)),
-        prev1Close: Number(prev1Close.toFixed(2)),
-        prev2Close: Number(prev2Close.toFixed(2))
-       });
-      }
-    }
-
-    // Filter: weak candle body
-    const body = Math.abs(candle.close - candle.open);
-    const range = candle.high - candle.low;
-    const bodyRatio = range > 0 ? body / range : 0;
-    let weakCandleBody = bodyRatio < minCandleBody ;
-
-    if (weakCandleBody) {
-      console.log("Trade skipped: weak candle body:" , Number(bodyRatio.toFixed(2)) );
-    }
-
     // Final entry decision
-    if (candle && shouldEnter && state.openTradesById.size < maxPositions && !alreadySimilar && !withinCooldown && !alreadyOpenedThisCandle && !candleExplosive && !weakOpen && !weakCandleBody) {
+    if (candle && shouldEnter && state.openTradesById.size < maxPositions && !withinCooldown && !alreadyOpenedThisCandle) {
       const entryPrice = candle.close;
       const effectiveATR = atr_pct;
       let stopLoss = entryPrice * (1 - k_sl * effectiveATR);
@@ -809,7 +787,6 @@ async function gracefulShutdown(signal) {
       'priceNearSMA=' + (state.lastDecision.priceNearSMA ? 1 : 0),
       'priceAboveSMA=' + (state.lastDecision.priceAboveSMA ? 1 : 0),      
       'trendUp=' + (state.lastDecision.trendUp ? 1 : 0),
-      'candleExplosive=' + (candleExplosive ? 1 : 0),
       'shouldEnter=' + (state.lastDecision.shouldEnter ? 1 : 0),
       'effective_min_momentum=' + (state.lastDecision.effective_min_momentum || 0),
       'green_run=' + (state.lastDecision.green_run || 0),
