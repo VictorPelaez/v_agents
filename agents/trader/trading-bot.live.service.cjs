@@ -382,34 +382,26 @@ async function signedBinanceRequest(method, endpoint, params) {
   return axios({ method, url, headers, timeout: 5000 });
 }
 
-async function maybePlaceLiveOpenOrder(trade, symbol) {
-  // LIVE TRADING LINES - KEEP COMMENTED UNTIL YOU FULLY TEST THEM.
-  // if (process.env.MODE === 'live') {
-  //   const res = await signedBinanceRequest('POST', '/api/v3/order', {
-  //     symbol,
-  //     side: 'BUY',
-  //     type: 'MARKET',
-  //     quantity: String(trade.size),
-  //     timestamp: Date.now(),
-  //     recvWindow: 5000
-  //   });
-  //   console.log('LIVE OPEN ORDER:', JSON.stringify(res.data));
-  // }
-}
-
-async function maybePlaceLiveCloseOrder(trade, symbol) {
-  // LIVE TRADING LINES - KEEP COMMENTED UNTIL YOU FULLY TEST THEM.
-  // if (process.env.MODE === 'live') {
-  //   const res = await signedBinanceRequest('POST', '/api/v3/order', {
-  //     symbol,
-  //     side: 'SELL',
-  //     type: 'MARKET',
-  //     quantity: String(trade.size),
-  //     timestamp: Date.now(),
-  //     recvWindow: 5000
-  //   });
-  //   console.log('LIVE CLOSE ORDER:', JSON.stringify(res.data));
-  // }
+async function PlaceLiveOpenOrder(trade, symbol) {
+  if (!isValidNumber(trade.entryPrice) || !isValidNumber(trade.stopLoss) || !isValidNumber(trade.takeProfit)) {
+    console.error('Invalid trade values for live OCO', { trade });
+    return;
+  }
+  try {
+    const qty = trade.size;
+    const res = await signedBinanceRequest('POST', '/api/v3/order/oco', {
+      symbol,
+      side: 'SELL',             
+      quantity: String(qty),
+      price: trade.takeProfit.toFixed(2),      // TP
+      stopPrice: trade.stopLoss.toFixed(2),    // SL 
+      stopLimitPrice: trade.stopLoss.toFixed(2),
+      stopLimitTimeInForce: 'GTC'  
+    });
+    console.log('LIVE OCO ORDER PLACED:', JSON.stringify(res.data || res));
+  } catch (e) {
+    console.error('LIVE OCO ORDER ERROR:', e.message, e.response?.data || '');
+  }
 }
 
 /* TRADE LOGINC */
@@ -441,8 +433,7 @@ async function openTrade(trade, symbol, candleBucketMs, signalCooldownMs) {
   if (!ok) return false;
 
   console.log(
-    'OPEN (paper):',
-    trade.openedAt,
+    'OPEN (paper):', trade.openedAt,
     'id=', trade.id,
     'signalCandleTs=', trade.signalCandleTs,
     'signalKey=', signalKey,
@@ -452,7 +443,7 @@ async function openTrade(trade, symbol, candleBucketMs, signalCooldownMs) {
     'REASON=', trade.reasonTag
   );
 
-  await maybePlaceLiveOpenOrder(trade, symbol);
+  // await PlaceLiveOpenOrder(trade, symbol);
   return true;
 }
 
@@ -462,8 +453,7 @@ async function closeTrade(trade, market, closeReason, symbol, candleBucketMs) {
     return false;
   }
 
-  trade.exitPrice = market;
-  trade.profit = (market - trade.entryPrice) * (trade.size || 0);
+  trade.profit = (trade.exitPrice - trade.entryPrice) * (trade.size || 0);
   trade.closedAt = new Date().toISOString();
 
   const reason = closeReason || buildCloseReason(trade, market);
@@ -488,8 +478,6 @@ async function closeTrade(trade, market, closeReason, symbol, candleBucketMs) {
     'exit=', trade.exitPrice,
     'profit=', trade.profit
   );
-
-  await maybePlaceLiveCloseOrder(trade, symbol);
   return true;
 }
 
@@ -537,8 +525,6 @@ async function gracefulShutdown(signal) {
   const MOM_REDUCTION_PCT = parseFloat(process.env.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || cfg.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || 0.0);
   const GREEN_KLINES = parseInt(process.env.GREEN_KLINES_FOR_REDUCTION || cfg.GREEN_KLINES_FOR_REDUCTION || 0, 10);
   const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfg.SMA_TOLERANCE || 0.001);  
-  const DUP_TOLERANCE_PCT = parseFloat(process.env.DUP_TOLERANCE_PCT || cfg.DUP_TOLERANCE_PCT || 1e-6);
-  const CANDLE_MS = parseInt(process.env.CANDLE_MS || cfg.CANDLE_MS || 60000, 10);
   const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || cfg.SYMBOL_COOLDOWN_SECONDS || 0, 10);
   const fees= parseFloat(process.env.FEE_RATE || cfg.FEE_RATE || 0.0015);
   const ATR_WINDOW = parseInt(cfg.ATR_WINDOW || 14, 10);
@@ -596,19 +582,19 @@ async function gracefulShutdown(signal) {
         const prev1Close = +klines[klines.length - 2][4];
         const prev2Close = +klines[klines.length - 3][4];
         weakOpen = candle.open < prev1Close && candle.open < prev2Close;
+        if (weakOpen) { console.log("Trade skipped: detect a weak open-candle", Number(candle.open.toFixed(2)) ) ;}
         // Explosive candle: check last 2 candles ranges
         const ranges = [2, 3].map(i => {
           const k = klines[klines.length - i];
           return (+k[2] - +k[3]) / +k[4]; // (high - low) / close
         });
         candleExplosive = ranges.some(r => r > explosiveCandlePct);
-
-        if (weakOpen) { console.log("Trade skipped: detect a weak open-candle", Number(candle.open.toFixed(2)) ) ;}
         if (candleExplosive) {console.log("Filter: explosive candle:", {ranges: ranges.map(r => Number(r.toFixed(6))) });}
       }
 
-      // SMA calculation
+      
       if (!weakCandleBody && !weakOpen && !candleExplosive) {
+        // SMA calculation
         if (closes.length >= SMA_WINDOW + 1) {
           const lastWindow = closes.slice(-SMA_WINDOW - 1, -1);
           sma = lastWindow.reduce((a, b) => a + b, 0) / lastWindow.length;
@@ -618,10 +604,7 @@ async function gracefulShutdown(signal) {
           sma = closes.reduce((a, b) => a + b, 0) / closes.length;
           smaPrev = null;
         }
-      }
-
-      // ATR calculation
-      if (!weakCandleBody && !weakOpen && !candleExplosive) {
+        // ATR calculation
         const trs = [];
         for (let i = klines.length - ATR_WINDOW - 1; i < klines.length - 1; i++) {
           const high = +klines[i][2];
@@ -633,7 +616,7 @@ async function gracefulShutdown(signal) {
         atr_pct = atr / (last || 1);
       }
     }
-
+        
     // SMA slope y price near SMA
     const smaSlope = (sma !== null && smaPrev !== null) ? (sma - smaPrev) : 0;
     const priceNearSMA = (sma !== null && candle) ? (candle.close >= sma * (1 - smaTol)) : true;
@@ -754,6 +737,7 @@ async function gracefulShutdown(signal) {
 
     const monitorStart = Date.now();
     while (!shutdownRequested && (Date.now() - monitorStart < 60 * 1000)) {
+      const loopStart = Date.now();
       try {
         const market = await getTickerCached(symbol, HTTP_TIMEOUT_MS, 300);
         if (market !== null) {
@@ -773,7 +757,10 @@ async function gracefulShutdown(signal) {
       } catch (e) {
         console.error('monitor err:', e.message);
       }
-      await sleep(monitorInterval > 0 ? monitorInterval : 500);
+      
+      const elapsed = Date.now() - loopStart;
+      const sleepMs = Math.max(0, monitorInterval - elapsed);
+      await sleep(sleepMs);
     }
 
     console.log(
