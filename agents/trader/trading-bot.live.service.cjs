@@ -508,7 +508,7 @@ async function gracefulShutdown(signal) {
   try {
     if (snapshotTimer) clearInterval(snapshotTimer);
     flushOpenPositionsSnapshot();
-  } catch (e) {BTCUSDT
+  } catch (e) {
     console.error('shutdown flush err:', e.message);
   }
   releaseLock();
