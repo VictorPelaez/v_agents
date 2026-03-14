@@ -12,7 +12,7 @@ const axios = require('axios');
 require('dotenv').config();
 
 /* PATHS & CONFIG */
-
+const cfg = loadSkillConfig();
 const LABEL = process.env.LABEL || 'V4.2';
 const EXCHANGE = process.env.EXCHANGE || cfg.EXCHANGE || 'binance';
 const BASE_DIR = path.join(__dirname, 'skills', `live-forward-${LABEL.toLowerCase()}`);
@@ -57,6 +57,11 @@ const API_KEYS = {
 
 const ACTIVE_API_KEY = API_KEYS[EXCHANGE]?.key || '';
 const ACTIVE_API_SECRET = API_KEYS[EXCHANGE]?.secret || '';
+
+if (!ACTIVE_API_KEY || !ACTIVE_API_SECRET) {
+  console.error(`API keys for ${EXCHANGE} not set in .env`);
+  process.exit(1);
+}
 
 console.log("Exchange:", EXCHANGE);
 console.log("API Base:", getApiBase());
