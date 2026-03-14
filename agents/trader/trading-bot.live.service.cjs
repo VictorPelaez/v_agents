@@ -13,7 +13,7 @@ const axios = require('axios');
 /* PATHS & CONFIG */
 
 const LABEL = process.env.LABEL || 'V4.2';
-const API_BASE = process.env.BINANCE_API_BASE || 'https://api.binance.com';
+const EXCHANGE = process.env.EXCHANGE || cfg.EXCHANGE || 'binance';
 const BASE_DIR = path.join(__dirname, 'skills', `live-forward-${LABEL.toLowerCase()}`);
 const CONFIG_PATH = path.join(BASE_DIR, 'config.json');
 const LOCK_PATH = path.join(BASE_DIR, 'bot.lock');
@@ -35,18 +35,31 @@ const state = {
   lastTickerCache: { ts: 0, price: null }
 };
 
-/* BINANCE */
-let BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
-let BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || '';
+/* API EXCHANGE */
+const API_BASES = {
+  binance: 'https://api.binance.com',
+  mexc: 'https://api.mexc.com'
+};
 
-try {
-  if (!BINANCE_API_KEY) {
-    const keyPath = path.join(__dirname, 'API_KEYS.md');
-    if (fs.existsSync(keyPath)) {
-      BINANCE_API_KEY = fs.readFileSync(keyPath, 'utf8').split(/\r?\n/)[0].trim();
-    }
+function getApiBase() {return API_BASES[EXCHANGE] || API_BASES.binance;}
+
+const API_KEYS = {
+  binance: {
+    key: process.env.BINANCE_API_KEY || '',
+    secret: process.env.BINANCE_API_SECRET || ''
+  },
+  mexc: {
+    key: process.env.MEXC_API_KEY || '',
+    secret: process.env.MEXC_API_SECRET || ''
   }
-} catch (_) { BINANCE_API_KEY = ''; }
+};
+
+const ACTIVE_API_KEY = API_KEYS[EXCHANGE]?.key || '';
+const ACTIVE_API_SECRET = API_KEYS[EXCHANGE]?.secret || '';
+
+console.log("Exchange:", EXCHANGE);
+console.log("API Base:", getApiBase());
+
 
 /* HELPERS */
 function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
@@ -339,14 +352,13 @@ async function httpGetWithRetry(url, opts = {}, retries = 3, delayMs = 300, time
 }
 
 async function getTicker(symbol, timeoutMs) {
-  const url = `${API_BASE}/api/v3/ticker/price?symbol=${symbol}`;
+  const base = getApiBase();
+  const url = `${base}/api/v3/ticker/price?symbol=${symbol}`;
   try {
-    const r = await httpGetWithRetry(url, {
-      headers: BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {}
-    }, 3, 300, timeoutMs);
-    if (r.data && (r.data.price || r.data.price === 0)) return +r.data.price;
+    const r = await httpGetWithRetry(url, ACTIVE_API_KEY ? { headers: { 'X-MBX-APIKEY': ACTIVE_API_KEY } } : {}, 3, 300, timeoutMs);
+    if (r.data && (r.data.price || r.data.price === 0)) {return +r.data.price;}
   } catch (e) {
-    console.error('getTicker failed', e.message);
+    console.error('getTicker failed', EXCHANGE, e.message);
   }
   return null;
 }
@@ -363,22 +375,23 @@ async function getTickerCached(symbol, timeoutMs, maxAgeMs = 300) {
 
 async function getRecentKlines(symbol, limit, interval, timeoutMs) {
   try {
-    const url = `${API_BASE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-    const r = await httpGetWithRetry(url, {
-      headers: BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {}
-    }, 3, 300, timeoutMs);
+    const base = getApiBase();
+    const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const r = await httpGetWithRetry(url,
+      ACTIVE_API_KEY ? { headers: { 'X-MBX-APIKEY': ACTIVE_API_KEY } } : {}, 3, 300, timeoutMs);
     return r && r.data ? r.data : null;
   } catch (e) {
-    console.error('getRecentKlines failed', e.message);
+    console.error('getRecentKlines failed', EXCHANGE, e.message);
     return null;
   }
 }
 
 async function signedBinanceRequest(method, endpoint, params) {
+  const base = getApiBase();
   const qs = new URLSearchParams(params).toString();
-  const signature = crypto.createHmac('sha256', BINANCE_API_SECRET).update(qs).digest('hex');
-  const url = `${API_BASE}${endpoint}?${qs}&signature=${signature}`;
-  const headers = { 'X-MBX-APIKEY': BINANCE_API_KEY };
+  const signature = crypto.createHmac('sha256', ACTIVE_API_SECRET).update(qs).digest('hex');
+  const url = `${base}${endpoint}?${qs}&signature=${signature}`;
+  const headers = { 'X-MBX-APIKEY': ACTIVE_API_KEY };
   return axios({ method, url, headers, timeout: 5000 });
 }
 
