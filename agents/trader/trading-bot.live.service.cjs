@@ -12,6 +12,16 @@ const axios = require('axios');
 require('dotenv').config();
 
 /* PATHS & CONFIG */
+function readJsonFile(filePath, fallback) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    console.error('readJsonFile err:', filePath, e.message);
+    return fallback;
+  }
+}
+function loadSkillConfig() {return readJsonFile(CONFIG_PATH, {});}
 const cfg = loadSkillConfig();
 const LABEL = process.env.LABEL || 'V4.2';
 const EXCHANGE = process.env.EXCHANGE || cfg.EXCHANGE || 'binance';
@@ -72,15 +82,6 @@ function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function isValidNumber(n) { return typeof n === 'number' && Number.isFinite(n); }
 
-function readJsonFile(filePath, fallback) {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch (e) {
-    console.error('readJsonFile err:', filePath, e.message);
-    return fallback;
-  }
-}
 
 function writeJsonFileAtomic(filePath, value) {
   try {
@@ -128,8 +129,6 @@ function loadJsonl(filePath) {
     return [];
   }
 }
-
-function loadSkillConfig() {return readJsonFile(CONFIG_PATH, {});}
 
 function getYmd(dateValue) {
   const dt = new Date(dateValue || Date.now());
