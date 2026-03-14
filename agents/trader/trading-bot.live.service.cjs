@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 /**
- * AegisTrade v4-13-3
+ * AegisTrade v4.2-14-3
  * Filter hierarchy
+ * Add MEXC as exchange
  */
 
 const fs = require('fs');
@@ -12,9 +13,7 @@ const axios = require('axios');
 require('dotenv').config();
 
 /* PATHS & CONFIG */
-
 const LABEL = process.env.LABEL || 'V4.2';
-
 const BASE_DIR = path.join(__dirname, 'skills', `live-forward-${LABEL.toLowerCase()}`);
 const CONFIG_PATH = path.join(BASE_DIR, 'config.json');
 const LOCK_PATH = path.join(BASE_DIR, 'bot.lock');
@@ -472,12 +471,13 @@ async function openTrade(trade, symbol, candleBucketMs, signalCooldownMs) {
 }
 
 async function closeTrade(trade, market, closeReason, symbol, candleBucketMs) {
-  if (!isValidNumber(market) || !isValidNumber(trade.entryPrice)) {
+if (!isValidNumber(market) || !isValidNumber(trade.entryPrice)) {
     console.error('closeTrade invalid values', { market, entryPrice: trade.entryPrice, id: trade.id });
     return false;
   }
 
-  trade.profit = (trade.exitPrice - trade.entryPrice) * (trade.size || 0);
+  trade.exitPrice = market;
+  trade.profit = (market - trade.entryPrice) * (trade.size || 0);
   trade.closedAt = new Date().toISOString();
 
   const reason = closeReason || buildCloseReason(trade, market);
@@ -522,7 +522,7 @@ async function gracefulShutdown(signal) {
 
 /* MAIN */
 (async () => {
-  console.log('Starting v4 (paper mode)');
+  console.log('Starting v4.2-14-03 (paper mode)');
   ensureDir(BASE_DIR);
 
   if (!acquireLock()) process.exit(1);
