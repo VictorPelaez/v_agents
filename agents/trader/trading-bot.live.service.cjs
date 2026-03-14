@@ -506,12 +506,8 @@ if (!isValidNumber(market) || !isValidNumber(trade.entryPrice)) {
 }
 
 function detectVolatilityRegime(atr_pct) {
-if (atr_pct < 0.0008) {
-    return { regime: "LOW_VOL", k_: 0.7}}
-
-  if (atr_pct > 0.0015) {
-    return { regime: "HIGH_VOL", k_: 1.2}}
-
+  if (atr_pct < 0.0008) {return { regime: "LOW_VOL", k_: 0.7}}
+  if (atr_pct > 0.0015) {return { regime: "HIGH_VOL", k_: 1.2}}
   return {regime: "MID_VOL", k_: 1.0}
   }
 
@@ -586,6 +582,8 @@ async function gracefulShutdown(signal) {
     let dynamicMinMomentum = BASE_MIN_MOM;
     let dynamicMaxMomentum = MAX_MOMENTUM_PCT;
     let dynamicMinSlope  = minSMASlope;
+    let dynamicK_tp = k_tp;
+    let dynamicK_sl = k_sl;
 
     // Calculations based on klines
     if (Array.isArray(klines) && klines.length >= 3) {
@@ -651,11 +649,14 @@ async function gracefulShutdown(signal) {
         }
         const atr = trs.length ? trs.reduce((a, b) => a + b, 0) / trs.length : 0;
         atr_pct = atr / (last || 1);
+        // Adjusts based on volatility regime
         const vol = detectVolatilityRegime(atr_pct);
         const regime = vol.regime
         dynamicMinMomentum = dynamicMinMomentum* vol.k_;
         dynamicMaxMomentum = dynamicMaxMomentum * vol.k_;
         dynamicMinSlope = dynamicMinSlope * vol.k_;
+        dynamicK_tp = dynamicK_tp * vol.k_;
+        dynamicK_sl = dynamicK_sl * vol.k_;
         console.log(`Volatility regime: ${regime} | ATR%: ${atr_pct.toFixed(6)} | ` +  `k_: ${vol.k_}  `);
       }
     }
@@ -716,8 +717,8 @@ async function gracefulShutdown(signal) {
     if (candle && shouldEnter && state.openTradesById.size < maxPositions && !withinCooldown && !alreadyOpenedThisCandle) {
       const entryPrice = candle.close;
       const effectiveATR = atr_pct;
-      let stopLoss = entryPrice * (1 - k_sl * effectiveATR);
-      const takeProfit = entryPrice * (1 + k_tp * effectiveATR);
+      let stopLoss = entryPrice * (1 - dynamicK_sl * effectiveATR);
+      const takeProfit = entryPrice * (1 + dynamicK_tp * effectiveATR);
 
       const stopDistanceUSD = entryPrice - stopLoss;
 
@@ -739,7 +740,6 @@ async function gracefulShutdown(signal) {
       } else if (netProfit <= 0) { 
         console.log('Trade skipped: Not profitable after fees', { entryPrice, takeProfit, grossProfit, netProfit, feeRate });
       }else {
-
          const reasonDet = {
           momentum_pct: Number(momentum_pct.toFixed(6)),
           sma: sma != null ? Number(sma.toFixed(2)) : null,
