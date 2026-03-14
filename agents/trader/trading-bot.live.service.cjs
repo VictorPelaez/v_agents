@@ -505,6 +505,16 @@ if (!isValidNumber(market) || !isValidNumber(trade.entryPrice)) {
   return true;
 }
 
+function detectVolatilityRegime(atr_pct) {
+if (atr_pct < 0.0008) {
+    return { regime: "LOW_VOL", k_: 0.7}}
+
+  if (atr_pct > 0.0015) {
+    return { regime: "HIGH_VOL", k_: 1.2}}
+
+  return {regime: "MID_VOL", k_: 1.0}
+  }
+
 /* GRATEFUL SHUTDOWN */
 async function gracefulShutdown(signal) {
   if (shutdownRequested) return;
@@ -573,6 +583,9 @@ async function gracefulShutdown(signal) {
     let weakCandleBody = false;
     let weakOpen = false;
     let candleExplosive = false;
+    let dynamicMinMomentum = BASE_MIN_MOM;
+    let dynamicMaxMomentum = MAX_MOMENTUM_PCT;
+    let dynamicMinSlope  = minSMASlope;
 
     // Calculations based on klines
     if (Array.isArray(klines) && klines.length >= 3) {
@@ -638,13 +651,19 @@ async function gracefulShutdown(signal) {
         }
         const atr = trs.length ? trs.reduce((a, b) => a + b, 0) / trs.length : 0;
         atr_pct = atr / (last || 1);
+        const vol = detectVolatilityRegime(atr_pct);
+        const regime = vol.regime
+        dynamicMinMomentum = dynamicMinMomentum* vol.k_;
+        dynamicMaxMomentum = dynamicMaxMomentum * vol.k_;
+        dynamicMinSlope = dynamicMinSlope * vol.k_;
+        console.log(`Volatility regime: ${regime} | ATR%: ${atr_pct.toFixed(6)} | ` +  `k_: ${vol.k_}  `);
       }
     }
         
     // SMA slope y price near SMA
     const smaSlope = (sma !== null && smaPrev !== null) ? (sma - smaPrev) : 0;
     const priceNearSMA = (sma !== null && candle) ? (candle.close >= sma * (1 - smaTol)) : true;
-    const trendUp = smaSlope > minSMASlope;
+    const trendUp = smaSlope > dynamicMinSlope;
     const priceAboveSMA = (sma !== null && candle) ? (candle.close > sma) : true;
     
     // Filter by momentum with dynamic reduction if we have a run of green candles
@@ -657,11 +676,11 @@ async function gracefulShutdown(signal) {
       }
     }
 
-    let effectiveMinMom = BASE_MIN_MOM;
+    let effectiveMinMom = dynamicMinMomentum;
     if (green_run >= GREEN_KLINES && GREEN_KLINES > 0 && MOM_REDUCTION_PCT > 0) {
-      effectiveMinMom = BASE_MIN_MOM * (1 - MOM_REDUCTION_PCT);
+      effectiveMinMom = dynamicMinMomentum * (1 - MOM_REDUCTION_PCT);
     }
-    const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= MAX_MOMENTUM_PCT;
+    const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= dynamicMaxMomentum;
 
     // Final decision
     const shouldEnter = momentumOk &&
