@@ -12,6 +12,15 @@ const axios = require('axios');
 require('dotenv').config();
 
 /* PATHS & CONFIG */
+
+const LABEL = process.env.LABEL || 'V4.2';
+
+const BASE_DIR = path.join(__dirname, 'skills', `live-forward-${LABEL.toLowerCase()}`);
+const CONFIG_PATH = path.join(BASE_DIR, 'config.json');
+const LOCK_PATH = path.join(BASE_DIR, 'bot.lock');
+const OPEN_POSITIONS_PATH = path.join(BASE_DIR, 'open_positions.json');
+
+function loadSkillConfig() {return readJsonFile(CONFIG_PATH, {});}
 function readJsonFile(filePath, fallback) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -21,14 +30,8 @@ function readJsonFile(filePath, fallback) {
     return fallback;
   }
 }
-function loadSkillConfig() {return readJsonFile(CONFIG_PATH, {});}
 const cfg = loadSkillConfig();
-const LABEL = process.env.LABEL || 'V4.2';
 const EXCHANGE = process.env.EXCHANGE || cfg.EXCHANGE || 'binance';
-const BASE_DIR = path.join(__dirname, 'skills', `live-forward-${LABEL.toLowerCase()}`);
-const CONFIG_PATH = path.join(BASE_DIR, 'config.json');
-const LOCK_PATH = path.join(BASE_DIR, 'bot.lock');
-const OPEN_POSITIONS_PATH = path.join(BASE_DIR, 'open_positions.json');
 
 /* STATE */
 let shutdownRequested = false;
@@ -83,6 +86,7 @@ function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function isValidNumber(n) { return typeof n === 'number' && Number.isFinite(n); }
 
 
+
 function writeJsonFileAtomic(filePath, value) {
   try {
     ensureDir(path.dirname(filePath));
@@ -129,6 +133,8 @@ function loadJsonl(filePath) {
     return [];
   }
 }
+
+
 
 function getYmd(dateValue) {
   const dt = new Date(dateValue || Date.now());
