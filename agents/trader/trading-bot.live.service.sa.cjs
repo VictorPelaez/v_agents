@@ -868,10 +868,14 @@ async function gracefulShutdown(signal) {
   const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfgLive.SMA_TOLERANCE || 0.001);
   // Volume filter: interpret MIN_VOLUME as QUOTE volume (USDT) when available (kline[7]); fallback to base volume (kline[5]).
   const MIN_VOLUME = parseFloat(process.env.MIN_VOLUME || cfgLive.MIN_VOLUME || 0);
-  // Minimum stop distance in USD (existing in config.json). Helps avoid ultra-tight ATR stops.
+  // Minimum stop distance (legacy, ABS in price units; e.g., BTCUSDT: 80 means $80 move). Not multi-crypto friendly.
   const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || cfgLive.MIN_SL_USD || 0);
+  // Recommended for multi-crypto: minimum stop distance as % of entry price (e.g. 0.001 = 0.1%). Overrides MIN_SL_USD when set.
+  const MIN_SL_PCT = parseFloat(process.env.MIN_SL_PCT || cfgLive.MIN_SL_PCT || ''); // NaN if unset
 
-  const minSMASlope = parseFloat(process.env.MIN_SMA_SLOPE || cfgLive.MIN_SMA_SLOPE || 2.0);
+  const minSMASlope = parseFloat(process.env.MIN_SMA_SLOPE || cfgLive.MIN_SMA_SLOPE || 2.0); // ABS (price units) legacy
+  // Optional % slope threshold for multi-crypto (recommended). Example: 0.00003 ≈ 0.003% per candle.
+  const minSMASlopePct = parseFloat(process.env.MIN_SMA_SLOPE_PCT || cfgLive.MIN_SMA_SLOPE_PCT || ''); // NaN if unset
   const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || cfgLive.SMA_WINDOW || 60, 10);
   const limit = SMA_WINDOW + 2;
 
@@ -1000,15 +1004,22 @@ async function gracefulShutdown(signal) {
         }
 
         const lastClosed = klines[klines.length - 2];
+        const _close = Number(lastClosed[4]);
+        const _volBase = Number(lastClosed[5]);
+        const _quoteVolEx = Number(lastClosed[7]);
+        const _quoteVol = Number.isFinite(_quoteVolEx)
+          ? _quoteVolEx
+          : (Number.isFinite(_close) && Number.isFinite(_volBase) ? (_close * _volBase) : NaN);
+
         const candle = {
           ts: Number(lastClosed[0]),
           open: Number(lastClosed[1]),
           high: Number(lastClosed[2]),
           low: Number(lastClosed[3]),
-          close: Number(lastClosed[4]),
-          volume: Number(lastClosed[5]),
-          // Binance-style klines: quote volume at index 7 (may be undefined on some exchanges)
-          quoteVolume: Number(lastClosed[7])
+          close: _close,
+          volume: _volBase,
+          // Prefer exchange-provided quote volume; fallback to close*baseVolume for consistent USDT-based MIN_VOLUME
+          quoteVolume: _quoteVol
         };
 
         if (![candle.ts, candle.open, candle.high, candle.low, candle.close, candle.volume].every(Number.isFinite)) {
@@ -1066,7 +1077,9 @@ async function gracefulShutdown(signal) {
 
         // Indicators
         const { sma, smaPrev } = computeSmaPair(closes, SMA_WINDOW);
-        const smaSlope = (sma != null && smaPrev != null) ? (sma - smaPrev) : 0;
+        // Slope in ABS price units (legacy) + normalized slope in % of SMA (recommended for multi-crypto)
+        const smaSlopeAbs = (sma != null && smaPrev != null) ? (sma - smaPrev) : 0;
+        const smaSlopePct = (sma != null && smaPrev != null && smaPrev !== 0) ? (sma - smaPrev) / smaPrev : 0;
         const priceNearSMA = (sma != null) ? (candle.close >= sma * (1 - smaTol)) : true;
         const priceAboveSMA = (sma != null) ? (candle.close > sma) : true;
 
@@ -1076,7 +1089,7 @@ async function gracefulShutdown(signal) {
         const regimeInfo = detectMarketRegime({
           atrPct,
           realizedVol,
-          smaSlope,
+          smaSlope: smaSlopeAbs,
           lastClose: candle.close,
           priceAboveSma: priceAboveSMA
         });
@@ -1084,10 +1097,15 @@ async function gracefulShutdown(signal) {
         const regime = regimeInfo.volRegime;
 
         const dynamicMinMomentum = BASE_MIN_MOM * regimeInfo.kMinMomentum;
-        const dynamicMinSlope = minSMASlope * regimeInfo.kMinSlope;
+        const dynamicMinSlopeAbs = minSMASlope * regimeInfo.kMinSlope;
+        const dynamicMinSlopePct = Number.isFinite(minSMASlopePct) ? (minSMASlopePct * regimeInfo.kMinSlope) : null;
         const dynamicMaxMomentum = MAX_MOMENTUM_PCT;
 
-        const trendUp = smaSlope > dynamicMinSlope;
+        // If MIN_SMA_SLOPE_PCT is set, use pct-based slope threshold (works across assets).
+        // Otherwise fall back to ABS (price units) legacy behavior.
+        const trendUp = (dynamicMinSlopePct != null)
+          ? (smaSlopePct > dynamicMinSlopePct)
+          : (smaSlopeAbs > dynamicMinSlopeAbs);
 
         // Green run
         let green_run = 0;
@@ -1121,7 +1139,11 @@ async function gracefulShutdown(signal) {
           symbol: sym,
           momentum_pct: Number(momentum_pct.toFixed(6)),
           sma: sma != null ? Number(sma.toFixed(2)) : null,
-          smaSlope: Number(smaSlope.toFixed(2)),
+          // Use adaptive precision so alts don't show 0.00 slope when slope is small
+          smaSlope: Number(smaSlopeAbs.toFixed(candle.close < 10 ? 6 : 2)),
+          smaSlopePct: Number(smaSlopePct.toFixed(6)),
+          minSlopeAbs: Number(dynamicMinSlopeAbs.toFixed(candle.close < 10 ? 6 : 2)),
+          minSlopePct: (dynamicMinSlopePct != null) ? Number(dynamicMinSlopePct.toFixed(6)) : null,
           atr_pct: Number((atrPct || 0).toFixed(6)),
           realized_vol: Number((realizedVol || 0).toFixed(6)),
           regime,
@@ -1222,10 +1244,17 @@ async function gracefulShutdown(signal) {
 
         // TP/SL sizing:
         // - Base on ATR% (k_sl/k_tp)
-        // - Enforce a minimum absolute stop distance (MIN_SL_USD) to avoid ultra-tight stops
+        // - Enforce a minimum stop distance (prefer MIN_SL_PCT for multi-crypto; fallback MIN_SL_USD legacy)
         const rr = (k_sl > 0) ? (k_tp / k_sl) : 2.0;
         let riskDist = entryPrice * (k_sl * effectiveATR);
-        if (MIN_SL_USD > 0 && riskDist < MIN_SL_USD) riskDist = MIN_SL_USD;
+
+        if (Number.isFinite(MIN_SL_PCT) && MIN_SL_PCT > 0) {
+          const minDist = entryPrice * MIN_SL_PCT;
+          if (riskDist < minDist) riskDist = minDist;
+        } else if (MIN_SL_USD > 0 && riskDist < MIN_SL_USD) {
+          riskDist = MIN_SL_USD;
+        }
+
         const stopLoss = entryPrice - riskDist;
         const takeProfit = entryPrice + riskDist * rr;
 
@@ -1250,7 +1279,10 @@ async function gracefulShutdown(signal) {
         const reasonDet = {
           momentum_pct: Number(momentum_pct.toFixed(6)),
           sma: sma != null ? Number(sma.toFixed(2)) : null,
-          sma_slope: Number(smaSlope.toFixed(2)),
+          sma_slope: Number(smaSlopeAbs.toFixed(candle.close < 10 ? 6 : 2)),
+          sma_slope_pct: Number(smaSlopePct.toFixed(6)),
+          min_sma_slope_abs: Number(dynamicMinSlopeAbs.toFixed(candle.close < 10 ? 6 : 2)),
+          min_sma_slope_pct: (dynamicMinSlopePct != null) ? Number(dynamicMinSlopePct.toFixed(6)) : null,
           atr_pct: Number((atrPct || 0).toFixed(6)),
           realized_vol: Number((realizedVol || 0).toFixed(6)),
           regime,

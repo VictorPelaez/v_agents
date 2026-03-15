@@ -2,10 +2,11 @@
   "SYMBOL": "BTCUSDT",
   "SYMBOLS": [
     "BTCUSDT",
-    "NEARUSDT",
     "TRXUSDT",
     "BNBUSDT",
-    "LINKUSDT"
+    "LINKUSDT",
+    "SOLUSDT",
+    "XRPUSDT"
   ],
   "VERBOSE": true,
   "SYMBOL_RANKING_ENABLED": true,
@@ -30,9 +31,11 @@
   "CAPITAL": 1000,
   "RISK_PCT": 0.01,
   "TRADE_USD": 100.0,
-  "MIN_SL_USD": 80,
+  "MIN_SL_USD": 0,
+  "MIN_SL_PCT": 0.0011,
   "SMA_TOLERANCE": 0.001,
   "MIN_SMA_SLOPE": 2.0,
+  "MIN_SMA_SLOPE_PCT": 0.00003,
   "MIN_VOLUME": 80,
   "MIN_BODY_CANDLE": 0.5,
   "REQUIRED_CONFIRMATION": 1,
