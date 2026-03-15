@@ -458,7 +458,7 @@ async function openTrade(trade, symbol, candleBucketMs, signalCooldownMs) {
   console.log(
     'OPEN (paper):', trade.openedAt,
     'id=', trade.id,
-    'regime=', regime,
+    'regime=', trade.regime,
     'signalCandleTs=', trade.signalCandleTs,
     'signalKey=', signalKey,
     'entry=', trade.entryPrice,
