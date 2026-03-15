@@ -458,6 +458,7 @@ async function openTrade(trade, symbol, candleBucketMs, signalCooldownMs) {
   console.log(
     'OPEN (paper):', trade.openedAt,
     'id=', trade.id,
+    'regime=', regime,
     'signalCandleTs=', trade.signalCandleTs,
     'signalKey=', signalKey,
     'entry=', trade.entryPrice,
@@ -500,7 +501,10 @@ if (!isValidNumber(market) || !isValidNumber(trade.entryPrice)) {
     'close=', trade.closedAt,
     'entry=', trade.entryPrice,
     'exit=', trade.exitPrice,
-    'profit=', trade.profit
+    'fee rate=', trade.feeRate,
+    'profit=', trade.profit,
+    'profit%=', trade.profit_pct,
+    'profit after fees=', trade.profit - trade.feeRate
   );
   return true;
 }
@@ -582,8 +586,8 @@ async function gracefulShutdown(signal) {
     let dynamicMinMomentum = BASE_MIN_MOM;
     let dynamicMaxMomentum = MAX_MOMENTUM_PCT;
     let dynamicMinSlope  = minSMASlope;
-    let dynamicK_tp = k_tp;
-    let dynamicK_sl = k_sl;
+    // let dynamicK_tp = k_tp;
+    // let dynamicK_sl = k_sl;
 
     // Calculations based on klines
     if (Array.isArray(klines) && klines.length >= 3) {
@@ -655,8 +659,8 @@ async function gracefulShutdown(signal) {
         dynamicMinMomentum = dynamicMinMomentum* vol.k_;
         dynamicMaxMomentum = dynamicMaxMomentum * vol.k_;
         dynamicMinSlope = dynamicMinSlope * vol.k_;
-        dynamicK_tp = dynamicK_tp * vol.k_;
-        dynamicK_sl = dynamicK_sl * vol.k_;
+        // dynamicK_tp = dynamicK_tp * vol.k_;
+        // dynamicK_sl = dynamicK_sl * vol.k_;
         console.log(`Volatility regime: ${regime} | ATR%: ${atr_pct.toFixed(6)} | ` +  `k_: ${vol.k_}  `);
       }
     }
@@ -717,8 +721,8 @@ async function gracefulShutdown(signal) {
     if (candle && shouldEnter && state.openTradesById.size < maxPositions && !withinCooldown && !alreadyOpenedThisCandle) {
       const entryPrice = candle.close;
       const effectiveATR = atr_pct;
-      let stopLoss = entryPrice * (1 - dynamicK_sl * effectiveATR);
-      const takeProfit = entryPrice * (1 + dynamicK_tp * effectiveATR);
+      let stopLoss = entryPrice * (1 - k_sl * effectiveATR);
+      const takeProfit = entryPrice * (1 + k_tp * effectiveATR);
 
       const stopDistanceUSD = entryPrice - stopLoss;
 
@@ -765,6 +769,8 @@ async function gracefulShutdown(signal) {
             size: qty,
             exposureUSD: Number((entryPrice * qty).toFixed(2)),
             type: 'LONG',
+            regime,
+            feeRate,
             reasonTag,
             reasonDetails: reasonDet
           };
