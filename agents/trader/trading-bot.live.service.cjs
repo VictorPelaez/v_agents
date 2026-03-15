@@ -586,6 +586,7 @@ async function gracefulShutdown(signal) {
     let dynamicMinMomentum = BASE_MIN_MOM;
     let dynamicMaxMomentum = MAX_MOMENTUM_PCT;
     let dynamicMinSlope  = minSMASlope;
+    let regime = "UNKNOWN";
     // let dynamicK_tp = k_tp;
     // let dynamicK_sl = k_sl;
 
@@ -655,7 +656,7 @@ async function gracefulShutdown(signal) {
         atr_pct = atr / (last || 1);
         // Adjusts based on volatility regime
         const vol = detectVolatilityRegime(atr_pct);
-        const regime = vol.regime
+        regime = vol.regime;
         dynamicMinMomentum = dynamicMinMomentum* vol.k_;
         dynamicMaxMomentum = dynamicMaxMomentum * vol.k_;
         dynamicMinSlope = dynamicMinSlope * vol.k_;
