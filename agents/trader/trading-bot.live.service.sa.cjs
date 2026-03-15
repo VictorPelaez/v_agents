@@ -3,18 +3,18 @@
 /**
  * trading-bot.live.service.sa.cjs
  *
- * "SA" = Stabilized & Adaptive service version.
+ * SA = Stabilized & Adaptive.
  *
- * Goals (per Victor):
- * - Maintain compatibility with current system (paths, config keys, journal format)
- * - Be more robust (no crash on missing data, stale lock recovery)
- * - Clear & well-commented logic
- * - Include volatility / regime detection (simple, stable heuristics)
- * - Optimize execution (less IO churn, aligned caching)
+ * Additions requested by Victor:
+ * 1) Trade-rate limit: configurable max trades per hour (MAX_TRADES_PER_HOUR in config.json).
+ * 2) Multi-crypto support: configurable SYMBOLS[] in config.json (backwards compatible with SYMBOL).
+ * 3) Verbose mode ON by default: show symbol being analyzed, loop iteration, filter pass/fail,
+ *    and when signals are generated/discarded.
  *
- * Notes:
- * - This service runs in paper mode by default (journal-based simulation).
- * - It consumes Binance-style public endpoints (Binance/MEXC provide /api/v3 for spot).
+ * Hard constraints:
+ * - Respect existing config.json (do not break; new params optional)
+ * - Maintain inputs/outputs & journal JSONL format/rotation trade_journal_YYYYMMDD.jsonl
+ * - Do not break current log patterns (keep ITER_SUMMARY / OPEN_TRADE style lines)
  */
 
 'use strict';
@@ -73,17 +73,40 @@ let lockFd = null;
 let snapshotTimer = null;
 let snapshotDirty = false;
 let lastSnapshotHash = '';
-let lastTradeCandle = null;
+let iterCount = 0;
 
 const state = {
-  openTradesById: new Map(),
-  openTradeIdBySignalKey: new Map(),
+  // journal/state
+  openTradesById: new Map(),            // id -> trade
+  openTradesBySymbol: new Map(),        // symbol -> Map(id -> trade)
+  openTradeIdBySignalKey: new Map(),    // signalKey -> id
   seenEventKeys: new Set(),
   recentSignalSeenAt: new Map(),
-  lastOpenBySymbol: {},
-  lastDecision: {},
-  lastTickerCache: { ts: 0, price: null }
+
+  // runtime per-symbol
+  symbolRuntime: new Map(),             // symbol -> { lastAnalyzedClosedTs, lastTradeCandleMinute, lastOpenTs, lastKlinesPollMs }
+  decisionBySymbol: new Map(),
+  tickerCacheBySymbol: new Map(),
+
+  // trade-rate limiting
+  recentOpenTimes: [],                  // timestamps (ms) for rolling 1h window
+  openCountsByDay: new Map(),           // yyyymmdd (UTC) -> count of OPEN events
+
+  // misc
+  lastOpenBySymbol: {}
 };
+
+function getSymbolRuntime(symbol) {
+  if (!state.symbolRuntime.has(symbol)) {
+    state.symbolRuntime.set(symbol, {
+      lastAnalyzedClosedTs: null,
+      lastTradeCandleMinute: null,
+      lastOpenTs: 0,
+      lastKlinesPollMs: 0
+    });
+  }
+  return state.symbolRuntime.get(symbol);
+}
 
 /* -----------------------------
  * EXCHANGE / API
@@ -112,7 +135,7 @@ const API_KEYS = {
 const ACTIVE_API_KEY = API_KEYS[EXCHANGE]?.key || '';
 const ACTIVE_API_SECRET = API_KEYS[EXCHANGE]?.secret || '';
 
-// Keys are not required for public data endpoints. We keep compatibility but avoid hard-exit.
+// Keys are not required for public endpoints. We keep compatibility but avoid hard-exit.
 const REQUIRE_KEYS = String(process.env.REQUIRE_KEYS || cfg.REQUIRE_KEYS || '0') === '1';
 if (REQUIRE_KEYS && (!ACTIVE_API_KEY || !ACTIVE_API_SECRET)) {
   console.error(`API keys for ${EXCHANGE} not set in .env (REQUIRE_KEYS=1)`);
@@ -171,7 +194,6 @@ function loadJsonl(filePath) {
         try {
           return JSON.parse(line);
         } catch (e) {
-          console.error('loadJsonl parse err:', e.message);
           return null;
         }
       })
@@ -205,12 +227,8 @@ function fmtDateUtc1(d) {
   return `${Y}-${M}-${D} ${h}:${m}:${s}`;
 }
 
-function formatHms(sec) {
-  const s = Math.max(0, Math.floor(sec || 0));
-  const h = String(Math.floor(s / 3600)).padStart(2, '0');
-  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
-  const ss = String(s % 60).padStart(2, '0');
-  return `${h}:${m}:${ss}`;
+function nowIso() {
+  return new Date().toISOString();
 }
 
 /* -----------------------------
@@ -223,7 +241,6 @@ function isPidAlive(pid) {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    // EPERM => exists but no permissions; treat as alive.
     return e && e.code === 'EPERM';
   }
 }
@@ -231,7 +248,6 @@ function isPidAlive(pid) {
 function acquireLock() {
   ensureDir(BASE_DIR);
 
-  // If lock exists, check staleness.
   if (fs.existsSync(LOCK_PATH)) {
     try {
       const raw = fs.readFileSync(LOCK_PATH, 'utf8');
@@ -241,7 +257,6 @@ function acquireLock() {
         console.error('lock exists, process seems alive:', { lock: LOCK_PATH, pid });
         return false;
       }
-      // stale lock
       console.warn('stale lock detected, removing:', { lock: LOCK_PATH, pid });
       try { fs.unlinkSync(LOCK_PATH); } catch (_) {}
     } catch (e) {
@@ -252,7 +267,7 @@ function acquireLock() {
 
   try {
     lockFd = fs.openSync(LOCK_PATH, 'wx');
-    fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
+    fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, started_at: nowIso() }), 'utf8');
     return true;
   } catch (e) {
     if (e && e.code === 'EEXIST') {
@@ -286,7 +301,7 @@ function getSignalBucketMs(signalCandleTs, bucketMs) {
 }
 
 function getSignalKey(trade, candleBucketMs) {
-  const symbol = trade.symbol || 'BTC';
+  const symbol = trade.symbol || 'BTCUSDT';
   const side = trade.type || trade.side || 'LONG';
   const reasonTag = trade.reasonTag || trade.reason_tag || '';
   const bucket = getSignalBucketMs(trade.signalCandleTs || trade.signal_candle_ts, candleBucketMs);
@@ -302,7 +317,7 @@ function getCloseEventKey(trade, closeReason) {
 }
 
 /* -----------------------------
- * NORMALIZERS (compat: same journal shape; additive fields are OK)
+ * NORMALIZERS (compat: additive fields ok)
  * ----------------------------- */
 
 function normalizeOpenTrade(trade, candleBucketMs) {
@@ -310,7 +325,7 @@ function normalizeOpenTrade(trade, candleBucketMs) {
     id: trade.id,
     label: LABEL,
     symbol: trade.symbol || 'BTCUSDT',
-    open_time_iso: trade.openedAt || new Date().toISOString(),
+    open_time_iso: trade.openedAt || nowIso(),
     signal_candle_ts: trade.signalCandleTs || null,
     side: trade.type || 'LONG',
     qty: trade.size ?? 0,
@@ -326,7 +341,7 @@ function normalizeOpenTrade(trade, candleBucketMs) {
 
 function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
   const openedAt = trade.openedAt || '';
-  const closedAt = trade.closedAt || new Date().toISOString();
+  const closedAt = trade.closedAt || nowIso();
   const durationS = openedAt
     ? Math.round((new Date(closedAt).getTime() - new Date(openedAt).getTime()) / 1000)
     : null;
@@ -357,8 +372,40 @@ function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
 }
 
 /* -----------------------------
+ * TRADE-RATE LIMITING
+ * ----------------------------- */
+
+function pruneRecentOpens(nowMs, windowMs) {
+  const w = Math.max(1000, windowMs || 3600000);
+  state.recentOpenTimes = state.recentOpenTimes.filter(ts => (nowMs - ts) <= w);
+}
+
+function noteOpenTimestamp(ms) {
+  if (!Number.isFinite(ms)) return;
+  const nowMs = Date.now();
+  state.recentOpenTimes.push(ms);
+  pruneRecentOpens(nowMs, 3600000);
+}
+
+function countOpensLastHour() {
+  const nowMs = Date.now();
+  pruneRecentOpens(nowMs, 3600000);
+  return state.recentOpenTimes.length;
+}
+
+function countOpensTodayUtc() {
+  const ymd = getYmd(Date.now());
+  return state.openCountsByDay.get(ymd) || 0;
+}
+
+/* -----------------------------
  * JOURNAL STATE MANAGEMENT
  * ----------------------------- */
+
+function ensureOpenTradesSymbolMap(symbol) {
+  if (!state.openTradesBySymbol.has(symbol)) state.openTradesBySymbol.set(symbol, new Map());
+  return state.openTradesBySymbol.get(symbol);
+}
 
 function applyJournalEvent(event) {
   if (!event || !event.event_key) return;
@@ -381,19 +428,37 @@ function applyJournalEvent(event) {
       exposureUSD: t.exposure_usd ?? null
     };
 
+    const symbol = trade.symbol;
     const signalKey = t.signal_key;
+
     state.openTradesById.set(String(trade.id), trade);
+    ensureOpenTradesSymbolMap(symbol).set(String(trade.id), trade);
+
     state.openTradeIdBySignalKey.set(signalKey, String(trade.id));
     state.recentSignalSeenAt.set(signalKey, Date.now());
+
+    // rebuild trade-rate limiting window from journal
+    const ms = Date.parse(trade.openedAt);
+    if (Number.isFinite(ms)) {
+      noteOpenTimestamp(ms);
+      const ymd = getYmd(ms);
+      const prev = state.openCountsByDay.get(ymd) || 0;
+      state.openCountsByDay.set(ymd, prev + 1);
+    }
+
     markSnapshotDirty();
   }
 
   if (event.type === 'CLOSE') {
     const t = event.trade;
     const id = String(t.id ?? '');
+    const symbol = t.symbol || 'BTCUSDT';
     const signalKey = t.signal_key || '';
 
     state.openTradesById.delete(id);
+    const m = state.openTradesBySymbol.get(symbol);
+    if (m) m.delete(id);
+
     if (signalKey) state.openTradeIdBySignalKey.delete(signalKey);
     if (signalKey) state.recentSignalSeenAt.set(signalKey, Date.now());
 
@@ -403,26 +468,32 @@ function applyJournalEvent(event) {
 
 function rebuildStateFromJournal() {
   state.openTradesById.clear();
+  state.openTradesBySymbol.clear();
   state.openTradeIdBySignalKey.clear();
   state.seenEventKeys.clear();
   state.recentSignalSeenAt.clear();
+  state.recentOpenTimes = [];
+  state.openCountsByDay.clear();
 
-  const events = loadJsonl(getJournalPath(new Date().toISOString()));
+  const events = loadJsonl(getJournalPath(nowIso()));
   for (const ev of events) applyJournalEvent(ev);
 
-  // ensure snapshot reflects journal state after restart
   flushOpenPositionsSnapshot(true);
 }
 
 function persistJournalEvent(event) {
   if (state.seenEventKeys.has(event.event_key)) return true;
-  const ok = appendJsonl(getJournalPath(event.ts || new Date().toISOString()), event);
+  const ok = appendJsonl(getJournalPath(event.ts || nowIso()), event);
   if (!ok) return false;
   applyJournalEvent(event);
   return true;
 }
 
-function getOpenTradesArray() {
+function getOpenTradesArray(symbol) {
+  if (symbol) {
+    const m = state.openTradesBySymbol.get(symbol);
+    return m ? Array.from(m.values()) : [];
+  }
   return Array.from(state.openTradesById.values());
 }
 
@@ -431,8 +502,6 @@ function markSnapshotDirty() {
 }
 
 function computeSnapshotHash(trades) {
-  // Very small hash to avoid rewriting identical snapshot.
-  // We hash stable fields; exclude volatile runtime fields.
   const s = JSON.stringify(trades.map(t => ({
     id: t.id,
     symbol: t.symbol,
@@ -450,7 +519,6 @@ function flushOpenPositionsSnapshot(force = false) {
   try {
     const trades = getOpenTradesArray();
     const h = computeSnapshotHash(trades);
-
     if (!force && !snapshotDirty && h === lastSnapshotHash) return true;
 
     const ok = writeJsonFileAtomic(
@@ -515,7 +583,7 @@ function canOpenSignal(signalKey, cooldownMs) {
  * ----------------------------- */
 
 function jitter(ms) {
-  const j = 0.15; // ±15%
+  const j = 0.15;
   return Math.round(ms * (1 - j + Math.random() * 2 * j));
 }
 
@@ -533,7 +601,6 @@ async function httpGetWithRetry(url, opts = {}, retries = 4, baseDelayMs = 250, 
       const status = resp?.status || 0;
       if (status >= 200 && status < 300) return resp;
 
-      // Rate limit / abuse protection: backoff
       if (status === 429 || status === 418) {
         const delay = jitter(baseDelayMs * Math.pow(2, i));
         console.warn('HTTP rate limited', { status, url: url.split('?')[0], delay });
@@ -541,7 +608,6 @@ async function httpGetWithRetry(url, opts = {}, retries = 4, baseDelayMs = 250, 
         continue;
       }
 
-      // Transient server errors
       if (status >= 500 && status < 600) {
         const delay = jitter(baseDelayMs * Math.pow(2, i));
         console.warn('HTTP server error', { status, url: url.split('?')[0], delay });
@@ -549,10 +615,10 @@ async function httpGetWithRetry(url, opts = {}, retries = 4, baseDelayMs = 250, 
         continue;
       }
 
-      // Other non-2xx: do not retry too aggressively
       lastErr = new Error(`HTTP ${status}`);
       console.error('HTTP non-2xx', { status, url: url.split('?')[0], data: resp?.data });
       break;
+
     } catch (e) {
       lastErr = e;
       const delay = jitter(baseDelayMs * Math.pow(2, i));
@@ -574,18 +640,19 @@ async function getTicker(symbol, timeoutMs) {
     const px = Number(r?.data?.price);
     return Number.isFinite(px) ? px : null;
   } catch (e) {
-    console.error('getTicker failed', EXCHANGE, e.message);
+    console.error('getTicker failed', EXCHANGE, symbol, e.message);
     return null;
   }
 }
 
 async function getTickerCached(symbol, timeoutMs, maxAgeMs) {
   const now = Date.now();
-  if (state.lastTickerCache.price !== null && (now - state.lastTickerCache.ts) <= maxAgeMs) {
-    return state.lastTickerCache.price;
+  const cache = state.tickerCacheBySymbol.get(symbol) || { ts: 0, price: null };
+  if (cache.price !== null && (now - cache.ts) <= maxAgeMs) {
+    return cache.price;
   }
   const price = await getTicker(symbol, timeoutMs);
-  if (price !== null) state.lastTickerCache = { ts: now, price };
+  if (price !== null) state.tickerCacheBySymbol.set(symbol, { ts: now, price });
   return price;
 }
 
@@ -599,54 +666,65 @@ async function getRecentKlines(symbol, limit, interval, timeoutMs) {
     if (!Array.isArray(r?.data)) return null;
     return r.data;
   } catch (e) {
-    console.error('getRecentKlines failed', EXCHANGE, e.message);
+    console.error('getRecentKlines failed', EXCHANGE, symbol, e.message);
     return null;
   }
 }
 
 /* -----------------------------
- * OPTIONAL: Signed requests (kept for compatibility; not used by default)
+ * RANK SYMBOLS (simple, low-frequency)
  * ----------------------------- */
 
-async function signedBinanceRequest(method, endpoint, params) {
-  const base = getApiBase();
-  const qs = new URLSearchParams(params).toString();
-  const signature = crypto.createHmac('sha256', ACTIVE_API_SECRET).update(qs).digest('hex');
-  const url = `${base}${endpoint}?${qs}&signature=${signature}`;
-  const headers = { 'X-MBX-APIKEY': ACTIVE_API_KEY };
-  return axios({ method, url, headers, timeout: 5000 });
-}
+async function rankSymbolsByRecentReturn(symbols, lookbackDays, httpTimeoutMs, verbose) {
+  const days = Math.max(10, parseInt(lookbackDays || 90, 10));
+  const scores = [];
 
-async function PlaceLiveOpenOrderOco(trade, symbol) {
-  // This is exchange-specific (Binance-style OCO). Disabled unless explicitly enabled.
-  const ENABLE_LIVE = String(process.env.ENABLE_LIVE || cfg.ENABLE_LIVE || '0') === '1';
-  if (!ENABLE_LIVE) return;
+  for (const sym of symbols) {
+    const kl = await getRecentKlines(sym, days + 1, '1d', httpTimeoutMs);
+    if (!Array.isArray(kl) || kl.length < 5) {
+      if (verbose) console.log('RANK: skip symbol (no klines)', sym);
+      continue;
+    }
 
-  if (!ACTIVE_API_KEY || !ACTIVE_API_SECRET) {
-    console.error('ENABLE_LIVE=1 but missing API keys; skipping live order.');
-    return;
+    // Use closes; exclude last (in-progress) daily candle by slicing -1
+    const closed = kl.slice(0, kl.length - 1);
+    const closes = closed.map(k => Number(k[4])).filter(Number.isFinite);
+    if (closes.length < 5) continue;
+
+    const first = closes[0];
+    const last = closes[closes.length - 1];
+    if (!(first > 0 && last > 0)) continue;
+
+    const ret = (last / first) - 1;
+
+    // Max drawdown on closes (rough but stable)
+    let peak = closes[0];
+    let mdd = 0;
+    for (const c of closes) {
+      if (c > peak) peak = c;
+      if (peak > 0) {
+        const dd = (peak - c) / peak;
+        if (dd > mdd) mdd = dd;
+      }
+    }
+
+    // Score: prefer higher return, penalize deep drawdown.
+    const score = ret - 0.5 * mdd;
+    scores.push({ symbol: sym, score, ret, mdd });
   }
 
-  if (!isValidNumber(trade.entryPrice) || !isValidNumber(trade.stopLoss) || !isValidNumber(trade.takeProfit)) {
-    console.error('Invalid trade values for live OCO', { id: trade.id });
-    return;
+  scores.sort((a, b) => b.score - a.score);
+  if (verbose && scores.length) {
+    console.log('RANK: symbols ordered (best first):');
+    for (const s of scores.slice(0, Math.min(scores.length, 10))) {
+      console.log('RANK:', s.symbol, 'score=', s.score.toFixed(4), 'ret=', s.ret.toFixed(4), 'mdd=', s.mdd.toFixed(4));
+    }
   }
 
-  try {
-    const qty = trade.size;
-    const res = await signedBinanceRequest('POST', '/api/v3/order/oco', {
-      symbol,
-      side: 'SELL',
-      quantity: String(qty),
-      price: trade.takeProfit.toFixed(2),
-      stopPrice: trade.stopLoss.toFixed(2),
-      stopLimitPrice: trade.stopLoss.toFixed(2),
-      stopLimitTimeInForce: 'GTC'
-    });
-    console.log('LIVE OCO ORDER PLACED:', JSON.stringify(res.data || res));
-  } catch (e) {
-    console.error('LIVE OCO ORDER ERROR:', e.message, e.response?.data || '');
-  }
+  const ordered = scores.map(s => s.symbol);
+  // Keep any symbols that failed ranking at the end (original order)
+  const missing = symbols.filter(s => !ordered.includes(s));
+  return ordered.concat(missing);
 }
 
 /* -----------------------------
@@ -659,20 +737,14 @@ function buildCloseReason(trade, market) {
   return 'OTHER';
 }
 
-async function openTrade(trade, symbol, candleBucketMs, signalCooldownMs) {
+async function openTrade(trade, candleBucketMs, signalCooldownMs, verbose) {
   const signalKey = getSignalKey(trade, candleBucketMs);
 
-  if (hasOpenSignal(signalKey)) {
-    console.log('skip duplicated signal already open', signalKey);
-    return false;
-  }
-  if (!canOpenSignal(signalKey, signalCooldownMs)) {
-    console.log('skip repeated signal in cooldown', signalKey);
-    return false;
-  }
+  if (hasOpenSignal(signalKey)) return false;
+  if (!canOpenSignal(signalKey, signalCooldownMs)) return false;
 
   const event = {
-    ts: new Date().toISOString(),
+    ts: nowIso(),
     type: 'OPEN',
     event_key: getOpenEventKey(trade, candleBucketMs),
     trade: normalizeOpenTrade(trade, candleBucketMs)
@@ -684,6 +756,7 @@ async function openTrade(trade, symbol, candleBucketMs, signalCooldownMs) {
   console.log(
     'OPEN (paper):', trade.openedAt,
     'id=', trade.id,
+    'symbol=', trade.symbol,
     'regime=', trade.regime,
     'signalCandleTs=', trade.signalCandleTs,
     'signalKey=', signalKey,
@@ -693,13 +766,10 @@ async function openTrade(trade, symbol, candleBucketMs, signalCooldownMs) {
     'REASON=', trade.reasonTag
   );
 
-  // Optional live order (disabled by default)
-  // await PlaceLiveOpenOrderOco(trade, symbol);
-
   return true;
 }
 
-async function closeTrade(trade, market, closeReason, symbol, candleBucketMs, feeRate) {
+async function closeTrade(trade, market, closeReason, candleBucketMs, feeRate) {
   if (!isValidNumber(market) || !isValidNumber(trade.entryPrice)) {
     console.error('closeTrade invalid values', { market, entryPrice: trade.entryPrice, id: trade.id });
     return false;
@@ -709,15 +779,14 @@ async function closeTrade(trade, market, closeReason, symbol, candleBucketMs, fe
   trade.exitPrice = market;
   trade.profit = (market - trade.entryPrice) * qty;
   trade.profit_pct = trade.entryPrice > 0 ? (market - trade.entryPrice) / trade.entryPrice : null;
-  trade.closedAt = new Date().toISOString();
+  trade.closedAt = nowIso();
 
-  // Fee estimate (round-turn): (entry notional + exit notional) * feeRate
   const feeUsdEst = (trade.entryPrice * qty + market * qty) * (feeRate || 0);
   trade.feeUsdEst = feeUsdEst;
 
   const reason = closeReason || buildCloseReason(trade, market);
   const event = {
-    ts: new Date().toISOString(),
+    ts: nowIso(),
     type: 'CLOSE',
     event_key: getCloseEventKey(trade, reason),
     trade: normalizeCloseTrade(trade, reason, candleBucketMs)
@@ -730,6 +799,7 @@ async function closeTrade(trade, market, closeReason, symbol, candleBucketMs, fe
     'CLOSE:',
     reason,
     'id=', trade.id,
+    'symbol=', trade.symbol,
     'signalKey=', getSignalKey(trade, candleBucketMs),
     'open=', trade.openedAt,
     'close=', trade.closedAt,
@@ -765,31 +835,41 @@ async function gracefulShutdown(signal) {
 }
 
 /* -----------------------------
- * MAIN LOOP
+ * MAIN LOOP (continuous, multi-symbol)
  * ----------------------------- */
 
 (async () => {
-  console.log('Starting SA service (paper mode by default)');
+  console.log('Starting SA service (continuous, multi-symbol capable)');
   ensureDir(BASE_DIR);
 
   if (!acquireLock()) process.exit(1);
 
-  // Reload config at startup (we still keep cfg loaded globally for early reads)
   const cfgLive = loadSkillConfig();
 
-  // --- Primary settings (compatible with current config keys) ---
-  const symbol = process.env.SYMBOL || cfgLive.SYMBOL || 'BTCUSDT';
-  const monitorInterval = parseInt(process.env.MONITOR_INTERVAL_MS || cfgLive.MONITOR_INTERVAL_MS || 1000, 10);
-  const maxPositions = parseInt(process.env.MAX_POSITIONS || cfgLive.MAX_POSITIONS || 2, 10);
+  // Backward compatible: SYMBOL (string) OR SYMBOLS (array)
+  const singleSymbol = (process.env.SYMBOL || cfgLive.SYMBOL || 'BTCUSDT').toUpperCase();
+  let symbols = cfgLive.SYMBOLS;
+  if (!Array.isArray(symbols) || symbols.length === 0) symbols = [singleSymbol];
+  symbols = symbols.map(s => String(s || '').toUpperCase()).filter(Boolean);
+  if (symbols.length === 0) symbols = [singleSymbol];
+
+  // --- Primary settings ---
+  const monitorInterval = parseInt(process.env.MONITOR_INTERVAL_MS || cfgLive.MONITOR_INTERVAL_MS || 5000, 10);
+  const maxPositions = parseInt(process.env.MAX_POSITIONS || cfgLive.MAX_POSITIONS || 1, 10);
   const minHoldS = parseInt(process.env.MIN_HOLD_SECONDS || cfgLive.MIN_HOLD_SECONDS || '60', 10);
   const timeStopMinutes = parseInt(process.env.TIME_STOP_MINUTES || cfgLive.TIME_STOP_MINUTES || 10, 10);
   const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || cfgLive.HTTP_TIMEOUT_MS || 2500, 10);
-  const candleBucketMs = parseInt(process.env.SIGNAL_BUCKET_MS || cfgLive.SIGNAL_BUCKET_MS || 60000, 10);
+  const candleBucketMs = parseInt(process.env.SIGNAL_BUCKET_MS || cfgLive.SIGNAL_BUCKET_MS || cfgLive.CANDLE_MS || 60000, 10);
   const signalCooldownMs = parseInt(process.env.SIGNAL_COOLDOWN_MS || cfgLive.SIGNAL_COOLDOWN_MS || 180000, 10);
 
   const explosiveCandlePct = parseFloat(process.env.EXPLOSIVE_CANDLE_PCT || cfgLive.EXPLOSIVE_CANDLE_PCT || 0.003);
   const tradeUSD = parseFloat(process.env.TRADE_USD || cfgLive.TRADE_USD || 100.0);
   const minCandleBody = parseFloat(process.env.MIN_BODY_CANDLE || cfgLive.MIN_BODY_CANDLE || 0.5);
+  const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfgLive.SMA_TOLERANCE || 0.001);
+  // Volume filter: interpret MIN_VOLUME as QUOTE volume (USDT) when available (kline[7]); fallback to base volume (kline[5]).
+  const MIN_VOLUME = parseFloat(process.env.MIN_VOLUME || cfgLive.MIN_VOLUME || 0);
+  // Minimum stop distance in USD (existing in config.json). Helps avoid ultra-tight ATR stops.
+  const MIN_SL_USD = parseFloat(process.env.MIN_SL_USD || cfgLive.MIN_SL_USD || 0);
 
   const minSMASlope = parseFloat(process.env.MIN_SMA_SLOPE || cfgLive.MIN_SMA_SLOPE || 2.0);
   const SMA_WINDOW = parseInt(process.env.SMA_WINDOW || cfgLive.SMA_WINDOW || 60, 10);
@@ -804,316 +884,426 @@ async function gracefulShutdown(signal) {
   const MOM_REDUCTION_PCT = parseFloat(process.env.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || cfgLive.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN || 0.0);
   const GREEN_KLINES = parseInt(process.env.GREEN_KLINES_FOR_REDUCTION || cfgLive.GREEN_KLINES_FOR_REDUCTION || 0, 10);
 
-  const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfgLive.SMA_TOLERANCE || 0.001);
   const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || cfgLive.SYMBOL_COOLDOWN_SECONDS || 0, 10);
   const feeRate = parseFloat(process.env.FEE_RATE || cfgLive.FEE_RATE || 0.0005);
   const ATR_WINDOW = parseInt(process.env.ATR_WINDOW || cfgLive.ATR_WINDOW || 14, 10);
+
+  // Max trades per hour/day (per config)
+  const MAX_TRADES_PER_HOUR = parseInt(process.env.MAX_TRADES_PER_HOUR || cfgLive.MAX_TRADES_PER_HOUR || 0, 10);
+  const MAX_TRADES_PER_DAY = parseInt(process.env.MAX_TRADES_PER_DAY || cfgLive.MAX_TRADES_PER_DAY || 0, 10);
+
+  // Verbose ON by default (new param optional). Env overrides.
+  const VERBOSE = (process.env.VERBOSE != null)
+    ? String(process.env.VERBOSE) !== '0'
+    : (cfgLive.VERBOSE !== undefined ? !!cfgLive.VERBOSE : true);
 
   // snapshot interval: lower IO churn
   const SNAPSHOT_INTERVAL_MS = parseInt(process.env.SNAPSHOT_INTERVAL_MS || cfgLive.SNAPSHOT_INTERVAL_MS || 5000, 10);
   startSnapshotTimer(SNAPSHOT_INTERVAL_MS);
 
-  // Align ticker cache to monitor interval (avoid pointless 300ms cache)
+  // Align ticker cache to monitor interval
   const TICKER_CACHE_MS = parseInt(process.env.TICKER_CACHE_MS || cfgLive.TICKER_CACHE_MS || Math.max(250, Math.min(2000, monitorInterval)), 10);
+
+  // Kline poll cadence (so we don't call klines every tick)
+  const KLINES_POLL_MS = parseInt(process.env.KLINES_POLL_MS || cfgLive.KLINES_POLL_MS || 15000, 10);
+
+  // Symbol ranking (prioritize recent winners; low-frequency)
+  const RANKING_ENABLED = (cfgLive.SYMBOL_RANKING_ENABLED !== undefined)
+    ? !!cfgLive.SYMBOL_RANKING_ENABLED
+    : (symbols.length > 1);
+  const RANK_LOOKBACK_DAYS = parseInt(process.env.SYMBOL_RANK_LOOKBACK_DAYS || cfgLive.SYMBOL_RANK_LOOKBACK_DAYS || 90, 10);
+  const RANK_REFRESH_MINUTES = parseInt(process.env.SYMBOL_RANK_REFRESH_MINUTES || cfgLive.SYMBOL_RANK_REFRESH_MINUTES || 360, 10);
+
+  if (VERBOSE) {
+    console.log('VERBOSE=1 (default)');
+  }
+  console.log('Symbols configured:', symbols.join(','));
+  console.log('MIN_VOLUME (quote preferred):', MIN_VOLUME);
+  console.log('MIN_SL_USD:', MIN_SL_USD);
+  console.log('MAX_TRADES_PER_HOUR:', MAX_TRADES_PER_HOUR);
+  console.log('MAX_TRADES_PER_DAY:', MAX_TRADES_PER_DAY);
 
   rebuildStateFromJournal();
 
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
+  let symbolsOrdered = symbols.slice();
+  let lastRankTs = 0;
+
+  // Initial ranking (optional)
+  if (RANKING_ENABLED && symbols.length > 1) {
+    try {
+      symbolsOrdered = await rankSymbolsByRecentReturn(symbols, RANK_LOOKBACK_DAYS, HTTP_TIMEOUT_MS, VERBOSE);
+      lastRankTs = Date.now();
+    } catch (e) {
+      console.error('RANK init error:', e.message);
+    }
+  }
+
   while (!shutdownRequested) {
+    iterCount++;
+    const loopStart = Date.now();
     const tsStartIter = fmtDateUtc1(new Date());
 
     try {
       cleanupRecentSignals();
 
-      const klines = await getRecentKlines(symbol, limit, '1m', HTTP_TIMEOUT_MS);
-      if (!Array.isArray(klines) || klines.length < 4) {
-        console.warn('No/insufficient klines; sleeping and retrying...', { got: Array.isArray(klines) ? klines.length : null });
-        await sleep(500);
-        continue;
-      }
-
-      // Last CLOSED candle (Binance klines): index -2
-      const lastClosed = klines[klines.length - 2];
-      const candle = {
-        ts: Number(lastClosed[0]),
-        open: Number(lastClosed[1]),
-        high: Number(lastClosed[2]),
-        low: Number(lastClosed[3]),
-        close: Number(lastClosed[4]),
-        volume: Number(lastClosed[5])
-      };
-
-      if (![candle.ts, candle.open, candle.high, candle.low, candle.close, candle.volume].every(Number.isFinite)) {
-        console.warn('Invalid candle numbers; skipping iteration', candle);
-        await sleep(250);
-        continue;
-      }
-
-      const closes = getClosedCloses(klines);
-      if (!Array.isArray(closes) || closes.length < 3) {
-        console.warn('Invalid closes extracted; skipping iteration');
-        await sleep(250);
-        continue;
-      }
-
-      const last = closes[closes.length - 1];
-      const prev = closes[closes.length - 2] || last;
-      const momentum_pct = prev ? (last - prev) / prev : 0;
-
-      // --- Filters (robust, conservative) ---
-      const body = Math.abs(candle.close - candle.open);
-      const range = candle.high - candle.low;
-      const bodyRatio = range > 0 ? body / range : 0;
-      const weakCandleBody = bodyRatio < minCandleBody;
-
-      // Weak open: compare candle.open vs previous TWO closes (excluding current candle itself)
-      let weakOpen = false;
-      if (klines.length >= 6) {
-        const prevClose1 = Number(klines[klines.length - 3][4]);
-        const prevClose2 = Number(klines[klines.length - 4][4]);
-        if (Number.isFinite(prevClose1) && Number.isFinite(prevClose2)) {
-          weakOpen = candle.open < prevClose1 && candle.open < prevClose2;
+      // Refresh ranking occasionally
+      if (RANKING_ENABLED && symbols.length > 1) {
+        const ageMin = (Date.now() - lastRankTs) / 60000;
+        if (!lastRankTs || ageMin >= RANK_REFRESH_MINUTES) {
+          if (VERBOSE) console.log('RANK: refreshing symbols order...');
+          try {
+            symbolsOrdered = await rankSymbolsByRecentReturn(symbols, RANK_LOOKBACK_DAYS, HTTP_TIMEOUT_MS, VERBOSE);
+            lastRankTs = Date.now();
+          } catch (e) {
+            console.error('RANK refresh error:', e.message);
+          }
         }
       }
 
-      // Explosive candle detection: last 2 closed candles ranges
-      let candleExplosive = false;
-      try {
-        const kA = klines[klines.length - 2];
-        const kB = klines[klines.length - 3];
-        const ranges = [kA, kB].map(k => {
-          const hi = Number(k[2]);
-          const lo = Number(k[3]);
-          const cl = Number(k[4]);
-          if (!Number.isFinite(hi) || !Number.isFinite(lo) || !Number.isFinite(cl) || cl <= 0) return 0;
-          return (hi - lo) / cl;
+      // 1) Monitor open trades (TP/SL/time_stop) per symbol
+      for (const sym of symbolsOrdered) {
+        const openTrades = getOpenTradesArray(sym);
+        if (!openTrades.length) continue;
+
+        const market = await getTickerCached(sym, HTTP_TIMEOUT_MS, TICKER_CACHE_MS);
+        if (market == null) continue;
+
+        for (const tr of openTrades) {
+          const ageS = (Date.now() - new Date(tr.openedAt).getTime()) / 1000;
+          if (ageS < minHoldS) continue;
+
+          if (ageS > timeStopMinutes * 60) {
+            await closeTrade(tr, market, 'time_stop', candleBucketMs, feeRate);
+          } else if (tr.stopLoss && market <= tr.stopLoss) {
+            await closeTrade(tr, market, 'SL', candleBucketMs, feeRate);
+          } else if (tr.takeProfit && market >= tr.takeProfit) {
+            await closeTrade(tr, market, 'TP', candleBucketMs, feeRate);
+          }
+        }
+      }
+
+      // 2) Evaluate new candle entries per symbol (at most 1/min per symbol)
+      for (const sym of symbolsOrdered) {
+        const rt = getSymbolRuntime(sym);
+
+        // Poll klines at cadence (avoid N symbols * every tick)
+        if ((Date.now() - rt.lastKlinesPollMs) < KLINES_POLL_MS) continue;
+        rt.lastKlinesPollMs = Date.now();
+
+        const klines = await getRecentKlines(sym, limit, '1m', HTTP_TIMEOUT_MS);
+        if (!Array.isArray(klines) || klines.length < 4) {
+          if (VERBOSE) console.log('ANALYZE_SKIP: insufficient klines', { iter: iterCount, symbol: sym, got: Array.isArray(klines) ? klines.length : null });
+          continue;
+        }
+
+        const lastClosed = klines[klines.length - 2];
+        const candle = {
+          ts: Number(lastClosed[0]),
+          open: Number(lastClosed[1]),
+          high: Number(lastClosed[2]),
+          low: Number(lastClosed[3]),
+          close: Number(lastClosed[4]),
+          volume: Number(lastClosed[5]),
+          // Binance-style klines: quote volume at index 7 (may be undefined on some exchanges)
+          quoteVolume: Number(lastClosed[7])
+        };
+
+        if (![candle.ts, candle.open, candle.high, candle.low, candle.close, candle.volume].every(Number.isFinite)) {
+          if (VERBOSE) console.log('ANALYZE_SKIP: invalid candle', { iter: iterCount, symbol: sym, candle });
+          continue;
+        }
+
+        // Only analyze once per closed candle
+        if (rt.lastAnalyzedClosedTs === candle.ts) continue;
+        rt.lastAnalyzedClosedTs = candle.ts;
+
+        const closes = getClosedCloses(klines);
+        if (!Array.isArray(closes) || closes.length < 3) {
+          if (VERBOSE) console.log('ANALYZE_SKIP: invalid closes', { iter: iterCount, symbol: sym });
+          continue;
+        }
+
+        const last = closes[closes.length - 1];
+        const prev = closes[closes.length - 2] || last;
+        const momentum_pct = prev ? (last - prev) / prev : 0;
+
+        // Filters
+        const body = Math.abs(candle.close - candle.open);
+        const range = candle.high - candle.low;
+        const bodyRatio = range > 0 ? body / range : 0;
+        const weakCandleBody = bodyRatio < minCandleBody;
+
+        let weakOpen = false;
+        if (klines.length >= 6) {
+          const prevClose1 = Number(klines[klines.length - 3][4]);
+          const prevClose2 = Number(klines[klines.length - 4][4]);
+          if (Number.isFinite(prevClose1) && Number.isFinite(prevClose2)) {
+            weakOpen = candle.open < prevClose1 && candle.open < prevClose2;
+          }
+        }
+
+        let candleExplosive = false;
+        try {
+          const kA = klines[klines.length - 2];
+          const kB = klines[klines.length - 3];
+          const ranges = [kA, kB].map(k => {
+            const hi = Number(k[2]);
+            const lo = Number(k[3]);
+            const cl = Number(k[4]);
+            if (!Number.isFinite(hi) || !Number.isFinite(lo) || !Number.isFinite(cl) || cl <= 0) return 0;
+            return (hi - lo) / cl;
+          });
+          candleExplosive = ranges.some(r => r > explosiveCandlePct);
+        } catch (_) {
+          candleExplosive = false;
+        }
+
+        const volMetric = Number.isFinite(candle.quoteVolume) ? candle.quoteVolume : candle.volume;
+        const volumeOk = (MIN_VOLUME <= 0) ? true : (Number.isFinite(volMetric) && volMetric >= MIN_VOLUME);
+
+        // Indicators
+        const { sma, smaPrev } = computeSmaPair(closes, SMA_WINDOW);
+        const smaSlope = (sma != null && smaPrev != null) ? (sma - smaPrev) : 0;
+        const priceNearSMA = (sma != null) ? (candle.close >= sma * (1 - smaTol)) : true;
+        const priceAboveSMA = (sma != null) ? (candle.close > sma) : true;
+
+        const { atrPct } = computeAtr(klines, ATR_WINDOW);
+        const realizedVol = computeRealizedVol(closes, Math.min(60, Math.max(20, Math.floor(SMA_WINDOW / 2))));
+
+        const regimeInfo = detectMarketRegime({
+          atrPct,
+          realizedVol,
+          smaSlope,
+          lastClose: candle.close,
+          priceAboveSma: priceAboveSMA
         });
-        candleExplosive = ranges.some(r => r > explosiveCandlePct);
-      } catch (_) {
-        candleExplosive = false;
-      }
 
-      // --- Indicators (SMA, ATR, regime) ---
-      const { sma, smaPrev } = computeSmaPair(closes, SMA_WINDOW);
-      const smaSlope = (sma != null && smaPrev != null) ? (sma - smaPrev) : 0;
-      const priceNearSMA = (sma != null) ? (candle.close >= sma * (1 - smaTol)) : true;
-      const priceAboveSMA = (sma != null) ? (candle.close > sma) : true;
+        const regime = regimeInfo.volRegime;
 
-      const { atrPct } = computeAtr(klines, ATR_WINDOW);
-      const realizedVol = computeRealizedVol(closes, Math.min(60, Math.max(20, Math.floor(SMA_WINDOW / 2))));
+        const dynamicMinMomentum = BASE_MIN_MOM * regimeInfo.kMinMomentum;
+        const dynamicMinSlope = minSMASlope * regimeInfo.kMinSlope;
+        const dynamicMaxMomentum = MAX_MOMENTUM_PCT;
 
-      const regimeInfo = detectMarketRegime({
-        atrPct,
-        realizedVol,
-        smaSlope,
-        lastClose: candle.close,
-        priceAboveSma: priceAboveSMA
-      });
+        const trendUp = smaSlope > dynamicMinSlope;
 
-      const regime = regimeInfo.volRegime; // keep compatibility label (LOW_VOL|MID_VOL|HIGH_VOL)
-
-      // Dynamic thresholds (bounded multipliers, see market-regime.sa.cjs)
-      const dynamicMinMomentum = BASE_MIN_MOM * regimeInfo.kMinMomentum;
-      const dynamicMaxMomentum = MAX_MOMENTUM_PCT; // keep as cap (do not inflate too much)
-      const dynamicMinSlope = minSMASlope * regimeInfo.kMinSlope;
-
-      const trendUp = smaSlope > dynamicMinSlope;
-
-      // Green run detection (same as current logic)
-      let green_run = 0;
-      if (GREEN_KLINES > 0 && Array.isArray(klines)) {
-        for (let j = klines.length - 2; j > 0 && green_run < GREEN_KLINES; j--) {
-          const cur = Number(klines[j][4]);
-          const op = Number(klines[j][1]);
-          if (Number.isFinite(cur) && Number.isFinite(op) && cur > op) green_run++;
-          else break;
+        // Green run
+        let green_run = 0;
+        if (GREEN_KLINES > 0 && Array.isArray(klines)) {
+          for (let j = klines.length - 2; j > 0 && green_run < GREEN_KLINES; j--) {
+            const cur = Number(klines[j][4]);
+            const op = Number(klines[j][1]);
+            if (Number.isFinite(cur) && Number.isFinite(op) && cur > op) green_run++;
+            else break;
+          }
         }
-      }
 
-      let effectiveMinMom = dynamicMinMomentum;
-      if (green_run >= GREEN_KLINES && GREEN_KLINES > 0 && MOM_REDUCTION_PCT > 0) {
-        effectiveMinMom = dynamicMinMomentum * (1 - MOM_REDUCTION_PCT);
-      }
+        let effectiveMinMom = dynamicMinMomentum;
+        if (green_run >= GREEN_KLINES && GREEN_KLINES > 0 && MOM_REDUCTION_PCT > 0) {
+          effectiveMinMom = dynamicMinMomentum * (1 - MOM_REDUCTION_PCT);
+        }
 
-      const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= dynamicMaxMomentum;
+        const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= dynamicMaxMomentum;
 
-      // Final decision
-      const shouldEnter = momentumOk &&
-        trendUp &&
-        priceNearSMA &&
-        priceAboveSMA &&
-        !weakCandleBody &&
-        !weakOpen &&
-        !candleExplosive;
+        const shouldEnter = momentumOk &&
+          trendUp &&
+          priceNearSMA &&
+          priceAboveSMA &&
+          volumeOk &&
+          !weakCandleBody &&
+          !weakOpen &&
+          !candleExplosive;
 
-      state.lastDecision = {
-        momentum_pct: Number(momentum_pct.toFixed(6)),
-        sma: sma != null ? Number(sma.toFixed(2)) : null,
-        smaSlope: Number(smaSlope.toFixed(2)),
-        atr_pct: Number((atrPct || 0).toFixed(6)),
-        realized_vol: Number((realizedVol || 0).toFixed(6)),
-        regime,
-        microRegime: regimeInfo.microRegime,
-        slopeNorm: regimeInfo.slopeNorm,
-        priceNearSMA: !!priceNearSMA,
-        priceAboveSMA: !!priceAboveSMA,
-        trendUp: !!trendUp,
-        weakCandleBody: !!weakCandleBody,
-        weakOpen: !!weakOpen,
-        candleExplosive: !!candleExplosive,
-        shouldEnter: !!shouldEnter,
-        effective_min_momentum: Number(effectiveMinMom.toFixed(6)),
-        green_run
-      };
+        const decision = {
+          iter: iterCount,
+          symbol: sym,
+          momentum_pct: Number(momentum_pct.toFixed(6)),
+          sma: sma != null ? Number(sma.toFixed(2)) : null,
+          smaSlope: Number(smaSlope.toFixed(2)),
+          atr_pct: Number((atrPct || 0).toFixed(6)),
+          realized_vol: Number((realizedVol || 0).toFixed(6)),
+          regime,
+          microRegime: regimeInfo.microRegime,
+          slopeNorm: regimeInfo.slopeNorm,
+          priceNearSMA: !!priceNearSMA,
+          priceAboveSMA: !!priceAboveSMA,
+          volume_base: Number(candle.volume.toFixed(2)),
+          volume_quote: Number.isFinite(candle.quoteVolume) ? Number(candle.quoteVolume.toFixed(2)) : null,
+          volumeOk: !!volumeOk,
+          trendUp: !!trendUp,
+          weakCandleBody: !!weakCandleBody,
+          weakOpen: !!weakOpen,
+          candleExplosive: !!candleExplosive,
+          shouldEnter: !!shouldEnter,
+          effective_min_momentum: Number(effectiveMinMom.toFixed(6)),
+          green_run
+        };
 
-      // Cooldown controls
-      const nowTs = Date.now();
-      const lastOpenTs = state.lastOpenBySymbol[symbol] || 0;
-      const withinCooldown = (cooldown_s > 0) && ((nowTs - lastOpenTs) < cooldown_s * 1000);
-      const candleMinute = Math.floor(candle.ts / 60000);
-      const alreadyOpenedThisCandle = lastTradeCandle !== null && lastTradeCandle === candleMinute;
+        state.decisionBySymbol.set(sym, decision);
 
-      // --- Entry ---
-      if (shouldEnter && state.openTradesById.size < maxPositions && !withinCooldown && !alreadyOpenedThisCandle) {
+        // Verbose: show filter pass/fail
+        if (VERBOSE) {
+          console.log(
+            'ITER_SUMMARY:',
+            'iter=' + iterCount,
+            'symbol=' + sym,
+            'Started at: ' + tsStartIter,
+            'with candle: ' + new Date(candle.ts + 3600000).toISOString().slice(11, 16),
+            'volume last candle=' + candle.volume.toFixed(2),
+            'quoteVol=' + (Number.isFinite(candle.quoteVolume) ? candle.quoteVolume.toFixed(2) : 'null'),
+            'volOk=' + (volumeOk ? 1 : 0),
+            'momentum=' + decision.momentum_pct,
+            'sma=' + (decision.sma || 'null'),
+            'smaSlope=' + decision.smaSlope,
+            'atr_pct=' + decision.atr_pct,
+            'rv=' + decision.realized_vol,
+            'regime=' + decision.regime,
+            'micro=' + decision.microRegime,
+            'priceNearSMA=' + (decision.priceNearSMA ? 1 : 0),
+            'priceAboveSMA=' + (decision.priceAboveSMA ? 1 : 0),
+            'trendUp=' + (decision.trendUp ? 1 : 0),
+            'momentumOk=' + (momentumOk ? 1 : 0),
+            'weakBody=' + (weakCandleBody ? 1 : 0),
+            'weakOpen=' + (weakOpen ? 1 : 0),
+            'explosive=' + (candleExplosive ? 1 : 0),
+            'shouldEnter=' + (decision.shouldEnter ? 1 : 0),
+            'effective_min_momentum=' + decision.effective_min_momentum,
+            'green_run=' + decision.green_run,
+            'openTrades=' + state.openTradesById.size,
+            'openTradesSym=' + getOpenTradesArray(sym).length
+          );
+        } else {
+          // Keep minimal compatibility line if verbose is disabled
+          console.log(
+            'ITER_SUMMARY:',
+            'iter=' + iterCount,
+            'symbol=' + sym,
+            'Started at: ' + tsStartIter,
+            'momentum=' + decision.momentum_pct,
+            'sma=' + (decision.sma || 'null'),
+            'smaSlope=' + decision.smaSlope,
+            'shouldEnter=' + (decision.shouldEnter ? 1 : 0),
+            'openTrades=' + state.openTradesById.size
+          );
+        }
+
+        console.log('---------------------------------------------\n');
+
+        // Entry gating
+        const nowTs = Date.now();
+        const lastOpenTs = state.lastOpenBySymbol[sym] || 0;
+        const withinCooldown = (cooldown_s > 0) && ((nowTs - lastOpenTs) < cooldown_s * 1000);
+        const candleMinute = Math.floor(candle.ts / 60000);
+        const alreadyOpenedThisCandle = rt.lastTradeCandleMinute !== null && rt.lastTradeCandleMinute === candleMinute;
+
+        if (!shouldEnter) continue;
+
+        if (state.openTradesById.size >= maxPositions) continue;
+
+        if (withinCooldown) continue;
+
+        if (alreadyOpenedThisCandle) continue;
+
+        if (MAX_TRADES_PER_HOUR > 0) {
+          const opensLastHour = countOpensLastHour();
+          if (opensLastHour >= MAX_TRADES_PER_HOUR) continue;
+        }
+
+        if (MAX_TRADES_PER_DAY > 0) {
+          const opensToday = countOpensTodayUtc();
+          if (opensToday >= MAX_TRADES_PER_DAY) continue;
+        }
+
+        // Build trade
         const entryPrice = candle.close;
         const effectiveATR = Number.isFinite(atrPct) ? atrPct : 0;
 
-        // TP/SL based on ATR% (compatible)
-        const stopLoss = entryPrice * (1 - k_sl * effectiveATR);
-        const takeProfit = entryPrice * (1 + k_tp * effectiveATR);
+        // TP/SL sizing:
+        // - Base on ATR% (k_sl/k_tp)
+        // - Enforce a minimum absolute stop distance (MIN_SL_USD) to avoid ultra-tight stops
+        const rr = (k_sl > 0) ? (k_tp / k_sl) : 2.0;
+        let riskDist = entryPrice * (k_sl * effectiveATR);
+        if (MIN_SL_USD > 0 && riskDist < MIN_SL_USD) riskDist = MIN_SL_USD;
+        const stopLoss = entryPrice - riskDist;
+        const takeProfit = entryPrice + riskDist * rr;
 
-        const stopDistanceUSD = entryPrice - stopLoss;
-
-        // Current in-progress candle low as sanity check
+        const stopDistanceUSD = riskDist;
         const current = klines[klines.length - 1];
         const currentLow = Number(current?.[3]);
 
-        // Position size (USD exposure)
         const qty = Number((tradeUSD / entryPrice).toFixed(8));
 
-        // Profitability with fee estimate (entry + exit at TP)
         const grossProfitAtTp = qty * (takeProfit - entryPrice);
         const feeEstAtTp = (entryPrice * qty + takeProfit * qty) * feeRate;
         const netProfitAtTp = grossProfitAtTp - feeEstAtTp;
 
         if (!isValidNumber(entryPrice) || !isValidNumber(stopLoss) || !isValidNumber(takeProfit) || !isValidNumber(qty)) {
-          console.error('invalid trade values', { entryPrice, stopLoss, takeProfit, qty });
-        } else if (stopDistanceUSD <= 0) {
-          console.error('Trade skipped: Invalid stop distance', { entryPrice, stopLoss });
-        } else if (Number.isFinite(currentLow) && currentLow <= stopLoss) {
-          console.log('Trade skipped: SL inside candle', { entryPrice, stopLoss, currentLow, candleLow: candle.low });
-        } else if (netProfitAtTp <= 0) {
-          console.log('Trade skipped: Not profitable after fees (est)', {
-            entryPrice,
-            takeProfit,
-            grossProfitAtTp,
-            feeEstAtTp,
-            netProfitAtTp
-          });
-        } else {
-          const reasonDet = {
-            momentum_pct: Number(momentum_pct.toFixed(6)),
-            sma: sma != null ? Number(sma.toFixed(2)) : null,
-            sma_slope: Number(smaSlope.toFixed(2)),
-            atr_pct: Number((atrPct || 0).toFixed(6)),
-            realized_vol: Number((realizedVol || 0).toFixed(6)),
-            regime,
-            micro_regime: regimeInfo.microRegime,
-            slope_norm: regimeInfo.slopeNorm,
-            base_min_momentum: BASE_MIN_MOM,
-            effective_minimum: Number(effectiveMinMom.toFixed(6)),
-            green_run_len: green_run,
-            reduction_pct: MOM_REDUCTION_PCT
-          };
+          console.error('invalid trade values', { symbol: sym, entryPrice, stopLoss, takeProfit, qty });
+          continue;
+        }
+        if (stopDistanceUSD <= 0) continue;
+        if (Number.isFinite(currentLow) && currentLow <= stopLoss) continue;
+        if (netProfitAtTp <= 0) continue;
 
-          const reasonTag = (green_run >= GREEN_KLINES && MOM_REDUCTION_PCT > 0)
-            ? 'momentum_with_green_run'
-            : 'momentum_standard';
+        const reasonDet = {
+          momentum_pct: Number(momentum_pct.toFixed(6)),
+          sma: sma != null ? Number(sma.toFixed(2)) : null,
+          sma_slope: Number(smaSlope.toFixed(2)),
+          atr_pct: Number((atrPct || 0).toFixed(6)),
+          realized_vol: Number((realizedVol || 0).toFixed(6)),
+          regime,
+          micro_regime: regimeInfo.microRegime,
+          slope_norm: regimeInfo.slopeNorm,
+          base_min_momentum: BASE_MIN_MOM,
+          effective_minimum: Number(effectiveMinMom.toFixed(6)),
+          green_run_len: green_run,
+          reduction_pct: MOM_REDUCTION_PCT,
+          iter: iterCount
+        };
 
-          const trade = {
-            id: Date.now(),
-            symbol,
-            entryPrice,
-            stopLoss,
-            takeProfit,
-            openedAt: new Date().toISOString(),
-            signalCandleTs: candle.ts,
-            size: qty,
-            exposureUSD: Number((entryPrice * qty).toFixed(2)),
-            type: 'LONG',
-            regime,
-            reasonTag,
-            reasonDetails: reasonDet
-          };
+        const reasonTag = (green_run >= GREEN_KLINES && MOM_REDUCTION_PCT > 0)
+          ? 'momentum_with_green_run'
+          : 'momentum_standard';
 
-          const didOpen = await openTrade(trade, symbol, candleBucketMs, signalCooldownMs);
-          if (didOpen) {
-            lastTradeCandle = candleMinute;
-            state.lastOpenBySymbol[symbol] = Date.now();
-          }
+        const trade = {
+          id: Date.now(),
+          symbol: sym,
+          entryPrice,
+          stopLoss,
+          takeProfit,
+          openedAt: nowIso(),
+          signalCandleTs: candle.ts,
+          size: qty,
+          exposureUSD: Number((entryPrice * qty).toFixed(2)),
+          type: 'LONG',
+          regime,
+          reasonTag,
+          reasonDetails: reasonDet
+        };
+
+
+        const didOpen = await openTrade(trade, candleBucketMs, signalCooldownMs, VERBOSE);
+        if (didOpen) {
+          rt.lastTradeCandleMinute = candleMinute;
+          state.lastOpenBySymbol[sym] = Date.now();
         }
       }
 
-      // --- Monitor open trades for ~1 minute ---
-      const monitorStart = Date.now();
-      while (!shutdownRequested && (Date.now() - monitorStart < 60 * 1000)) {
-        const loopStart = Date.now();
-        try {
-          const market = await getTickerCached(symbol, HTTP_TIMEOUT_MS, TICKER_CACHE_MS);
-          if (market !== null) {
-            for (const tr of getOpenTradesArray()) {
-              const age = (Date.now() - new Date(tr.openedAt).getTime()) / 1000;
-              if (age < minHoldS) continue;
-
-              if (age > timeStopMinutes * 60) {
-                await closeTrade(tr, market, 'time_stop', symbol, candleBucketMs, feeRate);
-              } else if (tr.stopLoss && market <= tr.stopLoss) {
-                await closeTrade(tr, market, 'SL', symbol, candleBucketMs, feeRate);
-              } else if (tr.takeProfit && market >= tr.takeProfit) {
-                await closeTrade(tr, market, 'TP', symbol, candleBucketMs, feeRate);
-              }
-            }
-          }
-        } catch (e) {
-          console.error('monitor err:', e.message);
+      // Print open trades (compat) occasionally in verbose
+      if (VERBOSE) {
+        for (const ot of getOpenTradesArray()) {
+          console.log('OPEN_TRADE:', JSON.stringify(ot));
         }
-
-        const elapsed = Date.now() - loopStart;
-        const sleepMs = Math.max(0, monitorInterval - elapsed);
-        await sleep(sleepMs);
-      }
-
-      // --- Iteration summary (keep compatibility with current log parser) ---
-      console.log(
-        'ITER_SUMMARY:',
-        'Started at: ' + tsStartIter,
-        'with candle: ' + new Date(candle.ts + 3600000).toISOString().slice(11, 16),
-        'volume last candle=' + candle.volume.toFixed(2),
-        'momentum=' + (state.lastDecision.momentum_pct || 0),
-        'sma=' + (state.lastDecision.sma || 'null'),
-        'smaSlope=' + (state.lastDecision.smaSlope || 0),
-        'priceNearSMA=' + (state.lastDecision.priceNearSMA ? 1 : 0),
-        'priceAboveSMA=' + (state.lastDecision.priceAboveSMA ? 1 : 0),
-        'trendUp=' + (state.lastDecision.trendUp ? 1 : 0),
-        'shouldEnter=' + (state.lastDecision.shouldEnter ? 1 : 0),
-        'effective_min_momentum=' + (state.lastDecision.effective_min_momentum || 0),
-        'green_run=' + (state.lastDecision.green_run || 0),
-        'regime=' + (state.lastDecision.regime || 'UNKNOWN'),
-        'micro=' + (state.lastDecision.microRegime || 'NA'),
-        'openTrades=' + state.openTradesById.size
-      );
-      console.log('---------------------------------------------\n');
-
-      for (const ot of getOpenTradesArray()) {
-        console.log('OPEN_TRADE:', JSON.stringify(ot));
       }
 
     } catch (e) {
-      // Do not crash the service; log and continue.
       console.error('ITERATION_FATAL_ERR (caught):', e.message);
-      await sleep(500);
     }
+
+    const elapsed = Date.now() - loopStart;
+    const sleepMs = Math.max(0, monitorInterval - elapsed);
+    await sleep(sleepMs);
   }
 })();

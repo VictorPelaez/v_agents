@@ -10,3 +10,39 @@ agents/trader/skills/live-forward-v4.2/backups/*
 agents/trader/logs/*.out
 **/*.nohup.out
 agents/trader/skills/live-forward-v4.2/*.nohup.out
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Logs
+logs/
+*.log
+*.out
+
+# Open positions and snapshots
+*.jsonl
+open_positions.json
+bot.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.pid
+*.swp
+
+# IDE files (VSCode, WebStorm, etc.)
+.vscode/
+.idea/
+*.iml
+
+# Coverage reports (if any tests)
+coverage/
+
+# Build artifacts (if transpiling)
+dist/
+build/
