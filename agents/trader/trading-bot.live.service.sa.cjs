@@ -1364,8 +1364,11 @@ async function gracefulShutdown(signal) {
           riskDist = MIN_SL_USD;
         }
 
-        const stopLoss = entryPrice - riskDist;
         const takeProfit = entryPrice + riskDist * rr;
+        // const stopLoss = entryPrice - riskDist;
+        // SL de emergencia (mucho más lejos)
+        const EMERGENCY_SL_PCT = 0.006; // 0.6%
+        const stopLoss = entryPrice * (1 - EMERGENCY_SL_PCT);
 
         const stopDistanceUSD = riskDist;
         const current = klines[klines.length - 1];
