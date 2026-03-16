@@ -936,6 +936,20 @@ async function gracefulShutdown(signal) {
   // Example: 0.30 matches the boundary used by detectMarketRegime() for CHOPPY.
   const MIN_SLOPE_NORM = parseFloat(process.env.MIN_SLOPE_NORM || cfgLive.MIN_SLOPE_NORM || 0);
 
+  // Optional per-symbol override (multi-coin friendly):
+  //   MIN_SLOPE_NORM_BY_SYMBOL: { "BTCUSDT": 0.10, "XRPUSDT": 0.06 }
+  const MIN_SLOPE_NORM_BY_SYMBOL = {};
+  try {
+    const raw = cfgLive.MIN_SLOPE_NORM_BY_SYMBOL;
+    if (raw && typeof raw === 'object') {
+      for (const [k, v] of Object.entries(raw)) {
+        const sym = String(k || '').toUpperCase();
+        const num = parseFloat(v);
+        if (sym && Number.isFinite(num)) MIN_SLOPE_NORM_BY_SYMBOL[sym] = num;
+      }
+    }
+  } catch (_) {}
+
   // Max trades per hour/day (per config)
   const MAX_TRADES_PER_HOUR = parseInt(process.env.MAX_TRADES_PER_HOUR || cfgLive.MAX_TRADES_PER_HOUR || 0, 10);
   const MAX_TRADES_PER_DAY = parseInt(process.env.MAX_TRADES_PER_DAY || cfgLive.MAX_TRADES_PER_DAY || 0, 10);
@@ -1157,8 +1171,12 @@ async function gracefulShutdown(signal) {
           priceAboveSma: priceAboveSMA
         });
 
-        const slopeNormOk = (MIN_SLOPE_NORM > 0)
-          ? (Number(regimeInfo.slopeNorm) >= MIN_SLOPE_NORM)
+        const minSlopeNormEff = Number.isFinite(MIN_SLOPE_NORM_BY_SYMBOL[sym])
+          ? MIN_SLOPE_NORM_BY_SYMBOL[sym]
+          : MIN_SLOPE_NORM;
+
+        const slopeNormOk = (minSlopeNormEff > 0)
+          ? (Number(regimeInfo.slopeNorm) >= minSlopeNormEff)
           : true;
 
         const regime = regimeInfo.volRegime;
@@ -1220,7 +1238,7 @@ async function gracefulShutdown(signal) {
           min_atr_pct: Number((minAtrEffective || 0).toFixed(6)),
           atrOk: !!atrOk,
           realized_vol: Number((realizedVol || 0).toFixed(6)),
-          min_slope_norm: Number((MIN_SLOPE_NORM || 0).toFixed(3)),
+          min_slope_norm: Number((minSlopeNormEff || 0).toFixed(3)),
           slopeNormOk: !!slopeNormOk,
           regime,
           microRegime: regimeInfo.microRegime,
@@ -1380,7 +1398,7 @@ async function gracefulShutdown(signal) {
           atr_pctl_q: ATR_ADAPTIVE_ENABLED ? Number((ATR_ADAPTIVE_PCTL || 0).toFixed(2)) : null,
           min_atr_pct: Number((minAtrEffective || 0).toFixed(6)),
           realized_vol: Number((realizedVol || 0).toFixed(6)),
-          min_slope_norm: Number((MIN_SLOPE_NORM || 0).toFixed(3)),
+          min_slope_norm: Number((minSlopeNormEff || 0).toFixed(3)),
           regime,
           micro_regime: regimeInfo.microRegime,
           slope_norm: regimeInfo.slopeNorm,
