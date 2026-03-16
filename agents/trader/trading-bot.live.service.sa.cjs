@@ -106,7 +106,11 @@ function getSymbolRuntime(symbol) {
       lastAnalyzedClosedTs: null,
       lastTradeCandleMinute: null,
       lastOpenTs: 0,
-      lastKlinesPollMs: 0
+      lastKlinesPollMs: 0,
+
+      // ATR adaptive (per-symbol)
+      atrHistory: [],
+      lastAtrCandleTs: null
     });
   }
   return state.symbolRuntime.get(symbol);
@@ -160,6 +164,24 @@ function sleep(ms) {
 
 function isValidNumber(n) {
   return typeof n === 'number' && Number.isFinite(n);
+}
+
+function percentile(sortedOrUnsorted, q) {
+  try {
+    if (!Array.isArray(sortedOrUnsorted) || sortedOrUnsorted.length === 0) return 0;
+    const p = Math.max(0, Math.min(1, Number(q)));
+    const a = sortedOrUnsorted.slice().filter(Number.isFinite).sort((x, y) => x - y);
+    if (a.length === 0) return 0;
+
+    const idx = (a.length - 1) * p;
+    const lo = Math.floor(idx);
+    const hi = Math.ceil(idx);
+    if (lo === hi) return a[lo];
+    const w = idx - lo;
+    return a[lo] * (1 - w) + a[hi] * w;
+  } catch (_) {
+    return 0;
+  }
 }
 
 function writeJsonFileAtomic(filePath, value) {
@@ -901,6 +923,15 @@ async function gracefulShutdown(signal) {
   const ATR_WINDOW = parseInt(process.env.ATR_WINDOW || cfgLive.ATR_WINDOW || 14, 10);
   const MIN_ATR_PCT = parseFloat(process.env.MIN_ATR_PCT || cfgLive.MIN_ATR_PCT || 0);
 
+  // ATR adaptive (per symbol): require ATR% to be above a percentile of its own recent history.
+  // This makes the filter scale naturally across BTC vs alts.
+  const ATR_ADAPTIVE_ENABLED = (process.env.ATR_ADAPTIVE_ENABLED != null)
+    ? String(process.env.ATR_ADAPTIVE_ENABLED) === '1'
+    : !!cfgLive.ATR_ADAPTIVE_ENABLED;
+  const ATR_ADAPTIVE_PCTL = parseFloat(process.env.ATR_ADAPTIVE_PCTL || cfgLive.ATR_ADAPTIVE_PCTL || 0.60);
+  const ATR_ADAPTIVE_WINDOW = parseInt(process.env.ATR_ADAPTIVE_WINDOW || cfgLive.ATR_ADAPTIVE_WINDOW || 240, 10);
+  const ATR_ADAPTIVE_MIN_SAMPLES = parseInt(process.env.ATR_ADAPTIVE_MIN_SAMPLES || cfgLive.ATR_ADAPTIVE_MIN_SAMPLES || 60, 10);
+
   // Optional: require market to be non-choppy by slope-normalization (abs(smaSlope) / (ATR_abs)).
   // Example: 0.30 matches the boundary used by detectMarketRegime() for CHOPPY.
   const MIN_SLOPE_NORM = parseFloat(process.env.MIN_SLOPE_NORM || cfgLive.MIN_SLOPE_NORM || 0);
@@ -1098,7 +1129,23 @@ async function gracefulShutdown(signal) {
 
         const { atrPct } = computeAtr(klines, ATR_WINDOW);
         const atrPctNum = Number.isFinite(atrPct) ? atrPct : 0;
-        const atrOk = (MIN_ATR_PCT > 0) ? (atrPctNum >= MIN_ATR_PCT) : true;
+
+        // ATR adaptive (per symbol): update ATR history once per new closed candle.
+        if (ATR_ADAPTIVE_ENABLED && Number.isFinite(candle.ts) && rt.lastAtrCandleTs !== candle.ts) {
+          rt.lastAtrCandleTs = candle.ts;
+          rt.atrHistory.push(atrPctNum);
+          if (rt.atrHistory.length > ATR_ADAPTIVE_WINDOW) {
+            rt.atrHistory.splice(0, rt.atrHistory.length - ATR_ADAPTIVE_WINDOW);
+          }
+        }
+
+        let atrPctlThr = 0;
+        if (ATR_ADAPTIVE_ENABLED && rt.atrHistory.length >= ATR_ADAPTIVE_MIN_SAMPLES) {
+          atrPctlThr = percentile(rt.atrHistory, ATR_ADAPTIVE_PCTL);
+        }
+
+        const minAtrEffective = Math.max(MIN_ATR_PCT || 0, atrPctlThr || 0);
+        const atrOk = (minAtrEffective > 0) ? (atrPctNum >= minAtrEffective) : true;
 
         const realizedVol = computeRealizedVol(closes, Math.min(60, Math.max(20, Math.floor(SMA_WINDOW / 2))));
 
@@ -1167,7 +1214,10 @@ async function gracefulShutdown(signal) {
           minSlopeAbs: Number(dynamicMinSlopeAbs.toFixed(candle.close < 10 ? 6 : 2)),
           minSlopePct: (dynamicMinSlopePct != null) ? Number(dynamicMinSlopePct.toFixed(6)) : null,
           atr_pct: Number((atrPctNum || 0).toFixed(6)),
-          min_atr_pct: Number((MIN_ATR_PCT || 0).toFixed(6)),
+          min_atr_floor: Number((MIN_ATR_PCT || 0).toFixed(6)),
+          atr_pctl_thr: Number((atrPctlThr || 0).toFixed(6)),
+          atr_pctl_q: ATR_ADAPTIVE_ENABLED ? Number((ATR_ADAPTIVE_PCTL || 0).toFixed(2)) : null,
+          min_atr_pct: Number((minAtrEffective || 0).toFixed(6)),
           atrOk: !!atrOk,
           realized_vol: Number((realizedVol || 0).toFixed(6)),
           min_slope_norm: Number((MIN_SLOPE_NORM || 0).toFixed(3)),
@@ -1325,7 +1375,10 @@ async function gracefulShutdown(signal) {
           min_sma_slope_abs: Number(dynamicMinSlopeAbs.toFixed(candle.close < 10 ? 6 : 2)),
           min_sma_slope_pct: (dynamicMinSlopePct != null) ? Number(dynamicMinSlopePct.toFixed(6)) : null,
           atr_pct: Number((atrPctNum || 0).toFixed(6)),
-          min_atr_pct: Number((MIN_ATR_PCT || 0).toFixed(6)),
+          min_atr_floor: Number((MIN_ATR_PCT || 0).toFixed(6)),
+          atr_pctl_thr: Number((atrPctlThr || 0).toFixed(6)),
+          atr_pctl_q: ATR_ADAPTIVE_ENABLED ? Number((ATR_ADAPTIVE_PCTL || 0).toFixed(2)) : null,
+          min_atr_pct: Number((minAtrEffective || 0).toFixed(6)),
           realized_vol: Number((realizedVol || 0).toFixed(6)),
           min_slope_norm: Number((MIN_SLOPE_NORM || 0).toFixed(3)),
           regime,
