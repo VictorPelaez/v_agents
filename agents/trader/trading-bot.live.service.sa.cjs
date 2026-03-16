@@ -93,7 +93,11 @@ const state = {
   openCountsByDay: new Map(),           // yyyymmdd (UTC) -> count of OPEN events
 
   // misc
-  lastOpenBySymbol: {}
+  lastOpenBySymbol: {},
+
+  // log de OPEN_TRADE (anti-spam)
+  lastOpenTradesLogHash: '',
+  lastOpenTradesLogCount: 0
 };
 
 function getSymbolRuntime(symbol) {
@@ -474,6 +478,10 @@ function rebuildStateFromJournal() {
   state.recentSignalSeenAt.clear();
   state.recentOpenTimes = [];
   state.openCountsByDay.clear();
+
+  // reset OPEN_TRADE spam guard
+  state.lastOpenTradesLogHash = '';
+  state.lastOpenTradesLogCount = 0;
 
   const events = loadJsonl(getJournalPath(nowIso()));
   for (const ev of events) applyJournalEvent(ev);
@@ -891,6 +899,11 @@ async function gracefulShutdown(signal) {
   const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || cfgLive.SYMBOL_COOLDOWN_SECONDS || 0, 10);
   const feeRate = parseFloat(process.env.FEE_RATE || cfgLive.FEE_RATE || 0.0005);
   const ATR_WINDOW = parseInt(process.env.ATR_WINDOW || cfgLive.ATR_WINDOW || 14, 10);
+  const MIN_ATR_PCT = parseFloat(process.env.MIN_ATR_PCT || cfgLive.MIN_ATR_PCT || 0);
+
+  // Optional: require market to be non-choppy by slope-normalization (abs(smaSlope) / (ATR_abs)).
+  // Example: 0.30 matches the boundary used by detectMarketRegime() for CHOPPY.
+  const MIN_SLOPE_NORM = parseFloat(process.env.MIN_SLOPE_NORM || cfgLive.MIN_SLOPE_NORM || 0);
 
   // Max trades per hour/day (per config)
   const MAX_TRADES_PER_HOUR = parseInt(process.env.MAX_TRADES_PER_HOUR || cfgLive.MAX_TRADES_PER_HOUR || 0, 10);
@@ -1084,15 +1097,22 @@ async function gracefulShutdown(signal) {
         const priceAboveSMA = (sma != null) ? (candle.close > sma) : true;
 
         const { atrPct } = computeAtr(klines, ATR_WINDOW);
+        const atrPctNum = Number.isFinite(atrPct) ? atrPct : 0;
+        const atrOk = (MIN_ATR_PCT > 0) ? (atrPctNum >= MIN_ATR_PCT) : true;
+
         const realizedVol = computeRealizedVol(closes, Math.min(60, Math.max(20, Math.floor(SMA_WINDOW / 2))));
 
         const regimeInfo = detectMarketRegime({
-          atrPct,
+          atrPct: atrPctNum,
           realizedVol,
           smaSlope: smaSlopeAbs,
           lastClose: candle.close,
           priceAboveSma: priceAboveSMA
         });
+
+        const slopeNormOk = (MIN_SLOPE_NORM > 0)
+          ? (Number(regimeInfo.slopeNorm) >= MIN_SLOPE_NORM)
+          : true;
 
         const regime = regimeInfo.volRegime;
 
@@ -1125,7 +1145,9 @@ async function gracefulShutdown(signal) {
 
         const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= dynamicMaxMomentum;
 
-        const shouldEnter = momentumOk &&
+        const shouldEnter = atrOk &&
+          slopeNormOk &&
+          momentumOk &&
           trendUp &&
           priceNearSMA &&
           priceAboveSMA &&
@@ -1144,8 +1166,12 @@ async function gracefulShutdown(signal) {
           smaSlopePct: Number(smaSlopePct.toFixed(6)),
           minSlopeAbs: Number(dynamicMinSlopeAbs.toFixed(candle.close < 10 ? 6 : 2)),
           minSlopePct: (dynamicMinSlopePct != null) ? Number(dynamicMinSlopePct.toFixed(6)) : null,
-          atr_pct: Number((atrPct || 0).toFixed(6)),
+          atr_pct: Number((atrPctNum || 0).toFixed(6)),
+          min_atr_pct: Number((MIN_ATR_PCT || 0).toFixed(6)),
+          atrOk: !!atrOk,
           realized_vol: Number((realizedVol || 0).toFixed(6)),
+          min_slope_norm: Number((MIN_SLOPE_NORM || 0).toFixed(3)),
+          slopeNormOk: !!slopeNormOk,
           regime,
           microRegime: regimeInfo.microRegime,
           slopeNorm: regimeInfo.slopeNorm,
@@ -1179,7 +1205,16 @@ async function gracefulShutdown(signal) {
             'momentum=' + decision.momentum_pct,
             'sma=' + (decision.sma || 'null'),
             'smaSlope=' + decision.smaSlope,
+            'smaSlopePct=' + decision.smaSlopePct,
+            'minSlopeAbs=' + decision.minSlopeAbs,
+            'minSlopePct=' + (decision.minSlopePct == null ? 'null' : decision.minSlopePct),
+            'trendMode=' + (decision.minSlopePct == null ? 'abs' : 'pct'),
             'atr_pct=' + decision.atr_pct,
+            'min_atr_pct=' + decision.min_atr_pct,
+            'atrOk=' + (decision.atrOk ? 1 : 0),
+            'slopeNorm=' + decision.slopeNorm,
+            'min_slope_norm=' + decision.min_slope_norm,
+            'slopeNormOk=' + (decision.slopeNormOk ? 1 : 0),
             'rv=' + decision.realized_vol,
             'regime=' + decision.regime,
             'micro=' + decision.microRegime,
@@ -1206,6 +1241,12 @@ async function gracefulShutdown(signal) {
             'momentum=' + decision.momentum_pct,
             'sma=' + (decision.sma || 'null'),
             'smaSlope=' + decision.smaSlope,
+            'smaSlopePct=' + decision.smaSlopePct,
+            'minSlopePct=' + (decision.minSlopePct == null ? 'null' : decision.minSlopePct),
+            'atr_pct=' + decision.atr_pct,
+            'atrOk=' + (decision.atrOk ? 1 : 0),
+            'slopeNorm=' + decision.slopeNorm,
+            'slopeNormOk=' + (decision.slopeNormOk ? 1 : 0),
             'shouldEnter=' + (decision.shouldEnter ? 1 : 0),
             'openTrades=' + state.openTradesById.size
           );
@@ -1240,7 +1281,7 @@ async function gracefulShutdown(signal) {
 
         // Build trade
         const entryPrice = candle.close;
-        const effectiveATR = Number.isFinite(atrPct) ? atrPct : 0;
+        const effectiveATR = atrPctNum;
 
         // TP/SL sizing:
         // - Base on ATR% (k_sl/k_tp)
@@ -1283,8 +1324,10 @@ async function gracefulShutdown(signal) {
           sma_slope_pct: Number(smaSlopePct.toFixed(6)),
           min_sma_slope_abs: Number(dynamicMinSlopeAbs.toFixed(candle.close < 10 ? 6 : 2)),
           min_sma_slope_pct: (dynamicMinSlopePct != null) ? Number(dynamicMinSlopePct.toFixed(6)) : null,
-          atr_pct: Number((atrPct || 0).toFixed(6)),
+          atr_pct: Number((atrPctNum || 0).toFixed(6)),
+          min_atr_pct: Number((MIN_ATR_PCT || 0).toFixed(6)),
           realized_vol: Number((realizedVol || 0).toFixed(6)),
+          min_slope_norm: Number((MIN_SLOPE_NORM || 0).toFixed(3)),
           regime,
           micro_regime: regimeInfo.microRegime,
           slope_norm: regimeInfo.slopeNorm,
@@ -1323,10 +1366,18 @@ async function gracefulShutdown(signal) {
         }
       }
 
-      // Print open trades (compat) occasionally in verbose
+      // Print open trades (compat) in verbose, but avoid spamming the same OPEN_TRADE every tick.
+      // We only emit when the open-trades snapshot changes (open/close/update).
       if (VERBOSE) {
-        for (const ot of getOpenTradesArray()) {
-          console.log('OPEN_TRADE:', JSON.stringify(ot));
+        const tradesNow = getOpenTradesArray();
+        const hNow = computeSnapshotHash(tradesNow);
+        const changed = (hNow !== state.lastOpenTradesLogHash) || (tradesNow.length !== state.lastOpenTradesLogCount);
+        if (changed) {
+          state.lastOpenTradesLogHash = hNow;
+          state.lastOpenTradesLogCount = tradesNow.length;
+          for (const ot of tradesNow) {
+            console.log('OPEN_TRADE:', JSON.stringify(ot));
+          }
         }
       }
 
