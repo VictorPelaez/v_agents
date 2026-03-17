@@ -25,6 +25,9 @@ const crypto = require('crypto');
 const axios = require('axios');
 require('dotenv').config();
 
+// Exchange helpers (spot v3 signed endpoints)
+const { mexcPublic, mexcSigned } = require('./exchange/mexc_spot_v3.cjs');
+
 const {
   getClosedCloses,
   computeSmaPair,
@@ -160,6 +163,110 @@ console.log('API Base:', getApiBase());
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// --- MEXC Spot v3 helpers (signed endpoints) ---
+async function mexcBookTicker(symbol, timeoutMs) {
+  // Public endpoint
+  return mexcPublic({
+    baseUrl: getApiBase(),
+    method: 'GET',
+    path: '/api/v3/ticker/bookTicker',
+    params: { symbol },
+    timeoutMs: timeoutMs || 2500,
+  });
+}
+
+async function mexcPlaceOrder(params, timeoutMs) {
+  return mexcSigned({
+    baseUrl: getApiBase(),
+    method: 'POST',
+    path: '/api/v3/order',
+    params,
+    apiKey: ACTIVE_API_KEY,
+    apiSecret: ACTIVE_API_SECRET,
+    timeoutMs: timeoutMs || 2500,
+  });
+}
+
+async function mexcGetOrder(params, timeoutMs) {
+  return mexcSigned({
+    baseUrl: getApiBase(),
+    method: 'GET',
+    path: '/api/v3/order',
+    params,
+    apiKey: ACTIVE_API_KEY,
+    apiSecret: ACTIVE_API_SECRET,
+    timeoutMs: timeoutMs || 2500,
+  });
+}
+
+async function mexcCancelOrder(params, timeoutMs) {
+  return mexcSigned({
+    baseUrl: getApiBase(),
+    method: 'DELETE',
+    path: '/api/v3/order',
+    params,
+    apiKey: ACTIVE_API_KEY,
+    apiSecret: ACTIVE_API_SECRET,
+    timeoutMs: timeoutMs || 2500,
+  });
+}
+
+async function mexcOpenOrders(params, timeoutMs) {
+  return mexcSigned({
+    baseUrl: getApiBase(),
+    method: 'GET',
+    path: '/api/v3/openOrders',
+    params,
+    apiKey: ACTIVE_API_KEY,
+    apiSecret: ACTIVE_API_SECRET,
+    timeoutMs: timeoutMs || 2500,
+  });
+}
+
+function pickNum(obj, ...keys) {
+  for (const k of keys) {
+    if (obj && obj[k] != null) {
+      const n = Number(obj[k]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+function orderAvgFillPrice(order) {
+  const executedQty = pickNum(order, 'executedQty', 'executedQuantity', 'cumulativeQuantity');
+  const quoteQty = pickNum(order, 'cummulativeQuoteQty', 'cumulativeQuoteQty', 'cumulativeAmount');
+  if (executedQty && quoteQty) return quoteQty / executedQty;
+  const avg = pickNum(order, 'avgPrice');
+  return avg;
+}
+
+function isOrderFilled(order) {
+  const st = String(order?.status || '').toUpperCase();
+  return st === 'FILLED';
+}
+
+function isOrderActive(order) {
+  const st = String(order?.status || '').toUpperCase();
+  return st === 'NEW' || st === 'PARTIALLY_FILLED';
+}
+
+function isOrderCanceled(order) {
+  const st = String(order?.status || '').toUpperCase();
+  return st === 'CANCELED' || st === 'CANCELLED' || st === 'EXPIRED' || st === 'REJECTED';
+}
+
+async function waitForFill({ symbol, orderId, origClientOrderId, timeoutMs = 15000, pollMs = 500, httpTimeoutMs = 2500 }) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const ord = await mexcGetOrder({ symbol, orderId, origClientOrderId }, httpTimeoutMs);
+    if (isOrderFilled(ord)) return ord;
+    if (isOrderCanceled(ord)) return ord;
+    await sleep(Math.max(50, pollMs));
+  }
+  return null;
 }
 
 function isValidNumber(n) {
@@ -354,6 +461,12 @@ function normalizeOpenTrade(trade, candleBucketMs) {
     mode: trade.mode || null,
     execution_entry: trade.executionEntry || trade.execution_entry || null,
     fee_rate_entry: (trade.feeRateEntry != null) ? Number(trade.feeRateEntry) : null,
+    sl_policy: trade.slPolicy || null,
+    sl_confirm_seconds: (trade.slConfirmSeconds != null) ? Number(trade.slConfirmSeconds) : null,
+    entry_order_id: trade.entryOrderId || null,
+    entry_client_order_id: trade.entryClientOrderId || null,
+    tp_order_id: trade.tpOrderId || null,
+    tp_client_order_id: trade.tpClientOrderId || null,
     symbol: trade.symbol || 'BTCUSDT',
     open_time_iso: trade.openedAt || nowIso(),
     signal_candle_ts: trade.signalCandleTs || null,
@@ -361,6 +474,8 @@ function normalizeOpenTrade(trade, candleBucketMs) {
     qty: trade.size ?? 0,
     entry_price: trade.entryPrice ?? null,
     sl: trade.stopLoss ?? null,
+    sl_classic: (trade.stopLossClassic != null) ? trade.stopLossClassic : null,
+    sl_emergency: (trade.stopLossEmergency != null) ? trade.stopLossEmergency : null,
     tp: trade.takeProfit ?? null,
     reason_tag: trade.reasonTag || '',
     reason_details: trade.reasonDetails || {},
@@ -385,6 +500,12 @@ function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
     execution_exit: trade.executionExit || trade.execution_exit || null,
     fee_rate_entry: (trade.feeRateEntry != null) ? Number(trade.feeRateEntry) : null,
     fee_rate_exit: (trade.feeRateExit != null) ? Number(trade.feeRateExit) : null,
+    sl_policy: trade.slPolicy || null,
+    sl_confirm_seconds: (trade.slConfirmSeconds != null) ? Number(trade.slConfirmSeconds) : null,
+    entry_order_id: trade.entryOrderId || null,
+    entry_client_order_id: trade.entryClientOrderId || null,
+    tp_order_id: trade.tpOrderId || null,
+    tp_client_order_id: trade.tpClientOrderId || null,
     fee_usd_real: (trade.feeUsdReal != null) ? Number(trade.feeUsdReal) : null,
     profit_after_fees_real: (trade.profitAfterFeesReal != null) ? Number(trade.profitAfterFeesReal) : null,
     symbol: trade.symbol || 'BTCUSDT',
@@ -396,6 +517,8 @@ function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
     entry_price: trade.entryPrice ?? null,
     exit_price: trade.exitPrice ?? null,
     sl: trade.stopLoss ?? null,
+    sl_classic: (trade.stopLossClassic != null) ? trade.stopLossClassic : null,
+    sl_emergency: (trade.stopLossEmergency != null) ? trade.stopLossEmergency : null,
     tp: trade.takeProfit ?? null,
     profit: trade.profit ?? null,
     profit_pct: trade.profit_pct ?? null,
@@ -456,6 +579,8 @@ function applyJournalEvent(event) {
       symbol: t.symbol || 'BTCUSDT',
       entryPrice: Number(t.entry_price ?? 0),
       stopLoss: t.sl != null ? Number(t.sl) : null,
+      stopLossClassic: (t.sl_classic != null) ? Number(t.sl_classic) : null,
+      stopLossEmergency: (t.sl_emergency != null) ? Number(t.sl_emergency) : null,
       takeProfit: t.tp != null ? Number(t.tp) : null,
       openedAt: t.open_time_iso,
       signalCandleTs: t.signal_candle_ts,
@@ -463,7 +588,16 @@ function applyJournalEvent(event) {
       type: t.side || 'LONG',
       reasonTag: t.reason_tag || '',
       reasonDetails: t.reason_details || {},
-      exposureUSD: t.exposure_usd ?? null
+      exposureUSD: t.exposure_usd ?? null,
+      mode: t.mode || null,
+      executionEntry: t.execution_entry || null,
+      feeRateEntry: (t.fee_rate_entry != null) ? Number(t.fee_rate_entry) : null,
+      entryOrderId: t.entry_order_id || null,
+      entryClientOrderId: t.entry_client_order_id || null,
+      tpOrderId: t.tp_order_id || null,
+      tpClientOrderId: t.tp_client_order_id || null,
+      slPolicy: t.sl_policy || null,
+      slConfirmSeconds: (t.sl_confirm_seconds != null) ? Number(t.sl_confirm_seconds) : null
     };
 
     const symbol = trade.symbol;
@@ -499,6 +633,27 @@ function applyJournalEvent(event) {
 
     if (signalKey) state.openTradeIdBySignalKey.delete(signalKey);
     if (signalKey) state.recentSignalSeenAt.set(signalKey, Date.now());
+
+    markSnapshotDirty();
+  }
+
+  // Additive: patch/update event (used mainly for LIVE reconciliation, e.g., attaching tp_order_id).
+  if (event.type === 'UPDATE') {
+    const t = event.trade || {};
+    const id = String(t.id ?? '');
+    if (!id) return;
+
+    const tr = state.openTradesById.get(id);
+    if (!tr) return;
+
+    if (t.tp_order_id != null) tr.tpOrderId = t.tp_order_id;
+    if (t.tp_client_order_id != null) tr.tpClientOrderId = t.tp_client_order_id;
+    if (t.entry_order_id != null) tr.entryOrderId = t.entry_order_id;
+    if (t.entry_client_order_id != null) tr.entryClientOrderId = t.entry_client_order_id;
+
+    // allow updating SL levels if we ever recompute
+    if (t.sl_classic != null) tr.stopLossClassic = Number(t.sl_classic);
+    if (t.sl_emergency != null) tr.stopLossEmergency = Number(t.sl_emergency);
 
     markSnapshotDirty();
   }
@@ -570,7 +725,12 @@ function flushOpenPositionsSnapshot(force = false) {
         symbol: t.symbol,
         entryPrice: t.entryPrice,
         stopLoss: t.stopLoss,
+        stopLossClassic: t.stopLossClassic ?? null,
+        stopLossEmergency: t.stopLossEmergency ?? null,
         takeProfit: t.takeProfit,
+        mode: t.mode ?? null,
+        slPolicy: t.slPolicy ?? null,
+        slConfirmSeconds: t.slConfirmSeconds ?? null,
         openedAt: t.openedAt,
         signalCandleTs: t.signalCandleTs,
         size: t.size,
@@ -796,7 +956,7 @@ async function openTrade(trade, candleBucketMs, signalCooldownMs, verbose) {
   if (!ok) return false;
 
   console.log(
-    'OPEN (paper):', trade.openedAt,
+    `OPEN (${trade.mode || 'paper'}):`, trade.openedAt,
     'id=', trade.id,
     'symbol=', trade.symbol,
     'regime=', trade.regime,
@@ -907,8 +1067,42 @@ async function gracefulShutdown(signal) {
   const candleBucketMs = parseInt(process.env.SIGNAL_BUCKET_MS || cfgLive.SIGNAL_BUCKET_MS || cfgLive.CANDLE_MS || 60000, 10);
   const signalCooldownMs = parseInt(process.env.SIGNAL_COOLDOWN_MS || cfgLive.SIGNAL_COOLDOWN_MS || 180000, 10);
 
+  // --- Trading mode / risk policies (paper vs live) ---
+  const TRADING_MODE = String(process.env.TRADING_MODE || cfgLive.TRADING_MODE || 'PAPER').toUpperCase();
+  const ENABLE_LIVE = String(process.env.ENABLE_LIVE || cfgLive.ENABLE_LIVE || '0') === '1';
+  const runMode = (TRADING_MODE === 'LIVE' && ENABLE_LIVE) ? 'live' : 'paper';
+
+  // SL policies:
+  // - CLASSIC: hard close when market <= SL classic
+  // - EMERGENCY_ONLY: only emergency SL (wide) + time_stop
+  // - SOFT_CLASSIC_WITH_EMERGENCY: emergency as airbag + classic SL with confirmation window
+  const SL_POLICY = String(process.env.SL_POLICY || cfgLive.SL_POLICY || 'CLASSIC').toUpperCase();
+  const EMERGENCY_SL_PCT = parseFloat(process.env.EMERGENCY_SL_PCT || cfgLive.EMERGENCY_SL_PCT || 0);
+  const SL_CONFIRM_SECONDS = parseInt(process.env.SL_CONFIRM_SECONDS || cfgLive.SL_CONFIRM_SECONDS || 0, 10);
+  const HALT_TRADING_ON_EMERGENCY = (process.env.HALT_TRADING_ON_EMERGENCY != null)
+    ? String(process.env.HALT_TRADING_ON_EMERGENCY) === '1'
+    : !!cfgLive.HALT_TRADING_ON_EMERGENCY;
+
+  // LIVE guardrails
+  if (TRADING_MODE === 'LIVE' && !ENABLE_LIVE) {
+    console.error('TRADING_MODE=LIVE requires ENABLE_LIVE=1 (env)');
+    process.exit(1);
+  }
+  if (runMode === 'live' && (!ACTIVE_API_KEY || !ACTIVE_API_SECRET)) {
+    console.error(`API keys for ${EXCHANGE} not set in .env (runMode=live)`);
+    process.exit(1);
+  }
+
   const explosiveCandlePct = parseFloat(process.env.EXPLOSIVE_CANDLE_PCT || cfgLive.EXPLOSIVE_CANDLE_PCT || 0.003);
   const tradeUSD = parseFloat(process.env.TRADE_USD || cfgLive.TRADE_USD || 100.0);
+
+  // Execution tuning (LIVE)
+  const TP_ON_EXCHANGE = (process.env.TP_ON_EXCHANGE != null)
+    ? String(process.env.TP_ON_EXCHANGE) === '1'
+    : (cfgLive.TP_ON_EXCHANGE !== undefined ? !!cfgLive.TP_ON_EXCHANGE : true);
+  const MAKER_ENTRY_TIMEOUT_MS = parseInt(process.env.MAKER_ENTRY_TIMEOUT_MS || cfgLive.MAKER_ENTRY_TIMEOUT_MS || 15000, 10);
+  const ORDER_POLL_MS = parseInt(process.env.ORDER_POLL_MS || cfgLive.ORDER_POLL_MS || 500, 10);
+
   const minCandleBody = parseFloat(process.env.MIN_BODY_CANDLE || cfgLive.MIN_BODY_CANDLE || 0.5);
   const smaTol = parseFloat(process.env.SMA_TOLERANCE || cfgLive.SMA_TOLERANCE || 0.001);
   // Volume filter: interpret MIN_VOLUME as QUOTE volume (USDT) when available (kline[7]); fallback to base volume (kline[5]).
@@ -935,6 +1129,8 @@ async function gracefulShutdown(signal) {
 
   const cooldown_s = parseInt(process.env.SYMBOL_COOLDOWN_SECONDS || cfgLive.SYMBOL_COOLDOWN_SECONDS || 0, 10);
   const feeRate = parseFloat(process.env.FEE_RATE || cfgLive.FEE_RATE || 0.0005);
+  const feeRateMaker = parseFloat(process.env.FEE_RATE_MAKER || cfgLive.FEE_RATE_MAKER || 0.0);
+  const feeRateTaker = parseFloat(process.env.FEE_RATE_TAKER || cfgLive.FEE_RATE_TAKER || feeRate);
   const ATR_WINDOW = parseInt(process.env.ATR_WINDOW || cfgLive.ATR_WINDOW || 14, 10);
   const MIN_ATR_PCT = parseFloat(process.env.MIN_ATR_PCT || cfgLive.MIN_ATR_PCT || 0);
 
@@ -999,14 +1195,303 @@ async function gracefulShutdown(signal) {
   console.log('MIN_SL_USD:', MIN_SL_USD);
   console.log('MAX_TRADES_PER_HOUR:', MAX_TRADES_PER_HOUR);
   console.log('MAX_TRADES_PER_DAY:', MAX_TRADES_PER_DAY);
+  console.log('TRADING_MODE:', TRADING_MODE, '(runMode=', runMode + ')');
+  console.log('SL_POLICY:', SL_POLICY, 'EMERGENCY_SL_PCT=', EMERGENCY_SL_PCT, 'SL_CONFIRM_SECONDS=', SL_CONFIRM_SECONDS);
+  console.log('HALT_TRADING_ON_EMERGENCY:', HALT_TRADING_ON_EMERGENCY);
 
   rebuildStateFromJournal();
+
+  // --- LIVE execution (simplified v1): maker entry with fallback taker + TP order on exchange ---
+  async function openTradeLive(trade, candleBucketMs, signalCooldownMs, verbose) {
+    const signalKey = getSignalKey(trade, candleBucketMs);
+
+    if (hasOpenSignal(signalKey)) return false;
+    if (!canOpenSignal(signalKey, signalCooldownMs)) return false;
+
+    // Mark as seen immediately to avoid duplicate opens while the entry order is pending.
+    state.recentSignalSeenAt.set(signalKey, Date.now());
+
+    const sym = trade.symbol;
+
+    // 1) Entry maker (LIMIT_MAKER) near best bid
+    let entryExec = 'maker';
+    let entryFeeRate = feeRateMaker;
+    const entryClientId = `open_${LABEL}_${trade.id}`;
+
+    let entryOrder = null;
+    let entryOrderId = null;
+
+    try {
+      const bt = await mexcBookTicker(sym, HTTP_TIMEOUT_MS);
+      const bid = pickNum(bt, 'bidPrice', 'bid');
+      const price = (bid != null && bid > 0) ? bid : trade.entryPrice;
+
+      entryOrder = await mexcPlaceOrder({
+        symbol: sym,
+        side: 'BUY',
+        type: 'LIMIT_MAKER',
+        quantity: trade.size,
+        price,
+        newClientOrderId: entryClientId,
+      }, HTTP_TIMEOUT_MS);
+
+      entryOrderId = entryOrder?.orderId || entryOrder?.order_id || null;
+    } catch (e) {
+      // If maker placement fails (e.g., would be taker), we fallback below.
+      if (verbose) console.error('LIVE entry maker place failed:', e.message);
+    }
+
+    let filledEntry = null;
+    if (entryOrderId) {
+      filledEntry = await waitForFill({
+        symbol: sym,
+        orderId: entryOrderId,
+        origClientOrderId: entryClientId,
+        timeoutMs: MAKER_ENTRY_TIMEOUT_MS,
+        pollMs: ORDER_POLL_MS,
+        httpTimeoutMs: HTTP_TIMEOUT_MS,
+      });
+    }
+
+    // Fallback: market buy
+    if (!filledEntry || !isOrderFilled(filledEntry)) {
+      entryExec = 'fallback_taker';
+      entryFeeRate = feeRateTaker;
+
+      try {
+        if (entryOrderId) {
+          await mexcCancelOrder({ symbol: sym, orderId: entryOrderId }, HTTP_TIMEOUT_MS);
+        }
+      } catch (_) {}
+
+      const mktClientId = `${entryClientId}_mkt`;
+      const mkt = await mexcPlaceOrder({
+        symbol: sym,
+        side: 'BUY',
+        type: 'MARKET',
+        quantity: trade.size,
+        newClientOrderId: mktClientId,
+      }, HTTP_TIMEOUT_MS);
+      const mktOrderId = mkt?.orderId || mkt?.order_id || null;
+      filledEntry = mktOrderId
+        ? await waitForFill({ symbol: sym, orderId: mktOrderId, origClientOrderId: mktClientId, timeoutMs: 15000, pollMs: ORDER_POLL_MS, httpTimeoutMs: HTTP_TIMEOUT_MS })
+        : null;
+      entryOrderId = mktOrderId || entryOrderId;
+    }
+
+    const execQty = pickNum(filledEntry, 'executedQty', 'executedQuantity', 'cumulativeQuantity') ?? trade.size;
+    const avgEntry = orderAvgFillPrice(filledEntry) ?? trade.entryPrice;
+
+    if (!Number.isFinite(execQty) || execQty <= 0 || !Number.isFinite(avgEntry) || avgEntry <= 0) {
+      console.error('LIVE entry failed (no fills)', { symbol: sym, id: trade.id, entryOrderId });
+      return false;
+    }
+
+    // Update trade with actual execution details
+    trade.mode = 'live';
+    trade.executionEntry = entryExec;
+    trade.feeRateEntry = entryFeeRate;
+    trade.entryOrderId = entryOrderId;
+    trade.entryClientOrderId = entryClientId;
+
+    trade.size = execQty;
+    trade.entryPrice = avgEntry;
+    trade.openedAt = nowIso();
+
+    // 2) Place TP order on exchange (LIMIT sell). This is the "TP real" simplification.
+    if (TP_ON_EXCHANGE && trade.takeProfit && Number.isFinite(trade.takeProfit)) {
+      try {
+        const tpClientId = `tp_${LABEL}_${trade.id}`;
+        const tp = await mexcPlaceOrder({
+          symbol: sym,
+          side: 'SELL',
+          type: 'LIMIT',
+          quantity: trade.size,
+          price: trade.takeProfit,
+          timeInForce: 'GTC',
+          newClientOrderId: tpClientId,
+        }, HTTP_TIMEOUT_MS);
+
+        trade.tpOrderId = tp?.orderId || tp?.order_id || null;
+        trade.tpClientOrderId = tpClientId;
+      } catch (e) {
+        console.error('LIVE TP place failed:', e.message);
+        // We still open the position; TP can be managed by bot later.
+      }
+    }
+
+    const event = {
+      ts: nowIso(),
+      type: 'OPEN',
+      event_key: getOpenEventKey(trade, candleBucketMs),
+      trade: normalizeOpenTrade(trade, candleBucketMs),
+    };
+
+    const ok = persistJournalEvent(event);
+    if (!ok) return false;
+
+    console.log(
+      `OPEN (${trade.mode || 'live'}):`, trade.openedAt,
+      'id=', trade.id,
+      'symbol=', trade.symbol,
+      'entry=', trade.entryPrice,
+      'exec=', trade.executionEntry,
+      'entryOrderId=', trade.entryOrderId,
+      'tpOrderId=', trade.tpOrderId || '—'
+    );
+
+    return true;
+  }
+
+  function persistTradeUpdate(patch) {
+    try {
+      const id = patch?.id;
+      if (!id) return false;
+      const event = {
+        ts: nowIso(),
+        type: 'UPDATE',
+        event_key: `update:${LABEL}:${id}:${Date.now()}`,
+        trade: patch,
+      };
+      return persistJournalEvent(event);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function closeTradeLiveMarket(trade, closeReason) {
+    const sym = trade.symbol;
+
+    // Cancel TP if present
+    try {
+      if (trade.tpOrderId) {
+        await mexcCancelOrder({ symbol: sym, orderId: trade.tpOrderId }, HTTP_TIMEOUT_MS);
+      }
+    } catch (_) {}
+
+    const clientId = `close_${LABEL}_${trade.id}_${closeReason}`;
+    const mkt = await mexcPlaceOrder({
+      symbol: sym,
+      side: 'SELL',
+      type: 'MARKET',
+      quantity: trade.size,
+      newClientOrderId: clientId,
+    }, HTTP_TIMEOUT_MS);
+
+    const orderId = mkt?.orderId || mkt?.order_id || null;
+    const filled = orderId
+      ? await waitForFill({ symbol: sym, orderId, origClientOrderId: clientId, timeoutMs: 15000, pollMs: ORDER_POLL_MS, httpTimeoutMs: HTTP_TIMEOUT_MS })
+      : null;
+
+    const avgExit = orderAvgFillPrice(filled) ?? (await getTickerCached(sym, HTTP_TIMEOUT_MS, 0));
+
+    trade.mode = 'live';
+    trade.executionExit = 'taker';
+    trade.feeRateExit = feeRateTaker;
+
+    return closeTrade(trade, avgExit, closeReason, candleBucketMs, feeRateTaker);
+  }
+
+  async function reconcileLiveTpOrders() {
+    if (runMode !== 'live' || !TP_ON_EXCHANGE) return;
+
+    for (const sym of symbols) {
+      const openTrades = getOpenTradesArray(sym);
+
+      // Pull open orders once per symbol
+      let openOrders = [];
+      try {
+        const oo = await mexcOpenOrders({ symbol: sym }, HTTP_TIMEOUT_MS);
+        if (Array.isArray(oo)) openOrders = oo;
+        else if (Array.isArray(oo?.data)) openOrders = oo.data;
+        else if (Array.isArray(oo?.orders)) openOrders = oo.orders;
+      } catch (e) {
+        console.error('LIVE reconcile: openOrders fetch failed:', e.message);
+        continue;
+      }
+
+      // If no open trades in journal/state, cancel any stray TP orders created by this bot.
+      if (!openTrades.length) {
+        for (const o of openOrders) {
+          const clientId = String(o?.clientOrderId || o?.client_order_id || o?.origClientOrderId || o?.orig_client_order_id || '');
+          const orderId = o?.orderId || o?.order_id || null;
+          if (orderId && clientId.startsWith(`tp_${LABEL}_`)) {
+            try {
+              await mexcCancelOrder({ symbol: sym, orderId }, HTTP_TIMEOUT_MS);
+              console.log('LIVE reconcile: canceled stray TP order', { symbol: sym, orderId, clientId });
+            } catch (_) {}
+          }
+        }
+        continue;
+      }
+
+      // For each open trade, ensure we have a TP order attached.
+      for (const tr of openTrades) {
+        const expectedTpClientId = `tp_${LABEL}_${tr.id}`;
+
+        // Attach tpOrderId if missing (look in openOrders)
+        if (!tr.tpOrderId) {
+          const found = openOrders.find((o) => {
+            const clientId = String(o?.clientOrderId || o?.client_order_id || o?.origClientOrderId || o?.orig_client_order_id || '');
+            return clientId === expectedTpClientId;
+          });
+          if (found) {
+            tr.tpOrderId = found?.orderId || found?.order_id || null;
+            tr.tpClientOrderId = expectedTpClientId;
+            persistTradeUpdate({ id: tr.id, symbol: sym, tp_order_id: tr.tpOrderId, tp_client_order_id: tr.tpClientOrderId });
+            console.log('LIVE reconcile: attached existing TP order to trade', { id: tr.id, symbol: sym, tpOrderId: tr.tpOrderId });
+          }
+        }
+
+        // If we have a TP order id, check if it already filled while we were down.
+        if (tr.tpOrderId) {
+          try {
+            const tpOrd = await mexcGetOrder({ symbol: sym, orderId: tr.tpOrderId }, HTTP_TIMEOUT_MS);
+            if (isOrderFilled(tpOrd)) {
+              const exitP = orderAvgFillPrice(tpOrd) ?? null;
+              tr.mode = 'live';
+              tr.executionExit = 'maker';
+              tr.feeRateExit = feeRateMaker;
+              await closeTrade(tr, exitP, 'TP', candleBucketMs, feeRateMaker);
+              console.log('LIVE reconcile: TP already filled, journal close emitted', { id: tr.id, symbol: sym, tpOrderId: tr.tpOrderId });
+              continue;
+            }
+          } catch (_) {}
+        }
+
+        // If still no TP order, place a new one.
+        if (!tr.tpOrderId && tr.takeProfit && Number.isFinite(tr.takeProfit)) {
+          try {
+            const tp = await mexcPlaceOrder({
+              symbol: sym,
+              side: 'SELL',
+              type: 'LIMIT',
+              quantity: tr.size,
+              price: tr.takeProfit,
+              timeInForce: 'GTC',
+              newClientOrderId: expectedTpClientId,
+            }, HTTP_TIMEOUT_MS);
+
+            tr.tpOrderId = tp?.orderId || tp?.order_id || null;
+            tr.tpClientOrderId = expectedTpClientId;
+            persistTradeUpdate({ id: tr.id, symbol: sym, tp_order_id: tr.tpOrderId, tp_client_order_id: tr.tpClientOrderId });
+            console.log('LIVE reconcile: placed missing TP order', { id: tr.id, symbol: sym, tpOrderId: tr.tpOrderId });
+          } catch (e) {
+            console.error('LIVE reconcile: TP place failed:', e.message);
+          }
+        }
+      }
+    }
+  }
 
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
   let symbolsOrdered = symbols.slice();
   let lastRankTs = 0;
+
+  // If emergency SL triggers and HALT_TRADING_ON_EMERGENCY=1, we stop opening new trades until UTC day rollover.
+  let emergencyHaltYmd = null;
 
   // Initial ranking (optional)
   if (RANKING_ENABLED && symbols.length > 1) {
@@ -1015,6 +1500,15 @@ async function gracefulShutdown(signal) {
       lastRankTs = Date.now();
     } catch (e) {
       console.error('RANK init error:', e.message);
+    }
+  }
+
+  // LIVE: best-effort reconciliation (attach TP orders / emit closes if TP filled while down)
+  if (runMode === 'live') {
+    try {
+      await reconcileLiveTpOrders();
+    } catch (e) {
+      console.error('LIVE reconcile fatal (ignored):', e.message);
     }
   }
 
@@ -1050,14 +1544,81 @@ async function gracefulShutdown(signal) {
 
         for (const tr of openTrades) {
           const ageS = (Date.now() - new Date(tr.openedAt).getTime()) / 1000;
-          if (ageS < minHoldS) continue;
+
+          // LIVE: if TP order exists on exchange, check fill status first (even before minHold).
+          if (runMode === 'live' && TP_ON_EXCHANGE && tr.tpOrderId) {
+            try {
+              const tpOrd = await mexcGetOrder({ symbol: sym, orderId: tr.tpOrderId }, HTTP_TIMEOUT_MS);
+              if (isOrderFilled(tpOrd)) {
+                const exitP = orderAvgFillPrice(tpOrd) ?? market;
+                tr.mode = 'live';
+                tr.executionExit = 'maker';
+                tr.feeRateExit = feeRateMaker;
+                await closeTrade(tr, exitP, 'TP', candleBucketMs, feeRateMaker);
+                continue;
+              }
+            } catch (e) {
+              if (VERBOSE) console.error('LIVE TP status check failed:', e.message);
+            }
+          }
 
           if (ageS > timeStopMinutes * 60) {
-            await closeTrade(tr, market, 'time_stop', candleBucketMs, feeRate);
-          } else if (tr.stopLoss && market <= tr.stopLoss) {
-            await closeTrade(tr, market, 'SL', candleBucketMs, feeRate);
-          } else if (tr.takeProfit && market >= tr.takeProfit) {
-            await closeTrade(tr, market, 'TP', candleBucketMs, feeRate);
+            if (runMode === 'live') await closeTradeLiveMarket(tr, 'time_stop');
+            else await closeTrade(tr, market, 'time_stop', candleBucketMs, feeRate);
+            continue;
+          }
+
+          if (ageS < minHoldS) continue;
+
+          const slClassic = (tr.stopLossClassic != null) ? tr.stopLossClassic : null;
+          const slEmergency = (tr.stopLossEmergency != null)
+            ? tr.stopLossEmergency
+            : (tr.stopLoss != null ? tr.stopLoss : null);
+
+          // 1) Emergency SL (airbag)
+          if ((SL_POLICY === 'SOFT_CLASSIC_WITH_EMERGENCY' || SL_POLICY === 'EMERGENCY_ONLY')
+              && slEmergency != null
+              && market <= slEmergency) {
+            if (runMode === 'live') await closeTradeLiveMarket(tr, 'emergency_sl');
+            else await closeTrade(tr, market, 'emergency_sl', candleBucketMs, feeRate);
+            if (HALT_TRADING_ON_EMERGENCY) emergencyHaltYmd = getYmd(Date.now());
+            continue;
+          }
+
+          // 2) Classic SL
+          if (SL_POLICY === 'CLASSIC') {
+            if (tr.stopLoss && market <= tr.stopLoss) {
+              if (runMode === 'live') await closeTradeLiveMarket(tr, 'SL');
+              else await closeTrade(tr, market, 'SL', candleBucketMs, feeRate);
+              continue;
+            }
+          } else if (SL_POLICY === 'SOFT_CLASSIC_WITH_EMERGENCY') {
+            if (slClassic != null && market <= slClassic) {
+              if (!tr._slBreachStartMs) tr._slBreachStartMs = Date.now();
+              const confirmMs = Math.max(0, SL_CONFIRM_SECONDS) * 1000;
+              if (confirmMs <= 0 || (Date.now() - tr._slBreachStartMs) >= confirmMs) {
+                if (runMode === 'live') await closeTradeLiveMarket(tr, 'SL');
+                else await closeTrade(tr, market, 'SL', candleBucketMs, feeRate);
+                tr._slBreachStartMs = null;
+                continue;
+              }
+            } else {
+              tr._slBreachStartMs = null;
+            }
+          } else {
+            // EMERGENCY_ONLY: no classic SL
+            tr._slBreachStartMs = null;
+          }
+
+          // 3) Take profit fallback (only if no TP on exchange)
+          if (tr.takeProfit && market >= tr.takeProfit) {
+            if (runMode === 'live' && TP_ON_EXCHANGE) {
+              // If TP order wasn't placed/known, fall back to market close.
+              await closeTradeLiveMarket(tr, 'TP');
+            } else {
+              await closeTrade(tr, market, 'TP', candleBucketMs, feeRate);
+            }
+            continue;
           }
         }
       }
@@ -1065,6 +1626,12 @@ async function gracefulShutdown(signal) {
       // 2) Evaluate new candle entries per symbol (at most 1/min per symbol)
       for (const sym of symbolsOrdered) {
         const rt = getSymbolRuntime(sym);
+
+        // Halt new entries for the rest of the UTC day after an emergency SL, if enabled.
+        if (HALT_TRADING_ON_EMERGENCY && emergencyHaltYmd && emergencyHaltYmd === getYmd(Date.now())) {
+          if (VERBOSE) console.log('HALT: emergency SL triggered today, skipping new entries', { iter: iterCount, symbol: sym, ymd: emergencyHaltYmd });
+          continue;
+        }
 
         // Poll klines at cadence (avoid N symbols * every tick)
         if ((Date.now() - rt.lastKlinesPollMs) < KLINES_POLL_MS) continue;
@@ -1380,10 +1947,19 @@ async function gracefulShutdown(signal) {
         }
 
         const takeProfit = entryPrice + riskDist * rr;
-        // const stopLoss = entryPrice - riskDist;
-        // SL de emergencia (mucho más lejos)
-        const EMERGENCY_SL_PCT = 0.006; // 0.6%
-        const stopLoss = entryPrice * (1 - EMERGENCY_SL_PCT);
+
+        const stopLossClassic = entryPrice - riskDist;
+        const stopLossEmergency = (Number.isFinite(EMERGENCY_SL_PCT) && EMERGENCY_SL_PCT > 0)
+          ? (entryPrice * (1 - EMERGENCY_SL_PCT))
+          : stopLossClassic;
+
+        // Which SL is "armed" as hard stop in state:
+        // - CLASSIC: classic SL
+        // - SOFT_CLASSIC_WITH_EMERGENCY: emergency SL is hard airbag; classic evaluated with confirmation
+        // - EMERGENCY_ONLY: emergency SL only
+        const stopLoss = (SL_POLICY === 'SOFT_CLASSIC_WITH_EMERGENCY' || SL_POLICY === 'EMERGENCY_ONLY')
+          ? stopLossEmergency
+          : stopLossClassic;
 
         const stopDistanceUSD = riskDist;
         const current = klines[klines.length - 1];
@@ -1436,7 +2012,12 @@ async function gracefulShutdown(signal) {
           symbol: sym,
           entryPrice,
           stopLoss,
+          stopLossClassic,
+          stopLossEmergency,
           takeProfit,
+          mode: runMode,
+          slPolicy: SL_POLICY,
+          slConfirmSeconds: SL_CONFIRM_SECONDS,
           openedAt: nowIso(),
           signalCandleTs: candle.ts,
           size: qty,
@@ -1448,7 +2029,9 @@ async function gracefulShutdown(signal) {
         };
 
 
-        const didOpen = await openTrade(trade, candleBucketMs, signalCooldownMs, VERBOSE);
+        const didOpen = (runMode === 'live')
+          ? await openTradeLive(trade, candleBucketMs, signalCooldownMs, VERBOSE)
+          : await openTrade(trade, candleBucketMs, signalCooldownMs, VERBOSE);
         if (didOpen) {
           rt.lastTradeCandleMinute = candleMinute;
           state.lastOpenBySymbol[sym] = Date.now();
