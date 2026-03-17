@@ -1241,9 +1241,13 @@ async function gracefulShutdown(signal) {
       if (verbose) console.error('LIVE entry maker place failed:', e.message);
     }
 
-    let filledEntry = null;
+    // Partial-fill aware entry handling
+    let makerOrd = null;
+    let makerExecQty = 0;
+    let makerAvg = null;
+
     if (entryOrderId) {
-      filledEntry = await waitForFill({
+      makerOrd = await waitForFill({
         symbol: sym,
         orderId: entryOrderId,
         origClientOrderId: entryClientId,
@@ -1251,36 +1255,62 @@ async function gracefulShutdown(signal) {
         pollMs: ORDER_POLL_MS,
         httpTimeoutMs: HTTP_TIMEOUT_MS,
       });
+      try {
+        const ordNow = makerOrd || await mexcGetOrder({ symbol: sym, orderId: entryOrderId, origClientOrderId: entryClientId }, HTTP_TIMEOUT_MS);
+        if (ordNow) makerOrd = ordNow;
+      } catch (_) {}
+
+      makerExecQty = pickNum(makerOrd, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
+      makerAvg = orderAvgFillPrice(makerOrd);
     }
 
-    // Fallback: market buy
-    if (!filledEntry || !isOrderFilled(filledEntry)) {
-      entryExec = 'fallback_taker';
-      entryFeeRate = feeRateTaker;
+    let mktOrd = null;
+    let mktExecQty = 0;
+    let mktAvg = null;
 
+    const filledEnough = makerExecQty >= (trade.size * 0.999999);
+
+    if (!filledEnough) {
+      // Cancel any remaining maker quantity
       try {
         if (entryOrderId) {
           await mexcCancelOrder({ symbol: sym, orderId: entryOrderId }, HTTP_TIMEOUT_MS);
         }
       } catch (_) {}
 
-      const mktClientId = `${entryClientId}_mkt`;
-      const mkt = await mexcPlaceOrder({
-        symbol: sym,
-        side: 'BUY',
-        type: 'MARKET',
-        quantity: trade.size,
-        newClientOrderId: mktClientId,
-      }, HTTP_TIMEOUT_MS);
-      const mktOrderId = mkt?.orderId || mkt?.order_id || null;
-      filledEntry = mktOrderId
-        ? await waitForFill({ symbol: sym, orderId: mktOrderId, origClientOrderId: mktClientId, timeoutMs: 15000, pollMs: ORDER_POLL_MS, httpTimeoutMs: HTTP_TIMEOUT_MS })
-        : null;
-      entryOrderId = mktOrderId || entryOrderId;
+      const remaining = Math.max(0, trade.size - makerExecQty);
+      if (remaining > 0) {
+        const mktClientId = `${entryClientId}_mkt`;
+        const mkt = await mexcPlaceOrder({
+          symbol: sym,
+          side: 'BUY',
+          type: 'MARKET',
+          quantity: remaining,
+          newClientOrderId: mktClientId,
+        }, HTTP_TIMEOUT_MS);
+
+        const mktOrderId = mkt?.orderId || mkt?.order_id || null;
+        mktOrd = mktOrderId
+          ? await waitForFill({ symbol: sym, orderId: mktOrderId, origClientOrderId: mktClientId, timeoutMs: 15000, pollMs: ORDER_POLL_MS, httpTimeoutMs: HTTP_TIMEOUT_MS })
+          : null;
+
+        mktExecQty = pickNum(mktOrd, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
+        mktAvg = orderAvgFillPrice(mktOrd);
+
+        entryOrderId = mktOrderId || entryOrderId;
+      }
+
+      entryExec = (makerExecQty > 0 && mktExecQty > 0) ? 'maker+fallback_taker' : 'fallback_taker';
+      entryFeeRate = feeRateTaker;
+    } else {
+      entryExec = 'maker';
+      entryFeeRate = feeRateMaker;
     }
 
-    const execQty = pickNum(filledEntry, 'executedQty', 'executedQuantity', 'cumulativeQuantity') ?? trade.size;
-    const avgEntry = orderAvgFillPrice(filledEntry) ?? trade.entryPrice;
+    const execQty = makerExecQty + mktExecQty;
+    const quoteMaker = (makerAvg != null ? makerAvg : trade.entryPrice) * makerExecQty;
+    const quoteMkt = (mktAvg != null ? mktAvg : trade.entryPrice) * mktExecQty;
+    const avgEntry = execQty > 0 ? ((quoteMaker + quoteMkt) / execQty) : null;
 
     if (!Number.isFinite(execQty) || execQty <= 0 || !Number.isFinite(avgEntry) || avgEntry <= 0) {
       console.error('LIVE entry failed (no fills)', { symbol: sym, id: trade.id, entryOrderId });
@@ -1493,6 +1523,9 @@ async function gracefulShutdown(signal) {
   // If emergency SL triggers and HALT_TRADING_ON_EMERGENCY=1, we stop opening new trades until UTC day rollover.
   let emergencyHaltYmd = null;
 
+  // LIVE reconciliation cadence (best-effort)
+  let lastLiveReconcileMs = 0;
+
   // Initial ranking (optional)
   if (RANKING_ENABLED && symbols.length > 1) {
     try {
@@ -1519,6 +1552,19 @@ async function gracefulShutdown(signal) {
 
     try {
       cleanupRecentSignals();
+
+      // LIVE: periodic reconciliation (attach TP orders / emit closes if TP filled while down)
+      if (runMode === 'live' && TP_ON_EXCHANGE) {
+        const nowMs = Date.now();
+        if (!lastLiveReconcileMs || (nowMs - lastLiveReconcileMs) >= 30_000) {
+          try {
+            await reconcileLiveTpOrders();
+          } catch (e) {
+            console.error('LIVE reconcile tick error (ignored):', e.message);
+          }
+          lastLiveReconcileMs = nowMs;
+        }
+      }
 
       // Refresh ranking occasionally
       if (RANKING_ENABLED && symbols.length > 1) {
