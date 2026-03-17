@@ -1,8 +1,7 @@
 {
   "SYMBOL": "BTCUSDT",
   "SYMBOLS": [
-    "BTCUSDT",
-    "XRPUSDT"
+    "BTCUSDT"
   ],
   "EXCHANGE": "mexc",
 
@@ -48,8 +47,7 @@
 
   "MIN_SLOPE_NORM": 0.08,
   "MIN_SLOPE_NORM_BY_SYMBOL": {
-    "BTCUSDT": 0.10,
-    "XRPUSDT": 0.06
+    "BTCUSDT": 0.10
   },
 
   "K_TP": 2.75,
