@@ -350,6 +350,10 @@ function normalizeOpenTrade(trade, candleBucketMs) {
   return {
     id: trade.id,
     label: LABEL,
+    // Additive: execution context (paper/live + maker/taker). Safe for old parsers.
+    mode: trade.mode || null,
+    execution_entry: trade.executionEntry || trade.execution_entry || null,
+    fee_rate_entry: (trade.feeRateEntry != null) ? Number(trade.feeRateEntry) : null,
     symbol: trade.symbol || 'BTCUSDT',
     open_time_iso: trade.openedAt || nowIso(),
     signal_candle_ts: trade.signalCandleTs || null,
@@ -375,6 +379,14 @@ function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
   return {
     id: trade.id,
     label: LABEL,
+    // Additive: execution context (paper/live + maker/taker). Safe for old parsers.
+    mode: trade.mode || null,
+    execution_entry: trade.executionEntry || trade.execution_entry || null,
+    execution_exit: trade.executionExit || trade.execution_exit || null,
+    fee_rate_entry: (trade.feeRateEntry != null) ? Number(trade.feeRateEntry) : null,
+    fee_rate_exit: (trade.feeRateExit != null) ? Number(trade.feeRateExit) : null,
+    fee_usd_real: (trade.feeUsdReal != null) ? Number(trade.feeUsdReal) : null,
+    profit_after_fees_real: (trade.profitAfterFeesReal != null) ? Number(trade.profitAfterFeesReal) : null,
     symbol: trade.symbol || 'BTCUSDT',
     open_time_iso: openedAt,
     close_time_iso: closedAt,
@@ -811,7 +823,10 @@ async function closeTrade(trade, market, closeReason, candleBucketMs, feeRate) {
   trade.profit_pct = trade.entryPrice > 0 ? (market - trade.entryPrice) / trade.entryPrice : null;
   trade.closedAt = nowIso();
 
-  const feeUsdEst = (trade.entryPrice * qty + market * qty) * (feeRate || 0);
+  // Fee estimation: allow per-side fee rates when available (maker/taker), otherwise fall back to feeRate.
+  const feeRateEntry = (trade.feeRateEntry != null) ? Number(trade.feeRateEntry) : (feeRate || 0);
+  const feeRateExit = (trade.feeRateExit != null) ? Number(trade.feeRateExit) : (feeRate || 0);
+  const feeUsdEst = (trade.entryPrice * qty) * feeRateEntry + (market * qty) * feeRateExit;
   trade.feeUsdEst = feeUsdEst;
 
   const reason = closeReason || buildCloseReason(trade, market);
