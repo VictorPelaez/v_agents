@@ -26,7 +26,13 @@ const axios = require('axios');
 require('dotenv').config();
 
 // Exchange helpers (spot v3 signed endpoints)
-const { mexcPublic, mexcSigned } = require('./exchange/mexc_spot_v3.cjs');
+const { createMexcSpotClient } = require('./exchange/mexc_spot_client.cjs');
+
+// Risk helpers
+const { evalSlPolicy } = require('./bot/sl_policy.cjs');
+
+// LIVE execution engine
+const { createLiveExecutorMexc } = require('./bot/live_executor_mexc.cjs');
 
 const {
   getClosedCloses,
@@ -146,6 +152,21 @@ const API_KEYS = {
 const ACTIVE_API_KEY = API_KEYS[EXCHANGE]?.key || '';
 const ACTIVE_API_SECRET = API_KEYS[EXCHANGE]?.secret || '';
 
+// Lazy-init MEXC client (only used in runMode=live paths)
+let _mexcClient = null;
+function getMexcClient() {
+  if (_mexcClient) return _mexcClient;
+  if (EXCHANGE !== 'mexc') throw new Error(`getMexcClient() called but EXCHANGE=${EXCHANGE}`);
+  if (!ACTIVE_API_KEY || !ACTIVE_API_SECRET) throw new Error('MEXC API keys not set (MEXC_API_KEY/MEXC_API_SECRET)');
+  _mexcClient = createMexcSpotClient({
+    baseUrl: getApiBase(),
+    apiKey: ACTIVE_API_KEY,
+    apiSecret: ACTIVE_API_SECRET,
+    timeoutMs: 2500,
+  });
+  return _mexcClient;
+}
+
 // Keys are not required for public endpoints. We keep compatibility but avoid hard-exit.
 const REQUIRE_KEYS = String(process.env.REQUIRE_KEYS || cfg.REQUIRE_KEYS || '0') === '1';
 if (REQUIRE_KEYS && (!ACTIVE_API_KEY || !ACTIVE_API_SECRET)) {
@@ -165,106 +186,14 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// --- MEXC Spot v3 helpers (signed endpoints) ---
-async function mexcBookTicker(symbol, timeoutMs) {
-  // Public endpoint
-  return mexcPublic({
-    baseUrl: getApiBase(),
-    method: 'GET',
-    path: '/api/v3/ticker/bookTicker',
-    params: { symbol },
-    timeoutMs: timeoutMs || 2500,
-  });
-}
-
-async function mexcPlaceOrder(params, timeoutMs) {
-  return mexcSigned({
-    baseUrl: getApiBase(),
-    method: 'POST',
-    path: '/api/v3/order',
-    params,
-    apiKey: ACTIVE_API_KEY,
-    apiSecret: ACTIVE_API_SECRET,
-    timeoutMs: timeoutMs || 2500,
-  });
-}
-
-async function mexcGetOrder(params, timeoutMs) {
-  return mexcSigned({
-    baseUrl: getApiBase(),
-    method: 'GET',
-    path: '/api/v3/order',
-    params,
-    apiKey: ACTIVE_API_KEY,
-    apiSecret: ACTIVE_API_SECRET,
-    timeoutMs: timeoutMs || 2500,
-  });
-}
-
-async function mexcCancelOrder(params, timeoutMs) {
-  return mexcSigned({
-    baseUrl: getApiBase(),
-    method: 'DELETE',
-    path: '/api/v3/order',
-    params,
-    apiKey: ACTIVE_API_KEY,
-    apiSecret: ACTIVE_API_SECRET,
-    timeoutMs: timeoutMs || 2500,
-  });
-}
-
-async function mexcOpenOrders(params, timeoutMs) {
-  return mexcSigned({
-    baseUrl: getApiBase(),
-    method: 'GET',
-    path: '/api/v3/openOrders',
-    params,
-    apiKey: ACTIVE_API_KEY,
-    apiSecret: ACTIVE_API_SECRET,
-    timeoutMs: timeoutMs || 2500,
-  });
-}
+// Exchange clients live in ./exchange/* and are initialized lazily via getMexcClient().
+// Generic helpers below are exchange-agnostic.
 
 function pickNum(obj, ...keys) {
   for (const k of keys) {
-    if (obj && obj[k] != null) {
-      const n = Number(obj[k]);
-      if (Number.isFinite(n)) return n;
-    }
-  }
-  return null;
-}
-
-function orderAvgFillPrice(order) {
-  const executedQty = pickNum(order, 'executedQty', 'executedQuantity', 'cumulativeQuantity');
-  const quoteQty = pickNum(order, 'cummulativeQuoteQty', 'cumulativeQuoteQty', 'cumulativeAmount');
-  if (executedQty && quoteQty) return quoteQty / executedQty;
-  const avg = pickNum(order, 'avgPrice');
-  return avg;
-}
-
-function isOrderFilled(order) {
-  const st = String(order?.status || '').toUpperCase();
-  return st === 'FILLED';
-}
-
-function isOrderActive(order) {
-  const st = String(order?.status || '').toUpperCase();
-  return st === 'NEW' || st === 'PARTIALLY_FILLED';
-}
-
-function isOrderCanceled(order) {
-  const st = String(order?.status || '').toUpperCase();
-  return st === 'CANCELED' || st === 'CANCELLED' || st === 'EXPIRED' || st === 'REJECTED';
-}
-
-async function waitForFill({ symbol, orderId, origClientOrderId, timeoutMs = 15000, pollMs = 500, httpTimeoutMs = 2500 }) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    const ord = await mexcGetOrder({ symbol, orderId, origClientOrderId }, httpTimeoutMs);
-    if (isOrderFilled(ord)) return ord;
-    if (isOrderCanceled(ord)) return ord;
-    await sleep(Math.max(50, pollMs));
+    const v = obj?.[k];
+    const n = (v == null) ? NaN : Number(v);
+    if (Number.isFinite(n)) return n;
   }
   return null;
 }
@@ -473,7 +402,9 @@ function normalizeOpenTrade(trade, candleBucketMs) {
     side: trade.type || 'LONG',
     qty: trade.size ?? 0,
     entry_price: trade.entryPrice ?? null,
-    sl: trade.stopLoss ?? null,
+    sl: (trade.stopLossClassic != null)
+      ? trade.stopLossClassic
+      : (trade.stopLoss != null ? trade.stopLoss : null),
     sl_classic: (trade.stopLossClassic != null) ? trade.stopLossClassic : null,
     sl_emergency: (trade.stopLossEmergency != null) ? trade.stopLossEmergency : null,
     tp: trade.takeProfit ?? null,
@@ -516,7 +447,9 @@ function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
     qty: trade.size ?? 0,
     entry_price: trade.entryPrice ?? null,
     exit_price: trade.exitPrice ?? null,
-    sl: trade.stopLoss ?? null,
+    sl: (trade.stopLossClassic != null)
+      ? trade.stopLossClassic
+      : (trade.stopLoss != null ? trade.stopLoss : null),
     sl_classic: (trade.stopLossClassic != null) ? trade.stopLossClassic : null,
     sl_emergency: (trade.stopLossEmergency != null) ? trade.stopLossEmergency : null,
     tp: trade.takeProfit ?? null,
@@ -983,8 +916,9 @@ async function closeTrade(trade, market, closeReason, candleBucketMs, feeRate) {
   trade.profit_pct = trade.entryPrice > 0 ? (market - trade.entryPrice) / trade.entryPrice : null;
   trade.closedAt = nowIso();
 
-  // Fee estimation: allow per-side fee rates when available (maker/taker), otherwise fall back to feeRate.
-  const feeRateEntry = (trade.feeRateEntry != null) ? Number(trade.feeRateEntry) : (feeRate || 0);
+  // Fee estimation: allow per-side fee rates when available (maker/taker).
+  // Default model (MEXC): maker 0%, taker FEE_RATE_TAKER (0.0005) applied **solo lado taker**.
+  const feeRateEntry = (trade.feeRateEntry != null) ? Number(trade.feeRateEntry) : 0;
   const feeRateExit = (trade.feeRateExit != null) ? Number(trade.feeRateExit) : (feeRate || 0);
   const feeUsdEst = (trade.entryPrice * qty) * feeRateEntry + (market * qty) * feeRateExit;
   trade.feeUsdEst = feeUsdEst;
@@ -1201,318 +1135,40 @@ async function gracefulShutdown(signal) {
 
   rebuildStateFromJournal();
 
-  // --- LIVE execution (simplified v1): maker entry with fallback taker + TP order on exchange ---
-  async function openTradeLive(trade, candleBucketMs, signalCooldownMs, verbose) {
-    const signalKey = getSignalKey(trade, candleBucketMs);
+  // Initialize exchange client lazily (only if we are truly in LIVE mode)
+  const mexc = (runMode === 'live') ? getMexcClient() : null;
 
-    if (hasOpenSignal(signalKey)) return false;
-    if (!canOpenSignal(signalKey, signalCooldownMs)) return false;
-
-    // Mark as seen immediately to avoid duplicate opens while the entry order is pending.
-    state.recentSignalSeenAt.set(signalKey, Date.now());
-
-    const sym = trade.symbol;
-
-    // 1) Entry maker (LIMIT_MAKER) near best bid
-    let entryExec = 'maker';
-    let entryFeeRate = feeRateMaker;
-    const entryClientId = `open_${LABEL}_${trade.id}`;
-
-    let entryOrder = null;
-    let entryOrderId = null;
-
-    try {
-      const bt = await mexcBookTicker(sym, HTTP_TIMEOUT_MS);
-      const bid = pickNum(bt, 'bidPrice', 'bid');
-      const price = (bid != null && bid > 0) ? bid : trade.entryPrice;
-
-      entryOrder = await mexcPlaceOrder({
-        symbol: sym,
-        side: 'BUY',
-        type: 'LIMIT_MAKER',
-        quantity: trade.size,
-        price,
-        newClientOrderId: entryClientId,
-      }, HTTP_TIMEOUT_MS);
-
-      entryOrderId = entryOrder?.orderId || entryOrder?.order_id || null;
-    } catch (e) {
-      // If maker placement fails (e.g., would be taker), we fallback below.
-      if (verbose) console.error('LIVE entry maker place failed:', e.message);
-    }
-
-    // Partial-fill aware entry handling
-    let makerOrd = null;
-    let makerExecQty = 0;
-    let makerAvg = null;
-
-    if (entryOrderId) {
-      makerOrd = await waitForFill({
-        symbol: sym,
-        orderId: entryOrderId,
-        origClientOrderId: entryClientId,
-        timeoutMs: MAKER_ENTRY_TIMEOUT_MS,
-        pollMs: ORDER_POLL_MS,
+  // --- LIVE execution engine (MEXC spot) ---
+  const liveExec = (runMode === 'live')
+    ? createLiveExecutorMexc({
+        mexc,
+        label: LABEL,
+        symbols,
+        candleBucketMs,
         httpTimeoutMs: HTTP_TIMEOUT_MS,
-      });
-      try {
-        const ordNow = makerOrd || await mexcGetOrder({ symbol: sym, orderId: entryOrderId, origClientOrderId: entryClientId }, HTTP_TIMEOUT_MS);
-        if (ordNow) makerOrd = ordNow;
-      } catch (_) {}
+        makerEntryTimeoutMs: MAKER_ENTRY_TIMEOUT_MS,
+        orderPollMs: ORDER_POLL_MS,
+        tpOnExchange: TP_ON_EXCHANGE,
+        feeRateMaker,
+        feeRateTaker,
+        state,
+        nowIso,
+        getSignalKey,
+        hasOpenSignal,
+        canOpenSignal,
+        getOpenEventKey,
+        persistJournalEvent,
+        normalizeOpenTrade,
+        closeTrade,
+        getTickerCached,
+        verbose: VERBOSE,
+        getOpenTradesArray,
+      })
+    : null;
 
-      makerExecQty = pickNum(makerOrd, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
-      makerAvg = orderAvgFillPrice(makerOrd);
-    }
-
-    let mktOrd = null;
-    let mktExecQty = 0;
-    let mktAvg = null;
-
-    const filledEnough = makerExecQty >= (trade.size * 0.999999);
-
-    if (!filledEnough) {
-      // Cancel any remaining maker quantity
-      try {
-        if (entryOrderId) {
-          await mexcCancelOrder({ symbol: sym, orderId: entryOrderId }, HTTP_TIMEOUT_MS);
-        }
-      } catch (_) {}
-
-      const remaining = Math.max(0, trade.size - makerExecQty);
-      if (remaining > 0) {
-        const mktClientId = `${entryClientId}_mkt`;
-        const mkt = await mexcPlaceOrder({
-          symbol: sym,
-          side: 'BUY',
-          type: 'MARKET',
-          quantity: remaining,
-          newClientOrderId: mktClientId,
-        }, HTTP_TIMEOUT_MS);
-
-        const mktOrderId = mkt?.orderId || mkt?.order_id || null;
-        mktOrd = mktOrderId
-          ? await waitForFill({ symbol: sym, orderId: mktOrderId, origClientOrderId: mktClientId, timeoutMs: 15000, pollMs: ORDER_POLL_MS, httpTimeoutMs: HTTP_TIMEOUT_MS })
-          : null;
-
-        mktExecQty = pickNum(mktOrd, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
-        mktAvg = orderAvgFillPrice(mktOrd);
-
-        entryOrderId = mktOrderId || entryOrderId;
-      }
-
-      entryExec = (makerExecQty > 0 && mktExecQty > 0) ? 'maker+fallback_taker' : 'fallback_taker';
-      entryFeeRate = feeRateTaker;
-    } else {
-      entryExec = 'maker';
-      entryFeeRate = feeRateMaker;
-    }
-
-    const execQty = makerExecQty + mktExecQty;
-    const quoteMaker = (makerAvg != null ? makerAvg : trade.entryPrice) * makerExecQty;
-    const quoteMkt = (mktAvg != null ? mktAvg : trade.entryPrice) * mktExecQty;
-    const avgEntry = execQty > 0 ? ((quoteMaker + quoteMkt) / execQty) : null;
-
-    if (!Number.isFinite(execQty) || execQty <= 0 || !Number.isFinite(avgEntry) || avgEntry <= 0) {
-      console.error('LIVE entry failed (no fills)', { symbol: sym, id: trade.id, entryOrderId });
-      return false;
-    }
-
-    // Update trade with actual execution details
-    trade.mode = 'live';
-    trade.executionEntry = entryExec;
-    trade.feeRateEntry = entryFeeRate;
-    trade.entryOrderId = entryOrderId;
-    trade.entryClientOrderId = entryClientId;
-
-    trade.size = execQty;
-    trade.entryPrice = avgEntry;
-    trade.openedAt = nowIso();
-
-    // 2) Place TP order on exchange (LIMIT sell). This is the "TP real" simplification.
-    if (TP_ON_EXCHANGE && trade.takeProfit && Number.isFinite(trade.takeProfit)) {
-      try {
-        const tpClientId = `tp_${LABEL}_${trade.id}`;
-        const tp = await mexcPlaceOrder({
-          symbol: sym,
-          side: 'SELL',
-          type: 'LIMIT',
-          quantity: trade.size,
-          price: trade.takeProfit,
-          timeInForce: 'GTC',
-          newClientOrderId: tpClientId,
-        }, HTTP_TIMEOUT_MS);
-
-        trade.tpOrderId = tp?.orderId || tp?.order_id || null;
-        trade.tpClientOrderId = tpClientId;
-      } catch (e) {
-        console.error('LIVE TP place failed:', e.message);
-        // We still open the position; TP can be managed by bot later.
-      }
-    }
-
-    const event = {
-      ts: nowIso(),
-      type: 'OPEN',
-      event_key: getOpenEventKey(trade, candleBucketMs),
-      trade: normalizeOpenTrade(trade, candleBucketMs),
-    };
-
-    const ok = persistJournalEvent(event);
-    if (!ok) return false;
-
-    console.log(
-      `OPEN (${trade.mode || 'live'}):`, trade.openedAt,
-      'id=', trade.id,
-      'symbol=', trade.symbol,
-      'entry=', trade.entryPrice,
-      'exec=', trade.executionEntry,
-      'entryOrderId=', trade.entryOrderId,
-      'tpOrderId=', trade.tpOrderId || '—'
-    );
-
-    return true;
-  }
-
-  function persistTradeUpdate(patch) {
-    try {
-      const id = patch?.id;
-      if (!id) return false;
-      const event = {
-        ts: nowIso(),
-        type: 'UPDATE',
-        event_key: `update:${LABEL}:${id}:${Date.now()}`,
-        trade: patch,
-      };
-      return persistJournalEvent(event);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  async function closeTradeLiveMarket(trade, closeReason) {
-    const sym = trade.symbol;
-
-    // Cancel TP if present
-    try {
-      if (trade.tpOrderId) {
-        await mexcCancelOrder({ symbol: sym, orderId: trade.tpOrderId }, HTTP_TIMEOUT_MS);
-      }
-    } catch (_) {}
-
-    const clientId = `close_${LABEL}_${trade.id}_${closeReason}`;
-    const mkt = await mexcPlaceOrder({
-      symbol: sym,
-      side: 'SELL',
-      type: 'MARKET',
-      quantity: trade.size,
-      newClientOrderId: clientId,
-    }, HTTP_TIMEOUT_MS);
-
-    const orderId = mkt?.orderId || mkt?.order_id || null;
-    const filled = orderId
-      ? await waitForFill({ symbol: sym, orderId, origClientOrderId: clientId, timeoutMs: 15000, pollMs: ORDER_POLL_MS, httpTimeoutMs: HTTP_TIMEOUT_MS })
-      : null;
-
-    const avgExit = orderAvgFillPrice(filled) ?? (await getTickerCached(sym, HTTP_TIMEOUT_MS, 0));
-
-    trade.mode = 'live';
-    trade.executionExit = 'taker';
-    trade.feeRateExit = feeRateTaker;
-
-    return closeTrade(trade, avgExit, closeReason, candleBucketMs, feeRateTaker);
-  }
-
-  async function reconcileLiveTpOrders() {
-    if (runMode !== 'live' || !TP_ON_EXCHANGE) return;
-
-    for (const sym of symbols) {
-      const openTrades = getOpenTradesArray(sym);
-
-      // Pull open orders once per symbol
-      let openOrders = [];
-      try {
-        const oo = await mexcOpenOrders({ symbol: sym }, HTTP_TIMEOUT_MS);
-        if (Array.isArray(oo)) openOrders = oo;
-        else if (Array.isArray(oo?.data)) openOrders = oo.data;
-        else if (Array.isArray(oo?.orders)) openOrders = oo.orders;
-      } catch (e) {
-        console.error('LIVE reconcile: openOrders fetch failed:', e.message);
-        continue;
-      }
-
-      // If no open trades in journal/state, cancel any stray TP orders created by this bot.
-      if (!openTrades.length) {
-        for (const o of openOrders) {
-          const clientId = String(o?.clientOrderId || o?.client_order_id || o?.origClientOrderId || o?.orig_client_order_id || '');
-          const orderId = o?.orderId || o?.order_id || null;
-          if (orderId && clientId.startsWith(`tp_${LABEL}_`)) {
-            try {
-              await mexcCancelOrder({ symbol: sym, orderId }, HTTP_TIMEOUT_MS);
-              console.log('LIVE reconcile: canceled stray TP order', { symbol: sym, orderId, clientId });
-            } catch (_) {}
-          }
-        }
-        continue;
-      }
-
-      // For each open trade, ensure we have a TP order attached.
-      for (const tr of openTrades) {
-        const expectedTpClientId = `tp_${LABEL}_${tr.id}`;
-
-        // Attach tpOrderId if missing (look in openOrders)
-        if (!tr.tpOrderId) {
-          const found = openOrders.find((o) => {
-            const clientId = String(o?.clientOrderId || o?.client_order_id || o?.origClientOrderId || o?.orig_client_order_id || '');
-            return clientId === expectedTpClientId;
-          });
-          if (found) {
-            tr.tpOrderId = found?.orderId || found?.order_id || null;
-            tr.tpClientOrderId = expectedTpClientId;
-            persistTradeUpdate({ id: tr.id, symbol: sym, tp_order_id: tr.tpOrderId, tp_client_order_id: tr.tpClientOrderId });
-            console.log('LIVE reconcile: attached existing TP order to trade', { id: tr.id, symbol: sym, tpOrderId: tr.tpOrderId });
-          }
-        }
-
-        // If we have a TP order id, check if it already filled while we were down.
-        if (tr.tpOrderId) {
-          try {
-            const tpOrd = await mexcGetOrder({ symbol: sym, orderId: tr.tpOrderId }, HTTP_TIMEOUT_MS);
-            if (isOrderFilled(tpOrd)) {
-              const exitP = orderAvgFillPrice(tpOrd) ?? null;
-              tr.mode = 'live';
-              tr.executionExit = 'maker';
-              tr.feeRateExit = feeRateMaker;
-              await closeTrade(tr, exitP, 'TP', candleBucketMs, feeRateMaker);
-              console.log('LIVE reconcile: TP already filled, journal close emitted', { id: tr.id, symbol: sym, tpOrderId: tr.tpOrderId });
-              continue;
-            }
-          } catch (_) {}
-        }
-
-        // If still no TP order, place a new one.
-        if (!tr.tpOrderId && tr.takeProfit && Number.isFinite(tr.takeProfit)) {
-          try {
-            const tp = await mexcPlaceOrder({
-              symbol: sym,
-              side: 'SELL',
-              type: 'LIMIT',
-              quantity: tr.size,
-              price: tr.takeProfit,
-              timeInForce: 'GTC',
-              newClientOrderId: expectedTpClientId,
-            }, HTTP_TIMEOUT_MS);
-
-            tr.tpOrderId = tp?.orderId || tp?.order_id || null;
-            tr.tpClientOrderId = expectedTpClientId;
-            persistTradeUpdate({ id: tr.id, symbol: sym, tp_order_id: tr.tpOrderId, tp_client_order_id: tr.tpClientOrderId });
-            console.log('LIVE reconcile: placed missing TP order', { id: tr.id, symbol: sym, tpOrderId: tr.tpOrderId });
-          } catch (e) {
-            console.error('LIVE reconcile: TP place failed:', e.message);
-          }
-        }
-      }
-    }
-  }
+  const openTradeLive = liveExec ? liveExec.openTradeLive : null;
+  const closeTradeLiveMarket = liveExec ? liveExec.closeTradeLiveMarket : null;
+  const reconcileLiveTpOrders = liveExec ? liveExec.reconcileLiveTpOrders : null;
 
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
@@ -1594,9 +1250,10 @@ async function gracefulShutdown(signal) {
           // LIVE: if TP order exists on exchange, check fill status first (even before minHold).
           if (runMode === 'live' && TP_ON_EXCHANGE && tr.tpOrderId) {
             try {
-              const tpOrd = await mexcGetOrder({ symbol: sym, orderId: tr.tpOrderId }, HTTP_TIMEOUT_MS);
-              if (isOrderFilled(tpOrd)) {
-                const exitP = orderAvgFillPrice(tpOrd) ?? market;
+              if (!mexc) throw new Error('mexc client not initialized');
+              const tpOrd = await mexc.getOrder({ symbol: sym, orderId: tr.tpOrderId }, HTTP_TIMEOUT_MS);
+              if (mexc.isOrderFilled(tpOrd)) {
+                const exitP = mexc.orderAvgFillPrice(tpOrd) ?? market;
                 tr.mode = 'live';
                 tr.executionExit = 'maker';
                 tr.feeRateExit = feeRateMaker;
@@ -1621,39 +1278,24 @@ async function gracefulShutdown(signal) {
             ? tr.stopLossEmergency
             : (tr.stopLoss != null ? tr.stopLoss : null);
 
-          // 1) Emergency SL (airbag)
-          if ((SL_POLICY === 'SOFT_CLASSIC_WITH_EMERGENCY' || SL_POLICY === 'EMERGENCY_ONLY')
-              && slEmergency != null
-              && market <= slEmergency) {
-            if (runMode === 'live') await closeTradeLiveMarket(tr, 'emergency_sl');
-            else await closeTrade(tr, market, 'emergency_sl', candleBucketMs, feeRate);
-            if (HALT_TRADING_ON_EMERGENCY) emergencyHaltYmd = getYmd(Date.now());
-            continue;
-          }
+          // SL policy evaluation (classic vs soft+emergency)
+          const slRes = evalSlPolicy({
+            slPolicy: SL_POLICY,
+            market,
+            slClassic,
+            slEmergency,
+            nowMs: Date.now(),
+            breachStartMs: tr._slBreachStartMs,
+            slConfirmSeconds: SL_CONFIRM_SECONDS,
+          });
 
-          // 2) Classic SL
-          if (SL_POLICY === 'CLASSIC') {
-            if (tr.stopLoss && market <= tr.stopLoss) {
-              if (runMode === 'live') await closeTradeLiveMarket(tr, 'SL');
-              else await closeTrade(tr, market, 'SL', candleBucketMs, feeRate);
-              continue;
-            }
-          } else if (SL_POLICY === 'SOFT_CLASSIC_WITH_EMERGENCY') {
-            if (slClassic != null && market <= slClassic) {
-              if (!tr._slBreachStartMs) tr._slBreachStartMs = Date.now();
-              const confirmMs = Math.max(0, SL_CONFIRM_SECONDS) * 1000;
-              if (confirmMs <= 0 || (Date.now() - tr._slBreachStartMs) >= confirmMs) {
-                if (runMode === 'live') await closeTradeLiveMarket(tr, 'SL');
-                else await closeTrade(tr, market, 'SL', candleBucketMs, feeRate);
-                tr._slBreachStartMs = null;
-                continue;
-              }
-            } else {
-              tr._slBreachStartMs = null;
-            }
-          } else {
-            // EMERGENCY_ONLY: no classic SL
-            tr._slBreachStartMs = null;
+          tr._slBreachStartMs = slRes.breachStartMs;
+
+          if (slRes.closeReason) {
+            if (runMode === 'live') await closeTradeLiveMarket(tr, slRes.closeReason);
+            else await closeTrade(tr, market, slRes.closeReason, candleBucketMs, feeRate);
+            if (slRes.emergency && HALT_TRADING_ON_EMERGENCY) emergencyHaltYmd = getYmd(Date.now());
+            continue;
           }
 
           // 3) Take profit fallback (only if no TP on exchange)
@@ -2076,7 +1718,7 @@ async function gracefulShutdown(signal) {
 
 
         const didOpen = (runMode === 'live')
-          ? await openTradeLive(trade, candleBucketMs, signalCooldownMs, VERBOSE)
+          ? await openTradeLive(trade, signalCooldownMs)
           : await openTrade(trade, candleBucketMs, signalCooldownMs, VERBOSE);
         if (didOpen) {
           rt.lastTradeCandleMinute = candleMinute;
