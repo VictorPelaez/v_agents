@@ -203,11 +203,129 @@ function detectMarketRegime({ atrPct, realizedVol, smaSlope, lastClose, priceAbo
   };
 }
 
+/* -----------------------------
+ * Extra indicators (Phase A)
+ * ----------------------------- */
+
+// Donchian channel on CLOSED candles (exclude current in-progress)
+function computeDonchian(klines, window) {
+  const n = Math.max(2, parseInt(window || 20, 10));
+  const closed = Array.isArray(klines) ? klines.slice(0, Math.max(0, klines.length - 1)) : [];
+  if (closed.length < n) return { high: null, low: null };
+  const slice = closed.slice(-n);
+  let hi = -Infinity;
+  let lo = Infinity;
+  for (const k of slice) {
+    const h = safeNum(k?.[2]);
+    const l = safeNum(k?.[3]);
+    if (h == null || l == null) return { high: null, low: null };
+    if (h > hi) hi = h;
+    if (l < lo) lo = l;
+  }
+  return { high: hi, low: lo };
+}
+
+// ADX (+DI/-DI) on CLOSED candles, Wilder's smoothing (simplified, stable)
+function computeAdx(klines, window) {
+  const n = Math.max(5, parseInt(window || 14, 10));
+  const closed = Array.isArray(klines) ? klines.slice(0, Math.max(0, klines.length - 1)) : [];
+  // Need at least n+1 candles to form n periods of deltas
+  if (closed.length < n + 1) return { adx: null, diPlus: null, diMinus: null };
+
+  // Build arrays for last n periods
+  const trs = [];
+  const dmPlus = [];
+  const dmMinus = [];
+
+  for (let i = closed.length - n; i < closed.length; i++) {
+    const cur = closed[i];
+    const prev = closed[i - 1];
+    const high = safeNum(cur?.[2]);
+    const low = safeNum(cur?.[3]);
+    const prevHigh = safeNum(prev?.[2]);
+    const prevLow = safeNum(prev?.[3]);
+    const prevClose = safeNum(prev?.[4]);
+    if ([high, low, prevHigh, prevLow, prevClose].some(v => v == null)) {
+      return { adx: null, diPlus: null, diMinus: null };
+    }
+
+    const upMove = high - prevHigh;
+    const downMove = prevLow - low;
+
+    const plus = (upMove > downMove && upMove > 0) ? upMove : 0;
+    const minus = (downMove > upMove && downMove > 0) ? downMove : 0;
+
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    );
+
+    trs.push(tr);
+    dmPlus.push(plus);
+    dmMinus.push(minus);
+  }
+
+  const trSum = trs.reduce((a, b) => a + b, 0);
+  if (!(trSum > 0)) return { adx: 0, diPlus: 0, diMinus: 0 };
+
+  const diPlus = 100 * (dmPlus.reduce((a, b) => a + b, 0) / trSum);
+  const diMinus = 100 * (dmMinus.reduce((a, b) => a + b, 0) / trSum);
+  const dx = (diPlus + diMinus) > 0 ? (100 * Math.abs(diPlus - diMinus) / (diPlus + diMinus)) : 0;
+
+  // NOTE: Full ADX is an EMA of DX over n periods.
+  // For Phase A logging we use a stable approximation: report DX as "adx".
+  // If we adopt it for decisions later, we should implement the full Wilder smoothing.
+  return { adx: dx, diPlus, diMinus };
+}
+
+// Supertrend (basic) on CLOSED candles; returns { value, dir }
+// dir: 1 bullish, -1 bearish
+function computeSupertrend(klines, atrWindow, multiplier) {
+  const m = Number.isFinite(Number(multiplier)) ? Number(multiplier) : 3;
+  const w = Math.max(2, parseInt(atrWindow || 10, 10));
+  const closed = Array.isArray(klines) ? klines.slice(0, Math.max(0, klines.length - 1)) : [];
+  if (closed.length < w + 2) return { value: null, dir: null };
+
+  // Compute ATR (simple mean of TR) over last w periods
+  const trs = [];
+  for (let i = closed.length - w; i < closed.length; i++) {
+    const cur = closed[i];
+    const prev = closed[i - 1];
+    const high = safeNum(cur?.[2]);
+    const low = safeNum(cur?.[3]);
+    const prevClose = safeNum(prev?.[4]);
+    if ([high, low, prevClose].some(v => v == null)) return { value: null, dir: null };
+    trs.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+  }
+  const atr = mean(trs);
+
+  const last = closed[closed.length - 1];
+  const high = safeNum(last?.[2]);
+  const low = safeNum(last?.[3]);
+  const close = safeNum(last?.[4]);
+  if ([high, low, close].some(v => v == null)) return { value: null, dir: null };
+
+  const hl2 = (high + low) / 2;
+  const upperBasic = hl2 + m * atr;
+  const lowerBasic = hl2 - m * atr;
+
+  // For Phase A (logging), we approximate final bands without full recursion.
+  // Direction is inferred from close vs mid-band.
+  const dir = close >= hl2 ? 1 : -1;
+  const value = (dir === 1) ? lowerBasic : upperBasic;
+
+  return { value, dir };
+}
+
 module.exports = {
   clamp,
   getClosedCloses,
   computeSmaPair,
   computeAtr,
   computeRealizedVol,
-  detectMarketRegime
+  detectMarketRegime,
+  computeDonchian,
+  computeAdx,
+  computeSupertrend
 };

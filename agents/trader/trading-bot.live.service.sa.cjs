@@ -39,7 +39,10 @@ const {
   computeSmaPair,
   computeAtr,
   computeRealizedVol,
-  detectMarketRegime
+  detectMarketRegime,
+  computeDonchian,
+  computeAdx,
+  computeSupertrend
 } = require('./market-regime.sa.cjs');
 
 /* -----------------------------
@@ -997,6 +1000,7 @@ async function gracefulShutdown(signal) {
   const maxPositions = parseInt(process.env.MAX_POSITIONS || cfgLive.MAX_POSITIONS || 1, 10);
   const minHoldS = parseInt(process.env.MIN_HOLD_SECONDS || cfgLive.MIN_HOLD_SECONDS || '60', 10);
   const timeStopMinutes = parseInt(process.env.TIME_STOP_MINUTES || cfgLive.TIME_STOP_MINUTES || 10, 10);
+
   const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || cfgLive.HTTP_TIMEOUT_MS || 2500, 10);
   const candleBucketMs = parseInt(process.env.SIGNAL_BUCKET_MS || cfgLive.SIGNAL_BUCKET_MS || cfgLive.CANDLE_MS || 60000, 10);
   const signalCooldownMs = parseInt(process.env.SIGNAL_COOLDOWN_MS || cfgLive.SIGNAL_COOLDOWN_MS || 180000, 10);
@@ -1067,6 +1071,27 @@ async function gracefulShutdown(signal) {
   const feeRateTaker = parseFloat(process.env.FEE_RATE_TAKER || cfgLive.FEE_RATE_TAKER || feeRate);
   const ATR_WINDOW = parseInt(process.env.ATR_WINDOW || cfgLive.ATR_WINDOW || 14, 10);
   const MIN_ATR_PCT = parseFloat(process.env.MIN_ATR_PCT || cfgLive.MIN_ATR_PCT || 0);
+
+  // Extra indicator configs (Phase B)
+  const USE_ADX_FILTER = (process.env.USE_ADX_FILTER != null)
+    ? String(process.env.USE_ADX_FILTER) === '1'
+    : !!cfgLive.USE_ADX_FILTER;
+  const ADX_WINDOW = parseInt(process.env.ADX_WINDOW || cfgLive.ADX_WINDOW || 14, 10);
+  const MIN_ADX = parseFloat(process.env.MIN_ADX || cfgLive.MIN_ADX || 0);
+  const ADX_REQUIRE_DI_BULL = (process.env.ADX_REQUIRE_DI_BULL != null)
+    ? String(process.env.ADX_REQUIRE_DI_BULL) === '1'
+    : (cfgLive.ADX_REQUIRE_DI_BULL !== undefined ? !!cfgLive.ADX_REQUIRE_DI_BULL : true);
+
+  const USE_DONCHIAN_FILTER = (process.env.USE_DONCHIAN_FILTER != null)
+    ? String(process.env.USE_DONCHIAN_FILTER) === '1'
+    : !!cfgLive.USE_DONCHIAN_FILTER;
+  const DONCHIAN_N = parseInt(process.env.DONCHIAN_N || cfgLive.DONCHIAN_N || 20, 10);
+
+  const USE_SUPERTREND_FILTER = (process.env.USE_SUPERTREND_FILTER != null)
+    ? String(process.env.USE_SUPERTREND_FILTER) === '1'
+    : !!cfgLive.USE_SUPERTREND_FILTER;
+  const SUPERTREND_ATR_WINDOW = parseInt(process.env.SUPERTREND_ATR_WINDOW || cfgLive.SUPERTREND_ATR_WINDOW || 10, 10);
+  const SUPERTREND_MULT = parseFloat(process.env.SUPERTREND_MULT || cfgLive.SUPERTREND_MULT || 3.0);
 
   // ATR adaptive (per symbol): require ATR% to be above a percentile of its own recent history.
   // This makes the filter scale naturally across BTC vs alts.
@@ -1247,6 +1272,12 @@ async function gracefulShutdown(signal) {
         for (const tr of openTrades) {
           const ageS = (Date.now() - new Date(tr.openedAt).getTime()) / 1000;
 
+          // Track MFE (max favorable excursion) using ticker
+          if (!Number.isFinite(tr._maxPriceSinceOpen)) tr._maxPriceSinceOpen = tr.entryPrice;
+          if (Number.isFinite(market) && Number.isFinite(tr._maxPriceSinceOpen)) {
+            tr._maxPriceSinceOpen = Math.max(tr._maxPriceSinceOpen, market);
+          }
+
           // LIVE: if TP order exists on exchange, check fill status first (even before minHold).
           if (runMode === 'live' && TP_ON_EXCHANGE && tr.tpOrderId) {
             try {
@@ -1272,6 +1303,41 @@ async function gracefulShutdown(signal) {
           }
 
           if (ageS < minHoldS) continue;
+
+          // Fail-fast: if after N minutes we haven't achieved minimal MFE, exit and free capital
+          if (FAIL_FAST_ENABLED && FAIL_FAST_MINUTES > 0 && FAIL_FAST_MIN_MFE_PCT > 0) {
+            const ageMin = ageS / 60;
+            const mfePct = (Number.isFinite(tr._maxPriceSinceOpen) && Number.isFinite(tr.entryPrice) && tr.entryPrice > 0)
+              ? ((tr._maxPriceSinceOpen - tr.entryPrice) / tr.entryPrice)
+              : 0;
+            // Only fail-fast if we are not in profit now (avoid cutting a trade that just started moving)
+            const inProfitNow = (Number.isFinite(market) && Number.isFinite(tr.entryPrice)) ? (market > tr.entryPrice) : false;
+            if (ageMin >= FAIL_FAST_MINUTES && !inProfitNow && mfePct < FAIL_FAST_MIN_MFE_PCT) {
+              if (runMode === 'live') await closeTradeLiveMarket(tr, 'fail_fast_mfe');
+              else await closeTrade(tr, market, 'fail_fast_mfe', candleBucketMs, feeRate);
+              continue;
+            }
+          }
+
+          // Exit on supertrend flip (uses last computed indicator snapshot from decisionBySymbol)
+          if (EXIT_ON_SUPERTREND_FLIP) {
+            const dec = state.decisionBySymbol.get(sym);
+            if (dec && dec.supertrendDir === -1) {
+              const mfePct2 = (Number.isFinite(tr._maxPriceSinceOpen) && Number.isFinite(tr.entryPrice) && tr.entryPrice > 0)
+                ? ((tr._maxPriceSinceOpen - tr.entryPrice) / tr.entryPrice)
+                : 0;
+              const inProfitNow2 = (Number.isFinite(market) && Number.isFinite(tr.entryPrice)) ? (market > tr.entryPrice) : false;
+              const allowFlipExit = (!ST_FLIP_REQUIRE_ADVANTAGE)
+                ? true
+                : (inProfitNow2 || (Number.isFinite(mfePct2) && mfePct2 >= ST_FLIP_MIN_MFE_PCT));
+
+              if (allowFlipExit) {
+                if (runMode === 'live') await closeTradeLiveMarket(tr, 'st_flip');
+                else await closeTrade(tr, market, 'st_flip', candleBucketMs, feeRate);
+                continue;
+              }
+            }
+          }
 
           const slClassic = (tr.stopLossClassic != null) ? tr.stopLossClassic : null;
           const slEmergency = (tr.stopLossEmergency != null)
@@ -1433,6 +1499,33 @@ async function gracefulShutdown(signal) {
 
         const realizedVol = computeRealizedVol(closes, Math.min(60, Math.max(20, Math.floor(SMA_WINDOW / 2))));
 
+        // Extra indicators
+        const adxInfo = computeAdx(klines, ADX_WINDOW);
+
+        const donch = computeDonchian(klines, DONCHIAN_N);
+        // Prior Donchian window (exclude the current closed candle) to avoid lookahead.
+        let donchPrevHigh = null;
+        let donchPrevLow = null;
+        try {
+          const closed = Array.isArray(klines) ? klines.slice(0, Math.max(0, klines.length - 1)) : [];
+          if (closed.length >= DONCHIAN_N + 1) {
+            const slice = closed.slice(-(DONCHIAN_N + 1), -1);
+            let hi = -Infinity;
+            let lo = Infinity;
+            for (const k of slice) {
+              const h = Number(k?.[2]);
+              const l = Number(k?.[3]);
+              if (!Number.isFinite(h) || !Number.isFinite(l)) { hi = -Infinity; lo = Infinity; break; }
+              if (h > hi) hi = h;
+              if (l < lo) lo = l;
+            }
+            if (hi !== -Infinity) donchPrevHigh = hi;
+            if (lo !== Infinity) donchPrevLow = lo;
+          }
+        } catch (_) {}
+
+        const st = computeSupertrend(klines, SUPERTREND_ATR_WINDOW, SUPERTREND_MULT);
+
         const regimeInfo = detectMarketRegime({
           atrPct: atrPctNum,
           realizedVol,
@@ -1480,6 +1573,22 @@ async function gracefulShutdown(signal) {
 
         const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= dynamicMaxMomentum;
 
+        const adxOk = (!USE_ADX_FILTER || !(MIN_ADX > 0))
+          ? true
+          : (adxInfo.adx != null && Number.isFinite(adxInfo.adx) && adxInfo.adx >= MIN_ADX);
+
+        const diBullOk = (!USE_ADX_FILTER || !ADX_REQUIRE_DI_BULL)
+          ? true
+          : (adxInfo.diPlus != null && adxInfo.diMinus != null && adxInfo.diPlus > adxInfo.diMinus);
+
+        const donchBreakoutUp = (!USE_DONCHIAN_FILTER)
+          ? true
+          : (donchPrevHigh != null && Number.isFinite(donchPrevHigh) && candle.close > donchPrevHigh);
+
+        const supertrendOk = (!USE_SUPERTREND_FILTER)
+          ? true
+          : (st.dir === 1);
+
         const shouldEnter = atrOk &&
           slopeNormOk &&
           momentumOk &&
@@ -1487,6 +1596,10 @@ async function gracefulShutdown(signal) {
           priceNearSMA &&
           priceAboveSMA &&
           volumeOk &&
+          adxOk &&
+          diBullOk &&
+          donchBreakoutUp &&
+          supertrendOk &&
           !weakCandleBody &&
           !weakOpen &&
           !candleExplosive;
@@ -1508,6 +1621,13 @@ async function gracefulShutdown(signal) {
           min_atr_pct: Number((minAtrEffective || 0).toFixed(6)),
           atrOk: !!atrOk,
           realized_vol: Number((realizedVol || 0).toFixed(6)),
+          adx: (adxInfo.adx == null ? null : Number(adxInfo.adx.toFixed(2))),
+          diPlus: (adxInfo.diPlus == null ? null : Number(adxInfo.diPlus.toFixed(2))),
+          diMinus: (adxInfo.diMinus == null ? null : Number(adxInfo.diMinus.toFixed(2))),
+          donchHigh: (donch.high == null ? null : Number(donch.high.toFixed(2))),
+          donchLow: (donch.low == null ? null : Number(donch.low.toFixed(2))),
+          supertrendDir: (st.dir == null ? null : st.dir),
+          supertrend: (st.value == null ? null : Number(st.value.toFixed(2))),
           min_slope_norm: Number((minSlopeNormEff || 0).toFixed(3)),
           slopeNormOk: !!slopeNormOk,
           regime,
@@ -1522,6 +1642,10 @@ async function gracefulShutdown(signal) {
           weakCandleBody: !!weakCandleBody,
           weakOpen: !!weakOpen,
           candleExplosive: !!candleExplosive,
+          adxOk: !!adxOk,
+          diBullOk: !!diBullOk,
+          donchBreakoutUp: !!donchBreakoutUp,
+          supertrendOk: !!supertrendOk,
           shouldEnter: !!shouldEnter,
           effective_min_momentum: Number(effectiveMinMom.toFixed(6)),
           green_run
@@ -1554,12 +1678,21 @@ async function gracefulShutdown(signal) {
             'min_slope_norm=' + decision.min_slope_norm,
             'slopeNormOk=' + (decision.slopeNormOk ? 1 : 0),
             'rv=' + decision.realized_vol,
+            'adx=' + (decision.adx == null ? 'null' : decision.adx),
+            'di+=' + (decision.diPlus == null ? 'null' : decision.diPlus),
+            'di-=' + (decision.diMinus == null ? 'null' : decision.diMinus),
+            'donchH=' + (decision.donchHigh == null ? 'null' : decision.donchHigh),
+            'donchL=' + (decision.donchLow == null ? 'null' : decision.donchLow),
+            'stDir=' + (decision.supertrendDir == null ? 'null' : decision.supertrendDir),
             'regime=' + decision.regime,
             'micro=' + decision.microRegime,
             'priceNearSMA=' + (decision.priceNearSMA ? 1 : 0),
             'priceAboveSMA=' + (decision.priceAboveSMA ? 1 : 0),
             'trendUp=' + (decision.trendUp ? 1 : 0),
             'momentumOk=' + (momentumOk ? 1 : 0),
+            'adxOk=' + (adxOk ? 1 : 0),
+            'donchOk=' + (donchBreakoutUp ? 1 : 0),
+            'stOk=' + (supertrendOk ? 1 : 0),
             'weakBody=' + (weakCandleBody ? 1 : 0),
             'weakOpen=' + (weakOpen ? 1 : 0),
             'explosive=' + (candleExplosive ? 1 : 0),
