@@ -161,11 +161,16 @@ function detectMarketRegime({ atrPct, realizedVol, smaSlope, lastClose, priceAbo
   if (a > 0.00110 || rv > 0.00100) volRegime = 'HIGH_VOL';
 
   // --- Micro regime (trend/chop) ---
+  // NOTE (2026-03-18): thresholds tuned for 1m trading. The previous (0.30/0.80)
+  // labeled almost everything as CHOPPY because SMA(60) slope is very smooth.
+  const CHOPPY_SLOPE_NORM = 0.12;
+  const TRENDING_SLOPE_NORM = 0.45;
+
   let microRegime = 'NORMAL';
   // CHOPPY: slope too small relative to ATR (no directional edge)
-  if (slopeNorm < 0.30) microRegime = 'CHOPPY';
+  if (slopeNorm < CHOPPY_SLOPE_NORM) microRegime = 'CHOPPY';
   // TRENDING: strong slope relative to ATR; only meaningful if slope aligns with long bias
-  if (slopeNorm > 0.80 && slope > 0 && !!priceAboveSma) microRegime = 'TRENDING';
+  if (slopeNorm > TRENDING_SLOPE_NORM && slope > 0 && !!priceAboveSma) microRegime = 'TRENDING';
 
   // --- Multipliers (bounded) ---
   // kMinMomentum / kMinSlope scale the thresholds.
@@ -197,7 +202,8 @@ function detectMarketRegime({ atrPct, realizedVol, smaSlope, lastClose, priceAbo
   return {
     volRegime,
     microRegime,
-    slopeNorm: Number(slopeNorm.toFixed(3)),
+    // Return full precision; callers can round for logging.
+    slopeNorm,
     kMinMomentum,
     kMinSlope
   };

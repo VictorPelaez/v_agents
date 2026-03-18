@@ -411,6 +411,14 @@ function normalizeOpenTrade(trade, candleBucketMs) {
     sl_classic: (trade.stopLossClassic != null) ? trade.stopLossClassic : null,
     sl_emergency: (trade.stopLossEmergency != null) ? trade.stopLossEmergency : null,
     tp: trade.takeProfit ?? null,
+    // Scale-out TP (additive)
+    scale_tp_enabled: !!trade.scaleTpEnabled,
+    tp1: (trade.tp1Price != null) ? trade.tp1Price : null,
+    tp2: (trade.tp2Price != null) ? trade.tp2Price : (trade.takeProfit ?? null),
+    tp1_frac: (trade.tp1Frac != null) ? trade.tp1Frac : null,
+    tp1_hit: !!trade.tp1Hit,
+    realized_gross: (trade.realizedGross != null) ? Number(trade.realizedGross) : null,
+    realized_fee_usd_est: (trade.realizedFeeUsdEst != null) ? Number(trade.realizedFeeUsdEst) : null,
     reason_tag: trade.reasonTag || '',
     reason_details: trade.reasonDetails || {},
     exposure_usd: trade.exposureUSD ?? null,
@@ -456,6 +464,15 @@ function normalizeCloseTrade(trade, closeReason, candleBucketMs) {
     sl_classic: (trade.stopLossClassic != null) ? trade.stopLossClassic : null,
     sl_emergency: (trade.stopLossEmergency != null) ? trade.stopLossEmergency : null,
     tp: trade.takeProfit ?? null,
+    // Scale-out TP (additive)
+    scale_tp_enabled: !!trade.scaleTpEnabled,
+    tp1: (trade.tp1Price != null) ? trade.tp1Price : null,
+    tp2: (trade.tp2Price != null) ? trade.tp2Price : (trade.takeProfit ?? null),
+    tp1_frac: (trade.tp1Frac != null) ? trade.tp1Frac : null,
+    tp1_hit: !!trade.tp1Hit,
+    realized_gross: (trade.realizedGross != null) ? Number(trade.realizedGross) : null,
+    realized_fee_usd_est: (trade.realizedFeeUsdEst != null) ? Number(trade.realizedFeeUsdEst) : null,
+
     profit: trade.profit ?? null,
     profit_pct: trade.profit_pct ?? null,
     fee_usd_est: trade.feeUsdEst ?? null,
@@ -914,8 +931,11 @@ async function closeTrade(trade, market, closeReason, candleBucketMs, feeRate) {
   }
 
   const qty = Number(trade.size || 0);
+  const realizedGross = Number(trade.realizedGross || 0);
+  const realizedFeeUsdEst = Number(trade.realizedFeeUsdEst || 0);
+
   trade.exitPrice = market;
-  trade.profit = (market - trade.entryPrice) * qty;
+  trade.profit = realizedGross + (market - trade.entryPrice) * qty;
   trade.profit_pct = trade.entryPrice > 0 ? (market - trade.entryPrice) / trade.entryPrice : null;
   trade.closedAt = nowIso();
 
@@ -923,7 +943,7 @@ async function closeTrade(trade, market, closeReason, candleBucketMs, feeRate) {
   // Default model (MEXC): maker 0%, taker FEE_RATE_TAKER (0.0005) applied **solo lado taker**.
   const feeRateEntry = (trade.feeRateEntry != null) ? Number(trade.feeRateEntry) : 0;
   const feeRateExit = (trade.feeRateExit != null) ? Number(trade.feeRateExit) : (feeRate || 0);
-  const feeUsdEst = (trade.entryPrice * qty) * feeRateEntry + (market * qty) * feeRateExit;
+  const feeUsdEst = realizedFeeUsdEst + (trade.entryPrice * qty) * feeRateEntry + (market * qty) * feeRateExit;
   trade.feeUsdEst = feeUsdEst;
 
   const reason = closeReason || buildCloseReason(trade, market);
@@ -951,6 +971,70 @@ async function closeTrade(trade, market, closeReason, candleBucketMs, feeRate) {
     'profit%=', trade.profit_pct,
     'feeUsdEst=', feeUsdEst,
     'profit_after_fees_est=', trade.profit - feeUsdEst
+  );
+
+  return true;
+}
+
+async function partialTp1(trade, market, candleBucketMs) {
+  if (!trade || !isValidNumber(market) || !isValidNumber(trade.entryPrice)) return false;
+  if (!trade.scaleTpEnabled || trade.tp1Hit) return false;
+  if (!isValidNumber(trade.tp1Price) || !isValidNumber(trade.tp1Frac)) return false;
+  if (market < trade.tp1Price) return false;
+
+  const qtyTotal = Number(trade.size || 0);
+  if (!isValidNumber(qtyTotal) || qtyTotal <= 0) return false;
+
+  // Close TP1_FRAC of the position.
+  const qtyClose = Number((qtyTotal * trade.tp1Frac).toFixed(8));
+  const qtyRemain = Number((qtyTotal - qtyClose).toFixed(8));
+  if (qtyClose <= 0 || qtyRemain <= 0) return false;
+
+  const gross = (market - trade.entryPrice) * qtyClose;
+  // PAPER assumption: TP1 is maker (fee 0). (LIVE implementation will place post-only orders.)
+  const feeUsdEst = 0;
+  const net = gross - feeUsdEst;
+
+  trade.tp1Hit = true;
+  trade.realizedGross = Number((Number(trade.realizedGross || 0) + gross).toFixed(10));
+  trade.realizedFeeUsdEst = Number((Number(trade.realizedFeeUsdEst || 0) + feeUsdEst).toFixed(10));
+  trade.size = qtyRemain;
+  trade.exposureUSD = Number((trade.entryPrice * qtyRemain).toFixed(2));
+
+  const event = {
+    ts: nowIso(),
+    type: 'PARTIAL_TP1',
+    event_key: `partial_tp1:${LABEL}:${String(trade.id)}`,
+    trade: {
+      id: trade.id,
+      label: LABEL,
+      symbol: trade.symbol,
+      tp1_price: trade.tp1Price,
+      tp2_price: trade.takeProfit ?? null,
+      tp1_frac: trade.tp1Frac,
+      qty_closed: qtyClose,
+      qty_remaining: qtyRemain,
+      entry_price: trade.entryPrice,
+      exit_price: market,
+      gross,
+      net,
+      signal_key: getSignalKey(trade, candleBucketMs),
+    }
+  };
+
+  const ok = persistJournalEvent(event);
+  if (!ok) return false;
+
+  console.log(
+    'PARTIAL_TP1:',
+    'id=', trade.id,
+    'symbol=', trade.symbol,
+    'entry=', trade.entryPrice,
+    'exit=', market,
+    'qty_closed=', qtyClose,
+    'qty_remaining=', qtyRemain,
+    'gross=', gross,
+    'net=', net
   );
 
   return true;
@@ -1059,6 +1143,14 @@ async function gracefulShutdown(signal) {
   const k_tp = parseFloat(process.env.K_TP || cfgLive.K_TP || '2.0');
   const k_sl = parseFloat(process.env.K_SL || cfgLive.K_SL || '1.2');
 
+  // Scale-out TP (PAPER now; LIVE integration later)
+  const SCALE_TP_ENABLED = (process.env.SCALE_TP_ENABLED != null)
+    ? String(process.env.SCALE_TP_ENABLED) === '1'
+    : !!cfgLive.SCALE_TP_ENABLED;
+  const TP1_PCT = parseFloat(process.env.TP1_PCT || cfgLive.TP1_PCT || 0);
+  const TP1_FRAC = parseFloat(process.env.TP1_FRAC || cfgLive.TP1_FRAC || 0);
+
+
   const BASE_MIN_MOM = parseFloat(process.env.MIN_MOMENTUM_PCT || cfgLive.MIN_MOMENTUM_PCT || 0.0005);
   const MAX_MOMENTUM_PCT = parseFloat(process.env.MAX_MOMENTUM_PCT || cfgLive.MAX_MOMENTUM_PCT || 0.0012);
 
@@ -1105,6 +1197,16 @@ async function gracefulShutdown(signal) {
   // Optional: require market to be non-choppy by slope-normalization (abs(smaSlope) / (ATR_abs)).
   // Example: 0.30 matches the boundary used by detectMarketRegime() for CHOPPY.
   const MIN_SLOPE_NORM = parseFloat(process.env.MIN_SLOPE_NORM || cfgLive.MIN_SLOPE_NORM || 0);
+
+  const SKIP_LOW_VOL = (process.env.SKIP_LOW_VOL != null)
+    ? String(process.env.SKIP_LOW_VOL) === '1'
+    : !!cfgLive.SKIP_LOW_VOL;
+  const SKIP_CHOPPY = (process.env.SKIP_CHOPPY != null)
+    ? String(process.env.SKIP_CHOPPY) === '1'
+    : !!cfgLive.SKIP_CHOPPY;
+  const SKIP_CHOPPY_ONLY_IF_LOW_VOL = (process.env.SKIP_CHOPPY_ONLY_IF_LOW_VOL != null)
+    ? String(process.env.SKIP_CHOPPY_ONLY_IF_LOW_VOL) === '1'
+    : !!cfgLive.SKIP_CHOPPY_ONLY_IF_LOW_VOL;
 
   // Optional per-symbol override (multi-coin friendly):
   //   MIN_SLOPE_NORM_BY_SYMBOL: { "BTCUSDT": 0.10, "XRPUSDT": 0.06 }
@@ -1272,11 +1374,6 @@ async function gracefulShutdown(signal) {
         for (const tr of openTrades) {
           const ageS = (Date.now() - new Date(tr.openedAt).getTime()) / 1000;
 
-          // Track MFE (max favorable excursion) using ticker
-          if (!Number.isFinite(tr._maxPriceSinceOpen)) tr._maxPriceSinceOpen = tr.entryPrice;
-          if (Number.isFinite(market) && Number.isFinite(tr._maxPriceSinceOpen)) {
-            tr._maxPriceSinceOpen = Math.max(tr._maxPriceSinceOpen, market);
-          }
 
           // LIVE: if TP order exists on exchange, check fill status first (even before minHold).
           if (runMode === 'live' && TP_ON_EXCHANGE && tr.tpOrderId) {
@@ -1296,6 +1393,11 @@ async function gracefulShutdown(signal) {
             }
           }
 
+          // PAPER: scale-out TP1 partial (maker assumed).
+          if (runMode !== 'live' && tr.scaleTpEnabled && !tr.tp1Hit) {
+            await partialTp1(tr, market, candleBucketMs);
+          }
+
           if (ageS > timeStopMinutes * 60) {
             if (runMode === 'live') await closeTradeLiveMarket(tr, 'time_stop');
             else await closeTrade(tr, market, 'time_stop', candleBucketMs, feeRate);
@@ -1304,40 +1406,6 @@ async function gracefulShutdown(signal) {
 
           if (ageS < minHoldS) continue;
 
-          // Fail-fast: if after N minutes we haven't achieved minimal MFE, exit and free capital
-          if (FAIL_FAST_ENABLED && FAIL_FAST_MINUTES > 0 && FAIL_FAST_MIN_MFE_PCT > 0) {
-            const ageMin = ageS / 60;
-            const mfePct = (Number.isFinite(tr._maxPriceSinceOpen) && Number.isFinite(tr.entryPrice) && tr.entryPrice > 0)
-              ? ((tr._maxPriceSinceOpen - tr.entryPrice) / tr.entryPrice)
-              : 0;
-            // Only fail-fast if we are not in profit now (avoid cutting a trade that just started moving)
-            const inProfitNow = (Number.isFinite(market) && Number.isFinite(tr.entryPrice)) ? (market > tr.entryPrice) : false;
-            if (ageMin >= FAIL_FAST_MINUTES && !inProfitNow && mfePct < FAIL_FAST_MIN_MFE_PCT) {
-              if (runMode === 'live') await closeTradeLiveMarket(tr, 'fail_fast_mfe');
-              else await closeTrade(tr, market, 'fail_fast_mfe', candleBucketMs, feeRate);
-              continue;
-            }
-          }
-
-          // Exit on supertrend flip (uses last computed indicator snapshot from decisionBySymbol)
-          if (EXIT_ON_SUPERTREND_FLIP) {
-            const dec = state.decisionBySymbol.get(sym);
-            if (dec && dec.supertrendDir === -1) {
-              const mfePct2 = (Number.isFinite(tr._maxPriceSinceOpen) && Number.isFinite(tr.entryPrice) && tr.entryPrice > 0)
-                ? ((tr._maxPriceSinceOpen - tr.entryPrice) / tr.entryPrice)
-                : 0;
-              const inProfitNow2 = (Number.isFinite(market) && Number.isFinite(tr.entryPrice)) ? (market > tr.entryPrice) : false;
-              const allowFlipExit = (!ST_FLIP_REQUIRE_ADVANTAGE)
-                ? true
-                : (inProfitNow2 || (Number.isFinite(mfePct2) && mfePct2 >= ST_FLIP_MIN_MFE_PCT));
-
-              if (allowFlipExit) {
-                if (runMode === 'live') await closeTradeLiveMarket(tr, 'st_flip');
-                else await closeTrade(tr, market, 'st_flip', candleBucketMs, feeRate);
-                continue;
-              }
-            }
-          }
 
           const slClassic = (tr.stopLossClassic != null) ? tr.stopLossClassic : null;
           const slEmergency = (tr.stopLossEmergency != null)
@@ -1589,7 +1657,14 @@ async function gracefulShutdown(signal) {
           ? true
           : (st.dir === 1);
 
-        const shouldEnter = atrOk &&
+        const choppyBlocked = SKIP_CHOPPY && (regimeInfo.microRegime === 'CHOPPY') &&
+          (!SKIP_CHOPPY_ONLY_IF_LOW_VOL || regimeInfo.volRegime === 'LOW_VOL');
+
+        const regimeOk = (!SKIP_LOW_VOL || regimeInfo.volRegime !== 'LOW_VOL') &&
+          !choppyBlocked;
+
+        const shouldEnter = regimeOk &&
+          atrOk &&
           slopeNormOk &&
           momentumOk &&
           trendUp &&
@@ -1632,7 +1707,7 @@ async function gracefulShutdown(signal) {
           slopeNormOk: !!slopeNormOk,
           regime,
           microRegime: regimeInfo.microRegime,
-          slopeNorm: regimeInfo.slopeNorm,
+          slopeNorm: Number((regimeInfo.slopeNorm || 0).toFixed(3)),
           priceNearSMA: !!priceNearSMA,
           priceAboveSMA: !!priceAboveSMA,
           volume_base: Number(candle.volume.toFixed(2)),
@@ -1836,6 +1911,16 @@ async function gracefulShutdown(signal) {
           stopLossClassic,
           stopLossEmergency,
           takeProfit,
+          // Scale-out (paper only for now). TP2 is the regular takeProfit.
+          scaleTpEnabled: (!!SCALE_TP_ENABLED && Number.isFinite(TP1_PCT) && TP1_PCT > 0 && Number.isFinite(TP1_FRAC) && TP1_FRAC > 0 && TP1_FRAC < 1),
+          tp1Pct: (Number.isFinite(TP1_PCT) && TP1_PCT > 0) ? TP1_PCT : null,
+          tp1Frac: (Number.isFinite(TP1_FRAC) && TP1_FRAC > 0 && TP1_FRAC < 1) ? TP1_FRAC : null,
+          tp1Price: (SCALE_TP_ENABLED && Number.isFinite(TP1_PCT) && TP1_PCT > 0) ? (entryPrice * (1 + TP1_PCT)) : null,
+          tp2Price: takeProfit,
+          tp1Hit: false,
+          sizeInitial: qty,
+          realizedGross: 0,
+          realizedFeeUsdEst: 0,
           mode: runMode,
           slPolicy: SL_POLICY,
           slConfirmSeconds: SL_CONFIRM_SECONDS,
