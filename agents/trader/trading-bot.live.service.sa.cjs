@@ -1122,6 +1122,9 @@ async function gracefulShutdown(signal) {
   const TP_ON_EXCHANGE = (process.env.TP_ON_EXCHANGE != null)
     ? String(process.env.TP_ON_EXCHANGE) === '1'
     : (cfgLive.TP_ON_EXCHANGE !== undefined ? !!cfgLive.TP_ON_EXCHANGE : true);
+  const MAKER_ENTRY_ONLY = (process.env.MAKER_ENTRY_ONLY != null)
+    ? String(process.env.MAKER_ENTRY_ONLY) === '1'
+    : !!cfgLive.MAKER_ENTRY_ONLY;
   const MAKER_ENTRY_TIMEOUT_MS = parseInt(process.env.MAKER_ENTRY_TIMEOUT_MS || cfgLive.MAKER_ENTRY_TIMEOUT_MS || 15000, 10);
   const ORDER_POLL_MS = parseInt(process.env.ORDER_POLL_MS || cfgLive.ORDER_POLL_MS || 500, 10);
 
@@ -1163,6 +1166,12 @@ async function gracefulShutdown(signal) {
   const feeRateTaker = parseFloat(process.env.FEE_RATE_TAKER || cfgLive.FEE_RATE_TAKER || feeRate);
   const ATR_WINDOW = parseInt(process.env.ATR_WINDOW || cfgLive.ATR_WINDOW || 14, 10);
   const MIN_ATR_PCT = parseFloat(process.env.MIN_ATR_PCT || cfgLive.MIN_ATR_PCT || 0);
+  // Defensive (entry): hard skip entries when ATR% is below this threshold (0 disables).
+  const MIN_ATR_PCT_HARD = parseFloat(process.env.MIN_ATR_PCT_HARD || cfgLive.MIN_ATR_PCT_HARD || 0);
+  // Defensive (monitor): in HIGH_VOL+CHOPPY, avoid wick-triggered emergency exits; let soft SL policy handle.
+  const DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY = (process.env.DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY != null)
+    ? String(process.env.DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY) === '1'
+    : !!cfgLive.DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY;
 
   // Extra indicator configs (Phase B)
   const USE_ADX_FILTER = (process.env.USE_ADX_FILTER != null)
@@ -1274,6 +1283,7 @@ async function gracefulShutdown(signal) {
         candleBucketMs,
         httpTimeoutMs: HTTP_TIMEOUT_MS,
         makerEntryTimeoutMs: MAKER_ENTRY_TIMEOUT_MS,
+        makerEntryOnly: MAKER_ENTRY_ONLY,
         orderPollMs: ORDER_POLL_MS,
         tpOnExchange: TP_ON_EXCHANGE,
         feeRateMaker,
@@ -1408,9 +1418,20 @@ async function gracefulShutdown(signal) {
 
 
           const slClassic = (tr.stopLossClassic != null) ? tr.stopLossClassic : null;
-          const slEmergency = (tr.stopLossEmergency != null)
+          let slEmergency = (tr.stopLossEmergency != null)
             ? tr.stopLossEmergency
             : (tr.stopLoss != null ? tr.stopLoss : null);
+
+          // Defensive: in HIGH_VOL+CHOPPY, avoid wick-driven emergency exits (let classic soft confirm handle)
+          if (DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY) {
+            try {
+              const rt = getSymbolRuntime(sym);
+              const reg = rt && rt.lastRegimeInfo;
+              if (reg && reg.volRegime === 'HIGH_VOL' && reg.microRegime === 'CHOPPY') {
+                slEmergency = null;
+              }
+            } catch (_) {}
+          }
 
           // SL policy evaluation (classic vs soft+emergency)
           const slRes = evalSlPolicy({
@@ -1564,6 +1585,9 @@ async function gracefulShutdown(signal) {
 
         const minAtrEffective = Math.max(MIN_ATR_PCT || 0, atrPctlThr || 0);
         const atrOk = (minAtrEffective > 0) ? (atrPctNum >= minAtrEffective) : true;
+        const atrHardOk = (!Number.isFinite(MIN_ATR_PCT_HARD) || MIN_ATR_PCT_HARD <= 0)
+          ? true
+          : (atrPctNum >= MIN_ATR_PCT_HARD);
 
         const realizedVol = computeRealizedVol(closes, Math.min(60, Math.max(20, Math.floor(SMA_WINDOW / 2))));
 
@@ -1601,6 +1625,13 @@ async function gracefulShutdown(signal) {
           lastClose: candle.close,
           priceAboveSma: priceAboveSMA
         });
+
+        // Persist last regime snapshot for monitor-side defensive logic (best-effort)
+        rt.lastRegimeInfo = {
+          ts: candle.ts,
+          volRegime: regimeInfo.volRegime,
+          microRegime: regimeInfo.microRegime,
+        };
 
         const minSlopeNormEff = Number.isFinite(MIN_SLOPE_NORM_BY_SYMBOL[sym])
           ? MIN_SLOPE_NORM_BY_SYMBOL[sym]
@@ -1665,6 +1696,7 @@ async function gracefulShutdown(signal) {
 
         const shouldEnter = regimeOk &&
           atrOk &&
+          atrHardOk &&
           slopeNormOk &&
           momentumOk &&
           trendUp &&
@@ -1695,6 +1727,7 @@ async function gracefulShutdown(signal) {
           atr_pctl_q: ATR_ADAPTIVE_ENABLED ? Number((ATR_ADAPTIVE_PCTL || 0).toFixed(2)) : null,
           min_atr_pct: Number((minAtrEffective || 0).toFixed(6)),
           atrOk: !!atrOk,
+          atrHardOk: !!atrHardOk,
           realized_vol: Number((realizedVol || 0).toFixed(6)),
           adx: (adxInfo.adx == null ? null : Number(adxInfo.adx.toFixed(2))),
           diPlus: (adxInfo.diPlus == null ? null : Number(adxInfo.diPlus.toFixed(2))),
@@ -1842,7 +1875,13 @@ async function gracefulShutdown(signal) {
           riskDist = MIN_SL_USD;
         }
 
-        const takeProfit = entryPrice + riskDist * rr;
+        const tp1AsTp = (!!SCALE_TP_ENABLED && Number.isFinite(TP1_PCT) && TP1_PCT > 0 && Number.isFinite(TP1_FRAC) && TP1_FRAC >= 0.99);
+        // Default TP2 (ATR-based RR)
+        let takeProfit = entryPrice + riskDist * rr;
+        // If TP1_FRAC≈1, treat TP1 as the ONLY TP (single TP order on exchange; simplest LIVE behavior)
+        if (tp1AsTp) {
+          takeProfit = entryPrice * (1 + TP1_PCT);
+        }
 
         const stopLossClassic = entryPrice - riskDist;
         const stopLossEmergency = (Number.isFinite(EMERGENCY_SL_PCT) && EMERGENCY_SL_PCT > 0)
@@ -1911,12 +1950,12 @@ async function gracefulShutdown(signal) {
           stopLossClassic,
           stopLossEmergency,
           takeProfit,
-          // Scale-out (paper only for now). TP2 is the regular takeProfit.
-          scaleTpEnabled: (!!SCALE_TP_ENABLED && Number.isFinite(TP1_PCT) && TP1_PCT > 0 && Number.isFinite(TP1_FRAC) && TP1_FRAC > 0 && TP1_FRAC < 1),
+          // Scale-out (PAPER). If TP1_FRAC≈1, we instead treat TP1 as the ONLY TP (single TP).
+          scaleTpEnabled: (!!SCALE_TP_ENABLED && !tp1AsTp && Number.isFinite(TP1_PCT) && TP1_PCT > 0 && Number.isFinite(TP1_FRAC) && TP1_FRAC > 0 && TP1_FRAC < 1),
           tp1Pct: (Number.isFinite(TP1_PCT) && TP1_PCT > 0) ? TP1_PCT : null,
           tp1Frac: (Number.isFinite(TP1_FRAC) && TP1_FRAC > 0 && TP1_FRAC < 1) ? TP1_FRAC : null,
           tp1Price: (SCALE_TP_ENABLED && Number.isFinite(TP1_PCT) && TP1_PCT > 0) ? (entryPrice * (1 + TP1_PCT)) : null,
-          tp2Price: takeProfit,
+          tp2Price: (!tp1AsTp) ? takeProfit : null,
           tp1Hit: false,
           sizeInitial: qty,
           realizedGross: 0,
