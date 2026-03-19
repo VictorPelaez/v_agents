@@ -1166,12 +1166,19 @@ async function gracefulShutdown(signal) {
   const feeRateTaker = parseFloat(process.env.FEE_RATE_TAKER || cfgLive.FEE_RATE_TAKER || feeRate);
   const ATR_WINDOW = parseInt(process.env.ATR_WINDOW || cfgLive.ATR_WINDOW || 14, 10);
   const MIN_ATR_PCT = parseFloat(process.env.MIN_ATR_PCT || cfgLive.MIN_ATR_PCT || 0);
+  // New: max ATR% cap (entry only). 0 disables.
+  const MAX_ATR_PCT = parseFloat(process.env.MAX_ATR_PCT || cfgLive.MAX_ATR_PCT || 0);
   // Defensive (entry): hard skip entries when ATR% is below this threshold (0 disables).
   const MIN_ATR_PCT_HARD = parseFloat(process.env.MIN_ATR_PCT_HARD || cfgLive.MIN_ATR_PCT_HARD || 0);
   // Defensive (monitor): in HIGH_VOL+CHOPPY, avoid wick-triggered emergency exits; let soft SL policy handle.
   const DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY = (process.env.DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY != null)
     ? String(process.env.DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY) === '1'
     : !!cfgLive.DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY;
+
+  // New: disable wick-based emergency SL always (all regimes). Leaves classic soft-confirm SL policy.
+  const DISABLE_EMERGENCY_WICK_ALWAYS = (process.env.DISABLE_EMERGENCY_WICK_ALWAYS != null)
+    ? String(process.env.DISABLE_EMERGENCY_WICK_ALWAYS) === '1'
+    : !!cfgLive.DISABLE_EMERGENCY_WICK_ALWAYS;
 
   // Extra indicator configs (Phase B)
   const USE_ADX_FILTER = (process.env.USE_ADX_FILTER != null)
@@ -1427,8 +1434,13 @@ async function gracefulShutdown(signal) {
             ? tr.stopLossEmergency
             : (tr.stopLoss != null ? tr.stopLoss : null);
 
+          // Defensive: optionally disable wick-driven emergency exits.
+          if (DISABLE_EMERGENCY_WICK_ALWAYS) {
+            slEmergency = null;
+          }
+
           // Defensive: in HIGH_VOL+CHOPPY, avoid wick-driven emergency exits (let classic soft confirm handle)
-          if (DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY) {
+          if (!DISABLE_EMERGENCY_WICK_ALWAYS && DISABLE_EMERGENCY_WICK_IN_HV_CHOPPY) {
             try {
               const rt = getSymbolRuntime(sym);
               const reg = rt && rt.lastRegimeInfo;
@@ -1593,6 +1605,9 @@ async function gracefulShutdown(signal) {
         const atrHardOk = (!Number.isFinite(MIN_ATR_PCT_HARD) || MIN_ATR_PCT_HARD <= 0)
           ? true
           : (atrPctNum >= MIN_ATR_PCT_HARD);
+        const atrMaxOk = (!Number.isFinite(MAX_ATR_PCT) || MAX_ATR_PCT <= 0)
+          ? true
+          : (atrPctNum <= MAX_ATR_PCT);
 
         const realizedVol = computeRealizedVol(closes, Math.min(60, Math.max(20, Math.floor(SMA_WINDOW / 2))));
 
@@ -1702,6 +1717,7 @@ async function gracefulShutdown(signal) {
         const shouldEnter = regimeOk &&
           atrOk &&
           atrHardOk &&
+          atrMaxOk &&
           slopeNormOk &&
           momentumOk &&
           trendUp &&
