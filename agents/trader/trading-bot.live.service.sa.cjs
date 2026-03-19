@@ -1875,13 +1875,7 @@ async function gracefulShutdown(signal) {
           riskDist = MIN_SL_USD;
         }
 
-        const tp1AsTp = (!!SCALE_TP_ENABLED && Number.isFinite(TP1_PCT) && TP1_PCT > 0 && Number.isFinite(TP1_FRAC) && TP1_FRAC >= 0.99);
-        // Default TP2 (ATR-based RR)
-        let takeProfit = entryPrice + riskDist * rr;
-        // If TP1_FRAC≈1, treat TP1 as the ONLY TP (single TP order on exchange; simplest LIVE behavior)
-        if (tp1AsTp) {
-          takeProfit = entryPrice * (1 + TP1_PCT);
-        }
+        const takeProfit = entryPrice + riskDist * rr;
 
         const stopLossClassic = entryPrice - riskDist;
         const stopLossEmergency = (Number.isFinite(EMERGENCY_SL_PCT) && EMERGENCY_SL_PCT > 0)
@@ -1950,12 +1944,12 @@ async function gracefulShutdown(signal) {
           stopLossClassic,
           stopLossEmergency,
           takeProfit,
-          // Scale-out (PAPER). If TP1_FRAC≈1, we instead treat TP1 as the ONLY TP (single TP).
-          scaleTpEnabled: (!!SCALE_TP_ENABLED && !tp1AsTp && Number.isFinite(TP1_PCT) && TP1_PCT > 0 && Number.isFinite(TP1_FRAC) && TP1_FRAC > 0 && TP1_FRAC < 1),
+          // Scale-out (paper only for now). TP2 is the regular takeProfit.
+          scaleTpEnabled: (!!SCALE_TP_ENABLED && Number.isFinite(TP1_PCT) && TP1_PCT > 0 && Number.isFinite(TP1_FRAC) && TP1_FRAC > 0 && TP1_FRAC < 1),
           tp1Pct: (Number.isFinite(TP1_PCT) && TP1_PCT > 0) ? TP1_PCT : null,
           tp1Frac: (Number.isFinite(TP1_FRAC) && TP1_FRAC > 0 && TP1_FRAC < 1) ? TP1_FRAC : null,
           tp1Price: (SCALE_TP_ENABLED && Number.isFinite(TP1_PCT) && TP1_PCT > 0) ? (entryPrice * (1 + TP1_PCT)) : null,
-          tp2Price: (!tp1AsTp) ? takeProfit : null,
+          tp2Price: takeProfit,
           tp1Hit: false,
           sizeInitial: qty,
           realizedGross: 0,
