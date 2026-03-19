@@ -1305,6 +1305,7 @@ async function gracefulShutdown(signal) {
 
   const openTradeLive = liveExec ? liveExec.openTradeLive : null;
   const closeTradeLiveMarket = liveExec ? liveExec.closeTradeLiveMarket : null;
+  const closeTradeLiveMakerFirst = liveExec ? liveExec.closeTradeLiveMakerFirst : null;
   const reconcileLiveTpOrders = liveExec ? liveExec.reconcileLiveTpOrders : null;
 
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
@@ -1409,8 +1410,12 @@ async function gracefulShutdown(signal) {
           }
 
           if (ageS > timeStopMinutes * 60) {
-            if (runMode === 'live') await closeTradeLiveMarket(tr, 'time_stop');
-            else await closeTrade(tr, market, 'time_stop', candleBucketMs, feeRate);
+            if (runMode === 'live') {
+              if (closeTradeLiveMakerFirst) await closeTradeLiveMakerFirst(tr, 'time_stop', { makerTimeoutMs: 8000 });
+              else await closeTradeLiveMarket(tr, 'time_stop');
+            } else {
+              await closeTrade(tr, market, 'time_stop', candleBucketMs, feeRate);
+            }
             continue;
           }
 
