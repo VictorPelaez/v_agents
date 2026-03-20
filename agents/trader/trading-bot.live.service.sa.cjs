@@ -1217,12 +1217,29 @@ async function gracefulShutdown(signal) {
   const SKIP_LOW_VOL = (process.env.SKIP_LOW_VOL != null)
     ? String(process.env.SKIP_LOW_VOL) === '1'
     : !!cfgLive.SKIP_LOW_VOL;
+
+  // Baseline-parity: hard skip LOW_VOL.
+  // If not provided, fall back to SKIP_LOW_VOL.
+  const SKIP_LOW_VOL_HARD = (process.env.SKIP_LOW_VOL_HARD != null)
+    ? String(process.env.SKIP_LOW_VOL_HARD) === '1'
+    : (cfgLive.SKIP_LOW_VOL_HARD !== undefined ? !!cfgLive.SKIP_LOW_VOL_HARD : !!SKIP_LOW_VOL);
+
   const SKIP_CHOPPY = (process.env.SKIP_CHOPPY != null)
     ? String(process.env.SKIP_CHOPPY) === '1'
     : !!cfgLive.SKIP_CHOPPY;
   const SKIP_CHOPPY_ONLY_IF_LOW_VOL = (process.env.SKIP_CHOPPY_ONLY_IF_LOW_VOL != null)
     ? String(process.env.SKIP_CHOPPY_ONLY_IF_LOW_VOL) === '1'
     : !!cfgLive.SKIP_CHOPPY_ONLY_IF_LOW_VOL;
+
+  // Baseline-parity: skip CHOPPY only when HIGH_VOL+CHOPPY (defensive).
+  const SKIP_CHOPPY_IN_HIGH_VOL = (process.env.SKIP_CHOPPY_IN_HIGH_VOL != null)
+    ? String(process.env.SKIP_CHOPPY_IN_HIGH_VOL) === '1'
+    : !!cfgLive.SKIP_CHOPPY_IN_HIGH_VOL;
+
+  // Baseline-parity: trend gate mode.
+  // - strict: require trendUp as computed.
+  // - no_trend: bypass trend gate (trendUp := true)
+  const TREND_GATE_MODE = String(process.env.TREND_GATE_MODE || cfgLive.TREND_GATE_MODE || 'strict');
 
   // Optional per-symbol override (multi-coin friendly):
   //   MIN_SLOPE_NORM_BY_SYMBOL: { "BTCUSDT": 0.10, "XRPUSDT": 0.06 }
@@ -1708,11 +1725,20 @@ async function gracefulShutdown(signal) {
           ? true
           : (st.dir === 1);
 
+        // Baseline-parity defensive regime skips
         const choppyBlocked = SKIP_CHOPPY && (regimeInfo.microRegime === 'CHOPPY') &&
           (!SKIP_CHOPPY_ONLY_IF_LOW_VOL || regimeInfo.volRegime === 'LOW_VOL');
 
-        const regimeOk = (!SKIP_LOW_VOL || regimeInfo.volRegime !== 'LOW_VOL') &&
-          !choppyBlocked;
+        const hvChoppyBlocked = !!SKIP_CHOPPY_IN_HIGH_VOL &&
+          (regimeInfo.volRegime === 'HIGH_VOL') &&
+          (regimeInfo.microRegime === 'CHOPPY');
+
+        const lowVolBlocked = !!SKIP_LOW_VOL_HARD && (regimeInfo.volRegime === 'LOW_VOL');
+
+        const regimeOk = !lowVolBlocked && !choppyBlocked && !hvChoppyBlocked;
+
+        // Trend gate mode (strict by default)
+        const trendUpEff = (String(TREND_GATE_MODE).toLowerCase() === 'no_trend') ? true : !!trendUp;
 
         const shouldEnter = regimeOk &&
           atrOk &&
@@ -1720,7 +1746,7 @@ async function gracefulShutdown(signal) {
           atrMaxOk &&
           slopeNormOk &&
           momentumOk &&
-          trendUp &&
+          trendUpEff &&
           priceNearSMA &&
           priceAboveSMA &&
           volumeOk &&
@@ -1768,6 +1794,7 @@ async function gracefulShutdown(signal) {
           volume_quote: Number.isFinite(candle.quoteVolume) ? Number(candle.quoteVolume.toFixed(2)) : null,
           volumeOk: !!volumeOk,
           trendUp: !!trendUp,
+          trendUpEff: (String(TREND_GATE_MODE).toLowerCase() === 'no_trend') ? true : !!trendUp,
           weakCandleBody: !!weakCandleBody,
           weakOpen: !!weakOpen,
           candleExplosive: !!candleExplosive,
