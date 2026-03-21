@@ -1084,6 +1084,7 @@ async function gracefulShutdown(signal) {
   const maxPositions = parseInt(process.env.MAX_POSITIONS || cfgLive.MAX_POSITIONS || 1, 10);
   const minHoldS = parseInt(process.env.MIN_HOLD_SECONDS || cfgLive.MIN_HOLD_SECONDS || '60', 10);
   const timeStopMinutes = parseInt(process.env.TIME_STOP_MINUTES || cfgLive.TIME_STOP_MINUTES || 10, 10);
+  const NO_SL_BEFORE_MINUTES = parseInt(process.env.NO_SL_BEFORE_MINUTES || cfgLive.NO_SL_BEFORE_MINUTES || 0, 10);
 
   const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || cfgLive.HTTP_TIMEOUT_MS || 2500, 10);
   const candleBucketMs = parseInt(process.env.SIGNAL_BUCKET_MS || cfgLive.SIGNAL_BUCKET_MS || cfgLive.CANDLE_MS || 60000, 10);
@@ -1193,7 +1194,7 @@ async function gracefulShutdown(signal) {
   const USE_DONCHIAN_FILTER = (process.env.USE_DONCHIAN_FILTER != null)
     ? String(process.env.USE_DONCHIAN_FILTER) === '1'
     : !!cfgLive.USE_DONCHIAN_FILTER;
-  const DONCHIAN_N = parseInt(process.env.DONCHIAN_N || cfgLive.DONCHIAN_N || 20, 10);
+  const DONCHIAN_N = parseInt(cfgLive.DONCHIAN_N || 20, 10);
 
   const USE_SUPERTREND_FILTER = (process.env.USE_SUPERTREND_FILTER != null)
     ? String(process.env.USE_SUPERTREND_FILTER) === '1'
@@ -1481,10 +1482,25 @@ async function gracefulShutdown(signal) {
           tr._slBreachStartMs = slRes.breachStartMs;
 
           if (slRes.closeReason) {
-            if (runMode === 'live') await closeTradeLiveMarket(tr, slRes.closeReason);
-            else await closeTrade(tr, market, slRes.closeReason, candleBucketMs, feeRate);
-            if (slRes.emergency && HALT_TRADING_ON_EMERGENCY) emergencyHaltYmd = getYmd(Date.now());
-            continue;
+            // Optional: ignore classic SL during the first N minutes to avoid early shakeouts.
+            // Safety: we only block the classic 'SL' closeReason; emergency sl remains active.
+            if (slRes.closeReason === 'SL' && Number.isFinite(NO_SL_BEFORE_MINUTES) && NO_SL_BEFORE_MINUTES > 0) {
+              const ageMin = ageS / 60;
+              if (ageMin < NO_SL_BEFORE_MINUTES) {
+                // Do not close; keep monitoring (TP/time_stop may still close).
+                // Note: breachStartMs remains tracked by evalSlPolicy state.
+              } else {
+                if (runMode === 'live') await closeTradeLiveMarket(tr, slRes.closeReason);
+                else await closeTrade(tr, market, slRes.closeReason, candleBucketMs, feeRate);
+                if (slRes.emergency && HALT_TRADING_ON_EMERGENCY) emergencyHaltYmd = getYmd(Date.now());
+                continue;
+              }
+            } else {
+              if (runMode === 'live') await closeTradeLiveMarket(tr, slRes.closeReason);
+              else await closeTrade(tr, market, slRes.closeReason, candleBucketMs, feeRate);
+              if (slRes.emergency && HALT_TRADING_ON_EMERGENCY) emergencyHaltYmd = getYmd(Date.now());
+              continue;
+            }
           }
 
           // 3) Take profit fallback (only if no TP on exchange)
