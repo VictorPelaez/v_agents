@@ -348,6 +348,7 @@ const {
   applyJournalEvent,
   persistJournalEvent,
   rebuildStateFromJournal,
+  computeSnapshotHash,
   flushOpenPositionsSnapshot,
   startSnapshotTimer,
   stopSnapshotTimer,

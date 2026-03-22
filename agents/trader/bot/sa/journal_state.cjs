@@ -269,6 +269,7 @@ function createJournalStateManager(ctx) {
     rebuildStateFromJournal,
 
     // snapshot
+    computeSnapshotHash,
     flushOpenPositionsSnapshot,
     startSnapshotTimer,
     stopSnapshotTimer,
