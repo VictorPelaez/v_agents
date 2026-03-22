@@ -21,7 +21,7 @@ require('dotenv').config();
 
 // Local SA helpers (refactor: no logic changes)
 const { ensureDir, readJsonFile } = require('./bot/sa/file_io.cjs');
-const { sleep, pickNum } = require('./bot/sa/util.cjs');
+const { sleep, pickNum, isValidNumber, percentile } = require('./bot/sa/util.cjs');
 const { getYmd, fmtDateUtc1, nowIso, makeGetJournalPath } = require('./bot/sa/time.cjs');
 const { createFileLock } = require('./bot/sa/lock.cjs');
 const { createSignalKeys } = require('./bot/sa/signal_keys.cjs');
@@ -176,28 +176,6 @@ console.log('API Base:', getApiBase());
 
 // Exchange clients live in ./exchange/* and are initialized lazily via getMexcClient().
 // Generic helpers below are exchange-agnostic.
-
-function isValidNumber(n) {
-  return typeof n === 'number' && Number.isFinite(n);
-}
-
-function percentile(sortedOrUnsorted, q) {
-  try {
-    if (!Array.isArray(sortedOrUnsorted) || sortedOrUnsorted.length === 0) return 0;
-    const p = Math.max(0, Math.min(1, Number(q)));
-    const a = sortedOrUnsorted.slice().filter(Number.isFinite).sort((x, y) => x - y);
-    if (a.length === 0) return 0;
-
-    const idx = (a.length - 1) * p;
-    const lo = Math.floor(idx);
-    const hi = Math.ceil(idx);
-    if (lo === hi) return a[lo];
-    const w = idx - lo;
-    return a[lo] * (1 - w) + a[hi] * w;
-  } catch (_) {
-    return 0;
-  }
-}
 
 const { writeJsonFileAtomic, appendJsonl, loadJsonl } = createJsonIo({ ensureDir });
 
