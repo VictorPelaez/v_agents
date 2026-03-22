@@ -551,6 +551,10 @@ async function gracefulShutdown(signal) {
     ? String(process.env.SKIP_CHOPPY_IN_HIGH_VOL) === '1'
     : !!cfgLive.SKIP_CHOPPY_IN_HIGH_VOL;
 
+  // New (config-clean): single knob for choppy skipping.
+  // Values: off | low_vol | high_vol | extremes | always
+  const CHOPPY_SKIP_MODE = String(process.env.CHOPPY_SKIP_MODE || cfgLive.CHOPPY_SKIP_MODE || '').toLowerCase() || null;
+
   // Baseline-parity: trend gate mode.
   // - strict: require trendUp as computed.
   // - no_trend: bypass trend gate (trendUp := true)
@@ -1080,8 +1084,21 @@ async function gracefulShutdown(signal) {
         const lowVolBlocked = !!SKIP_LOW_VOL_HARD && (regimeInfo.volRegime === 'LOW_VOL');
 
         const choppyBlocked = (() => {
-          if (!SKIP_CHOPPY) return false;
           if (regimeInfo.microRegime !== 'CHOPPY') return false;
+
+          // Preferred (clean config): CHOPPY_SKIP_MODE
+          if (CHOPPY_SKIP_MODE) {
+            if (CHOPPY_SKIP_MODE === 'off') return false;
+            if (CHOPPY_SKIP_MODE === 'always') return true;
+            if (CHOPPY_SKIP_MODE === 'low_vol') return regimeInfo.volRegime === 'LOW_VOL';
+            if (CHOPPY_SKIP_MODE === 'high_vol') return regimeInfo.volRegime === 'HIGH_VOL';
+            if (CHOPPY_SKIP_MODE === 'extremes') return (regimeInfo.volRegime === 'LOW_VOL' || regimeInfo.volRegime === 'HIGH_VOL');
+            // Unknown mode => be conservative: do not block
+            return false;
+          }
+
+          // Legacy knobs (backward compatible)
+          if (!SKIP_CHOPPY) return false;
 
           // Optional: skip CHOPPY only when LOW_VOL
           if (SKIP_CHOPPY_ONLY_IF_LOW_VOL) {
