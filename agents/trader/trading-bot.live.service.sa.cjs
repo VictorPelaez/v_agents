@@ -5,12 +5,6 @@
  *
  * SA = Stabilized & Adaptive.
  *
- * Additions requested by Victor:
- * 1) Trade-rate limit: configurable max trades per hour (MAX_TRADES_PER_HOUR in config.json).
- * 2) Multi-crypto support: configurable SYMBOLS[] in config.json (backwards compatible with SYMBOL).
- * 3) Verbose mode ON by default: show symbol being analyzed, loop iteration, filter pass/fail,
- *    and when signals are generated/discarded.
- *
  * Hard constraints:
  * - Respect existing config.json (do not break; new params optional)
  * - Maintain inputs/outputs & journal JSONL format/rotation trade_journal_YYYYMMDD.jsonl
