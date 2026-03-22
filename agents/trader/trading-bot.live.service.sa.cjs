@@ -31,6 +31,7 @@ const { sleep, pickNum } = require('./bot/sa/util.cjs');
 const { getYmd, fmtDateUtc1, nowIso, makeGetJournalPath } = require('./bot/sa/time.cjs');
 const { createFileLock } = require('./bot/sa/lock.cjs');
 const { createSignalKeys } = require('./bot/sa/signal_keys.cjs');
+const { createJsonIo } = require('./bot/sa/json_io.cjs');
 
 // Exchange helpers (spot v3 signed endpoints)
 const { createMexcSpotClient } = require('./exchange/mexc_spot_client.cjs');
@@ -203,51 +204,7 @@ function percentile(sortedOrUnsorted, q) {
   }
 }
 
-function writeJsonFileAtomic(filePath, value) {
-  try {
-    ensureDir(path.dirname(filePath));
-    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2), 'utf8');
-    fs.renameSync(tmpPath, filePath);
-    return true;
-  } catch (e) {
-    console.error('writeJsonFileAtomic err:', filePath, e.message);
-    return false;
-  }
-}
-
-function appendJsonl(filePath, record) {
-  try {
-    ensureDir(path.dirname(filePath));
-    fs.appendFileSync(filePath, JSON.stringify(record) + '\n', 'utf8');
-    return true;
-  } catch (e) {
-    console.error('appendJsonl err:', filePath, e.message);
-    return false;
-  }
-}
-
-function loadJsonl(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return [];
-    const raw = fs.readFileSync(filePath, 'utf8');
-    if (!raw.trim()) return [];
-    return raw
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map(line => {
-        try {
-          return JSON.parse(line);
-        } catch (e) {
-          return null;
-        }
-      })
-      .filter(Boolean);
-  } catch (e) {
-    console.error('loadJsonl err:', filePath, e.message);
-    return [];
-  }
-}
+const { writeJsonFileAtomic, appendJsonl, loadJsonl } = createJsonIo({ ensureDir });
 
 const getJournalPath = makeGetJournalPath(BASE_DIR);
 
