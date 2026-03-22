@@ -29,6 +29,8 @@ require('dotenv').config();
 const { ensureDir, readJsonFile } = require('./bot/sa/file_io.cjs');
 const { sleep, pickNum } = require('./bot/sa/util.cjs');
 const { getYmd, fmtDateUtc1, nowIso, makeGetJournalPath } = require('./bot/sa/time.cjs');
+const { createFileLock } = require('./bot/sa/lock.cjs');
+const { createSignalKeys } = require('./bot/sa/signal_keys.cjs');
 
 // Exchange helpers (spot v3 signed endpoints)
 const { createMexcSpotClient } = require('./exchange/mexc_spot_client.cjs');
@@ -73,7 +75,6 @@ const EXCHANGE = process.env.EXCHANGE || cfg.EXCHANGE || 'binance';
  * ----------------------------- */
 
 let shutdownRequested = false;
-let lockFd = null;
 let snapshotTimer = null;
 let snapshotDirty = false;
 let lastSnapshotHash = '';
@@ -254,86 +255,23 @@ const getJournalPath = makeGetJournalPath(BASE_DIR);
  * LOCK (robust)
  * ----------------------------- */
 
-function isPidAlive(pid) {
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e && e.code === 'EPERM';
-  }
-}
-
-function acquireLock() {
-  ensureDir(BASE_DIR);
-
-  if (fs.existsSync(LOCK_PATH)) {
-    try {
-      const raw = fs.readFileSync(LOCK_PATH, 'utf8');
-      const info = JSON.parse(raw || '{}');
-      const pid = Number(info.pid || 0);
-      if (pid && isPidAlive(pid)) {
-        console.error('lock exists, process seems alive:', { lock: LOCK_PATH, pid });
-        return false;
-      }
-      console.warn('stale lock detected, removing:', { lock: LOCK_PATH, pid });
-      try { fs.unlinkSync(LOCK_PATH); } catch (_) {}
-    } catch (e) {
-      console.warn('lock exists but unreadable, removing:', { lock: LOCK_PATH, err: e.message });
-      try { fs.unlinkSync(LOCK_PATH); } catch (_) {}
-    }
-  }
-
-  try {
-    lockFd = fs.openSync(LOCK_PATH, 'wx');
-    fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, started_at: nowIso() }), 'utf8');
-    return true;
-  } catch (e) {
-    if (e && e.code === 'EEXIST') {
-      console.error('lock exists, another instance may be running:', LOCK_PATH);
-      return false;
-    }
-    console.error('acquireLock err:', e.message);
-    return false;
-  }
-}
-
-function releaseLock() {
-  try {
-    if (lockFd !== null) fs.closeSync(lockFd);
-  } catch (_) {}
-  lockFd = null;
-  try {
-    if (fs.existsSync(LOCK_PATH)) fs.unlinkSync(LOCK_PATH);
-  } catch (e) {
-    console.error('releaseLock err:', e.message);
-  }
-}
+const { acquireLock, releaseLock } = createFileLock({
+  ensureDir,
+  baseDir: BASE_DIR,
+  lockPath: LOCK_PATH,
+  nowIso,
+});
 
 /* -----------------------------
  * SIGNAL KEYS (compat)
  * ----------------------------- */
 
-function getSignalBucketMs(signalCandleTs, bucketMs) {
-  if (!signalCandleTs) return 0;
-  return Math.floor(Number(signalCandleTs) / bucketMs);
-}
-
-function getSignalKey(trade, candleBucketMs) {
-  const symbol = trade.symbol || 'BTCUSDT';
-  const side = trade.type || trade.side || 'LONG';
-  const reasonTag = trade.reasonTag || trade.reason_tag || '';
-  const bucket = getSignalBucketMs(trade.signalCandleTs || trade.signal_candle_ts, candleBucketMs);
-  return `signal:${LABEL}:${symbol}:${side}:${bucket}:${reasonTag}`;
-}
-
-function getOpenEventKey(trade, candleBucketMs) {
-  return `open:${getSignalKey(trade, candleBucketMs)}`;
-}
-
-function getCloseEventKey(trade, closeReason) {
-  return `close:${LABEL}:${String(trade.id)}:${closeReason || 'UNKNOWN'}`;
-}
+const {
+  getSignalBucketMs,
+  getSignalKey,
+  getOpenEventKey,
+  getCloseEventKey,
+} = createSignalKeys({ label: LABEL });
 
 /* -----------------------------
  * NORMALIZERS (compat: additive fields ok)
