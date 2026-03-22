@@ -25,6 +25,11 @@ const crypto = require('crypto');
 const axios = require('axios');
 require('dotenv').config();
 
+// Local SA helpers (refactor: no logic changes)
+const { ensureDir, readJsonFile } = require('./bot/sa/file_io.cjs');
+const { sleep, pickNum } = require('./bot/sa/util.cjs');
+const { getYmd, fmtDateUtc1, nowIso, makeGetJournalPath } = require('./bot/sa/time.cjs');
+
 // Exchange helpers (spot v3 signed endpoints)
 const { createMexcSpotClient } = require('./exchange/mexc_spot_client.cjs');
 
@@ -55,19 +60,6 @@ const CONFIG_PATH = path.join(BASE_DIR, 'config.json');
 const LOCK_PATH = path.join(BASE_DIR, 'bot.lock');
 const OPEN_POSITIONS_PATH = path.join(BASE_DIR, 'open_positions.json');
 
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-function readJsonFile(filePath, fallback) {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch (e) {
-    console.error('readJsonFile err:', filePath, e.message);
-    return fallback;
-  }
-}
 
 function loadSkillConfig() {
   return readJsonFile(CONFIG_PATH, {});
@@ -185,21 +177,8 @@ console.log('API Base:', getApiBase());
  * HELPERS
  * ----------------------------- */
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 // Exchange clients live in ./exchange/* and are initialized lazily via getMexcClient().
 // Generic helpers below are exchange-agnostic.
-
-function pickNum(obj, ...keys) {
-  for (const k of keys) {
-    const v = obj?.[k];
-    const n = (v == null) ? NaN : Number(v);
-    if (Number.isFinite(n)) return n;
-  }
-  return null;
-}
 
 function isValidNumber(n) {
   return typeof n === 'number' && Number.isFinite(n);
@@ -269,32 +248,7 @@ function loadJsonl(filePath) {
   }
 }
 
-function getYmd(dateValue) {
-  const dt = new Date(dateValue || Date.now());
-  return String(dt.getUTCFullYear()) +
-    String(dt.getUTCMonth() + 1).padStart(2, '0') +
-    String(dt.getUTCDate()).padStart(2, '0');
-}
-
-function getJournalPath(dateValue) {
-  return path.join(BASE_DIR, `trade_journal_${getYmd(dateValue)}.jsonl`);
-}
-
-function fmtDateUtc1(d) {
-  // UTC+1 formatting (used in logs & iteration summaries)
-  const dt = new Date(d.getTime() + 60 * 60 * 1000);
-  const Y = dt.getUTCFullYear();
-  const M = String(dt.getUTCMonth() + 1).padStart(2, '0');
-  const D = String(dt.getUTCDate()).padStart(2, '0');
-  const h = String(dt.getUTCHours()).padStart(2, '0');
-  const m = String(dt.getUTCMinutes()).padStart(2, '0');
-  const s = String(dt.getUTCSeconds()).padStart(2, '0');
-  return `${Y}-${M}-${D} ${h}:${m}:${s}`;
-}
-
-function nowIso() {
-  return new Date().toISOString();
-}
+const getJournalPath = makeGetJournalPath(BASE_DIR);
 
 /* -----------------------------
  * LOCK (robust)
