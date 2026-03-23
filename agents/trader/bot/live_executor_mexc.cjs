@@ -21,6 +21,15 @@ function pickNum(obj, ...keys) {
   return null;
 }
 
+// MEXC constraint (per error 700008): newClientOrderId must match ^[0-9a-zA-Z_-]{1,32}$
+function sanitizeClientOrderId(id) {
+  const s = String(id ?? '')
+    .replace(/[^0-9a-zA-Z_-]/g, '_')
+    .slice(0, 32);
+  // Ensure non-empty
+  return s.length ? s : 'cid_' + Date.now().toString().slice(-8);
+}
+
 function createLiveExecutorMexc(ctx) {
   const {
     mexc,
@@ -29,6 +38,8 @@ function createLiveExecutorMexc(ctx) {
     candleBucketMs,
     httpTimeoutMs,
     makerEntryTimeoutMs,
+    makerEntryMaxAttempts: makerEntryMaxAttemptsCfg,
+    makerEntryRetrySleepMs: makerEntryRetrySleepMsCfg,
     makerEntryOnly,
     orderPollMs,
     tpOnExchange,
@@ -50,6 +61,16 @@ function createLiveExecutorMexc(ctx) {
 
   if (!mexc) throw new Error('createLiveExecutorMexc: mexc client required');
   if (!label) throw new Error('createLiveExecutorMexc: label required');
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Maker entry retries (in addition to MAKER_ENTRY_TIMEOUT_MS).
+  // Priority: ctx/config -> env -> default.
+  const makerEntryMaxAttempts = Number(
+    (makerEntryMaxAttemptsCfg != null ? makerEntryMaxAttemptsCfg : (process.env.MAKER_ENTRY_MAX_ATTEMPTS || 3))
+  );
+  const makerEntryRetrySleepMs = Number(
+    (makerEntryRetrySleepMsCfg != null ? makerEntryRetrySleepMsCfg : (process.env.MAKER_ENTRY_RETRY_SLEEP_MS || 750))
+  );
 
   function persistTradeUpdate(patch) {
     try {
@@ -88,64 +109,84 @@ function createLiveExecutorMexc(ctx) {
 
     let entryExec = 'maker';
     let entryFeeRate = feeRateMaker;
-    const entryClientId = `open_${label}_${trade.id}`;
+    let entryClientId = sanitizeClientOrderId(`open_${label}_${trade.id}`);
+    const entryClientIdBase = entryClientId;
 
     let entryOrder = null;
     let entryOrderId = null;
 
-    // 1) Entry: post-only LIMIT near best bid (MEXC Spot v3)
-    // NOTE: MEXC does not reliably support Binance-style type=LIMIT_MAKER; use LIMIT + timeInForce=GTX (post-only).
-    try {
-      const bt = await mexc.bookTicker(sym, httpTimeoutMs);
-      const bid = pickNum(bt, 'bidPrice', 'bid');
-      let price = (bid != null && bid > 0) ? bid : trade.entryPrice;
-      const norm = await mexc.normalizeLimit(sym, trade.size, price, httpTimeoutMs);
-
-      entryOrder = await mexc.placeOrder({
-        symbol: sym,
-        side: 'BUY',
-        type: 'LIMIT',
-        quantity: norm.qty,
-        price: norm.price,
-        timeInForce: 'GTX',
-        newClientOrderId: entryClientId,
-      }, httpTimeoutMs);
-
-      entryOrderId = entryOrder?.orderId || entryOrder?.order_id || null;
-    } catch (e) {
-      // If maker placement fails, we fallback below (unless makerEntryOnly).
-      const status = e?.response?.status;
-      const data = e?.response?.data;
-      console.error('LIVE entry maker place failed:', {
-        symbol: sym,
-        status,
-        data,
-        message: e?.message,
-      });
-    }
-
-    // Partial-fill aware entry handling
+    // Partial-fill aware entry handling (maker)
     let makerOrd = null;
     let makerExecQty = 0;
     let makerAvg = null;
 
-    if (entryOrderId) {
-      makerOrd = await mexc.waitForFill({
-        symbol: sym,
-        orderId: entryOrderId,
-        origClientOrderId: entryClientId,
-        timeoutMs: makerEntryTimeoutMs,
-        pollMs: orderPollMs,
-        httpTimeoutMs,
-      });
+    // 1) Entry: post-only LIMIT near best bid (MEXC Spot v3)
+    // NOTE: MEXC does not reliably support Binance-style type=LIMIT_MAKER; use LIMIT + timeInForce=GTX (post-only).
+    const maxAttempts = Math.max(1, Number.isFinite(makerEntryMaxAttempts) ? makerEntryMaxAttempts : 1);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // Make client id unique per attempt (and keep it MEXC-legal)
+      entryClientId = sanitizeClientOrderId(`${entryClientIdBase}_a${attempt}`);
+      entryOrder = null;
+      entryOrderId = null;
+      makerOrd = null;
+      makerExecQty = 0;
+      makerAvg = null;
 
       try {
-        const ordNow = makerOrd || await mexc.getOrder({ symbol: sym, orderId: entryOrderId, origClientOrderId: entryClientId }, httpTimeoutMs);
-        if (ordNow) makerOrd = ordNow;
+        const bt = await mexc.bookTicker(sym, httpTimeoutMs);
+        const bid = pickNum(bt, 'bidPrice', 'bid');
+        const _makerOffset = Number.isFinite(ctx.makerEntryPriceOffsetPct) ? ctx.makerEntryPriceOffsetPct : 0;
+        let price = (bid != null && bid > 0)
+          ? bid * (1 + _makerOffset)
+          : trade.entryPrice * (1 + _makerOffset);
+        const norm = await mexc.normalizeLimit(sym, trade.size, price, httpTimeoutMs);
+
+        entryOrder = await mexc.placeOrder({
+          symbol: sym,
+          side: 'BUY',
+          type: 'LIMIT',
+          quantity: norm.qty,
+          price: norm.price,
+          timeInForce: 'GTX',
+          newClientOrderId: entryClientId,
+        }, httpTimeoutMs);
+
+        entryOrderId = entryOrder?.orderId || entryOrder?.order_id || null;
+      } catch (e) {
+        const status = e?.response?.status;
+        const data = e?.response?.data;
+        console.error('LIVE entry maker place failed:', { symbol: sym, status, data, message: e?.message });
+      }
+
+      if (entryOrderId) {
+        makerOrd = await mexc.waitForFill({
+          symbol: sym,
+          orderId: entryOrderId,
+          origClientOrderId: entryClientId,
+          timeoutMs: makerEntryTimeoutMs,
+          pollMs: orderPollMs,
+          httpTimeoutMs,
+        });
+
+        try {
+          const ordNow = makerOrd || await mexc.getOrder({ symbol: sym, orderId: entryOrderId, origClientOrderId: entryClientId }, httpTimeoutMs);
+          if (ordNow) makerOrd = ordNow;
+        } catch (_) {}
+
+        makerExecQty = pickNum(makerOrd, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
+        makerAvg = mexc.orderAvgFillPrice(makerOrd);
+      }
+
+      const filledEnoughMaker = makerExecQty >= (trade.size * 0.999999);
+      if (filledEnoughMaker) break;
+
+      // Cancel any remaining maker quantity before retrying
+      try {
+        if (entryOrderId) await mexc.cancelOrder({ symbol: sym, orderId: entryOrderId }, httpTimeoutMs);
       } catch (_) {}
 
-      makerExecQty = pickNum(makerOrd, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
-      makerAvg = mexc.orderAvgFillPrice(makerOrd);
+      // Sleep a bit and retry (refresh bid)
+      if (attempt < maxAttempts) await sleep(Math.max(0, makerEntryRetrySleepMs));
     }
 
     let mktOrd = null;
@@ -172,7 +213,7 @@ function createLiveExecutorMexc(ctx) {
       remaining = (await mexc.normalizeQuantity(sym, remaining, httpTimeoutMs)).qty;
 
       if (remaining > 0 && (!rules.minQty || remaining >= rules.minQty)) {
-        const mktClientId = `${entryClientId}_mkt`;
+        const mktClientId = sanitizeClientOrderId(`${entryClientId}_mkt`);
         const mkt = await mexc.placeOrder({
           symbol: sym,
           side: 'BUY',
@@ -223,7 +264,7 @@ function createLiveExecutorMexc(ctx) {
     // 2) Place TP order on exchange (LIMIT sell).
     if (tpOnExchange && trade.takeProfit && Number.isFinite(trade.takeProfit)) {
       try {
-        const tpClientId = `tp_${label}_${trade.id}`;
+        const tpClientId = sanitizeClientOrderId(`tp_${label}_${trade.id}`);
         const tpNorm = await mexc.normalizeLimit(sym, trade.size, trade.takeProfit, httpTimeoutMs);
         const tp = await mexc.placeOrder({
           symbol: sym,
@@ -315,7 +356,7 @@ function createLiveExecutorMexc(ctx) {
     } catch (_) {}
 
     // 1) Maker attempt: LIMIT_MAKER at best ask
-    const makerClientId = `close_${label}_${trade.id}_${closeReason}_mk`;
+    const makerClientId = sanitizeClientOrderId(`close_${label}_${trade.id}_${closeReason}_mk`);
     let makerOrderId = null;
     let makerOrd = null;
     try {
@@ -382,7 +423,7 @@ function createLiveExecutorMexc(ctx) {
     let mktAvg = null;
 
     if (remaining > 0) {
-      const mktClientId = `close_${label}_${trade.id}_${closeReason}_mkt`;
+      const mktClientId = sanitizeClientOrderId(`close_${label}_${trade.id}_${closeReason}_mkt`);
       const mkt = await mexc.placeOrder({
         symbol: sym,
         side: 'SELL',
@@ -447,7 +488,7 @@ function createLiveExecutorMexc(ctx) {
 
       // For each open trade, ensure we have a TP order attached.
       for (const tr of openTrades) {
-        const expectedTpClientId = `tp_${label}_${tr.id}`;
+        const expectedTpClientId = sanitizeClientOrderId(`tp_${label}_${tr.id}`);
 
         // Attach tpOrderId if missing (look in openOrders)
         if (!tr.tpOrderId) {
@@ -517,4 +558,5 @@ function createLiveExecutorMexc(ctx) {
 
 module.exports = {
   createLiveExecutorMexc,
+  _sanitizeClientOrderId: sanitizeClientOrderId,
 };

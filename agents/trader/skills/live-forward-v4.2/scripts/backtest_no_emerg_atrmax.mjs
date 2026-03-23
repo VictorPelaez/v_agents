@@ -28,7 +28,10 @@ const TREND_GATE_MODE = String(process.env.TREND_GATE_MODE || 'strict');
 
 // Defensive filters (backtesting only)
 const DEF_SKIP_LOW_VOL_HARD = String(process.env.DEF_SKIP_LOW_VOL_HARD || '0') === '1';
+const DEF_SKIP_CHOPPY_LOWVOL = String(process.env.DEF_SKIP_CHOPPY_LOWVOL || '0') === '1';
 const DEF_SKIP_CHOPPY_HIGHVOL = String(process.env.DEF_SKIP_CHOPPY_HIGHVOL || '0') === '1';
+// If enabled, skip entries whenever microRegime is CHOPPY (any vol regime)
+const DEF_SKIP_CHOPPY_ALWAYS = String(process.env.DEF_SKIP_CHOPPY_ALWAYS || '0') === '1';
 const DEF_MIN_ATR_PCT_HARD = Number(process.env.DEF_MIN_ATR_PCT_HARD || '0');
 // If set (>0), use a wider emergency SL in HIGH_VOL+CHOPPY (reduces wick-triggered emergencies)
 const DEF_EMERGENCY_SL_PCT_HV_CHOPPY = Number(process.env.DEF_EMERGENCY_SL_PCT_HV_CHOPPY || '0');
@@ -799,7 +802,13 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
     if (DEF_SKIP_LOW_VOL_HARD && regimeInfo.volRegime === 'LOW_VOL') {
       continue;
     }
+    if (DEF_SKIP_CHOPPY_LOWVOL && regimeInfo.volRegime === 'LOW_VOL' && regimeInfo.microRegime === 'CHOPPY') {
+      continue;
+    }
     if (DEF_SKIP_CHOPPY_HIGHVOL && regimeInfo.volRegime === 'HIGH_VOL' && regimeInfo.microRegime === 'CHOPPY') {
+      continue;
+    }
+    if (DEF_SKIP_CHOPPY_ALWAYS && regimeInfo.microRegime === 'CHOPPY') {
       continue;
     }
 
