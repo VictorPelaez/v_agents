@@ -974,7 +974,7 @@ async function gracefulShutdown(signal) {
         const atrHardOk = (!Number.isFinite(MIN_ATR_PCT_HARD) || MIN_ATR_PCT_HARD <= 0)
           ? true
           : (atrPctNum >= MIN_ATR_PCT_HARD);
-        const atrMaxOk = (!Number.isFinite(MAX_ATR_PCT) || MAX_ATR_PCT <= 0)
+        const atrMaxOkBase = (!Number.isFinite(MAX_ATR_PCT) || MAX_ATR_PCT <= 0)
           ? true
           : (atrPctNum <= MAX_ATR_PCT);
 
@@ -1044,7 +1044,7 @@ async function gracefulShutdown(signal) {
           ? (minSmaSlopePctEff * regimeInfo.kMinSlope)
           : null;
 
-        const dynamicMaxMomentum = MAX_MOMENTUM_PCT;
+        const dynamicMaxMomentumBase = MAX_MOMENTUM_PCT;
 
         // If MIN_SMA_SLOPE_PCT is set, use pct-based slope threshold (works across assets).
         // Otherwise fall back to ABS (price units) legacy behavior.
@@ -1068,7 +1068,7 @@ async function gracefulShutdown(signal) {
           effectiveMinMom = dynamicMinMomentum * (1 - MOM_REDUCTION_PCT);
         }
 
-        const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= dynamicMaxMomentum;
+        const momentumOkBase = momentum_pct >= effectiveMinMom && momentum_pct <= dynamicMaxMomentumBase;
 
         const adxOk = (!USE_ADX_FILTER || !(MIN_ADX > 0))
           ? true
@@ -1085,6 +1085,31 @@ async function gracefulShutdown(signal) {
         const supertrendOk = (!USE_SUPERTREND_FILTER)
           ? true
           : (st.dir === 1);
+
+        // IMPULSE mode (optional): relax caps ONLY in very strong context.
+        // NOTE: computed AFTER donch/adx/trend are available, to avoid TDZ issues.
+        const impulseEnabled = !!cfg.IMPULSE_ENABLED;
+        const impulseRequireMicroTrending = (cfg.IMPULSE_REQUIRE_MICRO_TRENDING !== undefined)
+          ? !!cfg.IMPULSE_REQUIRE_MICRO_TRENDING
+          : true;
+        const impulseMinAdx = Number.isFinite(Number(cfg.IMPULSE_MIN_ADX)) ? Number(cfg.IMPULSE_MIN_ADX) : 45;
+        const impulseMaxAtrPct = Number.isFinite(Number(cfg.IMPULSE_MAX_ATR_PCT)) ? Number(cfg.IMPULSE_MAX_ATR_PCT) : 0;
+        const impulseMaxMomentumPct = Number.isFinite(Number(cfg.IMPULSE_MAX_MOMENTUM_PCT)) ? Number(cfg.IMPULSE_MAX_MOMENTUM_PCT) : 0;
+
+        const impulseCtx = impulseEnabled &&
+          trendUpEff &&
+          priceAboveSMA &&
+          donchBreakoutUp &&
+          (adxInfo.adx != null && Number.isFinite(adxInfo.adx) && adxInfo.adx >= impulseMinAdx) &&
+          (!impulseRequireMicroTrending || regimeInfo.microRegime === 'TRENDING');
+
+        const maxMomEff = (impulseCtx && impulseMaxMomentumPct > 0) ? impulseMaxMomentumPct : dynamicMaxMomentumBase;
+        const momentumOk = momentum_pct >= effectiveMinMom && momentum_pct <= maxMomEff;
+
+        const maxAtrEff = (impulseCtx && impulseMaxAtrPct > 0) ? impulseMaxAtrPct : MAX_ATR_PCT;
+        const atrMaxOk = (!Number.isFinite(maxAtrEff) || maxAtrEff <= 0)
+          ? true
+          : (atrPctNum <= maxAtrEff);
 
         // Baseline-parity defensive regime skips (normalized)
         const lowVolBlocked = !!SKIP_LOW_VOL_HARD && (regimeInfo.volRegime === 'LOW_VOL');
