@@ -137,8 +137,8 @@ function createLiveExecutorMexc(ctx) {
         const bid = pickNum(bt, 'bidPrice', 'bid');
         const _makerOffset = Number.isFinite(ctx.makerEntryPriceOffsetPct) ? ctx.makerEntryPriceOffsetPct : 0;
         let price = (bid != null && bid > 0)
-          ? bid * (1 - _makerOffset)
-          : trade.entryPrice * (1 - _makerOffset);
+          ? bid * (1 + _makerOffset)
+          : trade.entryPrice * (1 + _makerOffset);
         const norm = await mexc.normalizeLimit(sym, trade.size, price, httpTimeoutMs);
 
         entryOrder = await mexc.placeOrder({
@@ -417,79 +417,96 @@ function createLiveExecutorMexc(ctx) {
       }
     } catch (_) {}
 
-    // 1) Maker attempt: LIMIT_MAKER slightly ABOVE best ask (avoid immediate-match rejection)
-    // IMPORTANT: clientOrderId must be unique per attempt (MEXC rejects duplicates with 400).
-    // Put entropy early to survive truncation in sanitizeClientOrderId.
-    const makerClientId = sanitizeClientOrderId(`c_${label}_${Date.now()}_${trade.id}_mk`);
-    let makerOrderId = null;
-    let makerOrd = null;
-    try {
-      const bt = await mexc.bookTicker(sym, httpTimeoutMs);
-      const ask = pickNum(bt, 'askPrice', 'ask');
-      const px0 = (ask != null && ask > 0) ? ask : (await getTickerCached(sym, httpTimeoutMs, 0)) || null;
-
-      // Small offset to reduce LIMIT_MAKER 400 rejections when spread is tiny.
-      const makerCloseOffsetPct = 0.0002;
-      const px = (px0 != null && px0 > 0) ? (px0 * (1 + makerCloseOffsetPct)) : null;
-
-      if (px != null && px > 0) {
-        const norm = await mexc.normalizeLimit(sym, qty, px, httpTimeoutMs);
-        if (verbose) {
-          console.error('LIVE close maker-first attempt:', {
-            symbol: sym,
-            reason: closeReason,
-            qty,
-            ask: px0,
-            px,
-            normQty: norm.qty,
-            normPrice: norm.price,
-            clientId: makerClientId,
-          });
-        }
-        const placed = await mexc.placeOrder({
-          symbol: sym,
-          side: 'SELL',
-          type: 'LIMIT_MAKER',
-          quantity: norm.qty,
-          price: norm.price,
-          newClientOrderId: makerClientId,
-        }, httpTimeoutMs);
-        makerOrderId = placed?.orderId || placed?.order_id || null;
-      }
-    } catch (e) {
-      const resp = e?.response?.data;
-      if (verbose) {
-        console.error('LIVE close maker-first place failed:', e.message, resp ? { resp } : '');
-      } else {
-        console.error('LIVE close maker-first place failed:', e.message);
-      }
-    }
+    // 1) Maker attempts (LIMIT_MAKER) with fresh bookTicker each time
+    // Reuse existing maker-entry params (avoid introducing new config keys)
+    const makerCloseOffsetPct = Number.isFinite(ctx?.makerEntryPriceOffsetPct) ? ctx.makerEntryPriceOffsetPct : 0.0002;
+    const makerMaxAttempts = Math.max(1, Number(opts?.makerMaxAttempts ?? makerEntryMaxAttempts ?? 1));
+    const makerRetrySleepMs = Math.max(0, Number(opts?.makerRetrySleepMs ?? makerEntryRetrySleepMs ?? 0));
 
     let makerExecQty = 0;
     let makerAvg = null;
+    let makerOrderId = null;
 
-    if (makerOrderId) {
-      makerOrd = await mexc.waitForFill({
-        symbol: sym,
-        orderId: makerOrderId,
-        origClientOrderId: makerClientId,
-        timeoutMs: makerTimeoutMs,
-        pollMs: orderPollMs,
-        httpTimeoutMs,
-      });
+    for (let attempt = 1; attempt <= makerMaxAttempts; attempt++) {
+      // IMPORTANT: clientOrderId must be unique per attempt (MEXC rejects duplicates with 400)
+      const makerClientId = sanitizeClientOrderId(`c_${label}_${Date.now()}_${trade.id}_mk_a${attempt}`);
+      makerOrderId = null;
+      let makerOrd = null;
 
       try {
-        const ordNow = makerOrd || await mexc.getOrder({ symbol: sym, orderId: makerOrderId, origClientOrderId: makerClientId }, httpTimeoutMs);
-        if (ordNow) makerOrd = ordNow;
-      } catch (_) {}
+        const bt = await mexc.bookTicker(sym, httpTimeoutMs);
+        const ask = pickNum(bt, 'askPrice', 'ask');
+        const px0 = (ask != null && ask > 0) ? ask : (await getTickerCached(sym, httpTimeoutMs, 0)) || null;
 
-      makerExecQty = pickNum(makerOrd, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
-      makerAvg = mexc.orderAvgFillPrice(makerOrd);
+        // SELL maker: place slightly BELOW ask to be best ask without crossing bid
+        const px = (px0 != null && px0 > 0) ? (px0 * (1 - makerCloseOffsetPct)) : null;
 
-      // Cancel remainder
-      try {
-        await mexc.cancelOrder({ symbol: sym, orderId: makerOrderId }, httpTimeoutMs);
-      } catch (_) {}
+        if (px != null && px > 0) {
+          const norm = await mexc.normalizeLimit(sym, qty, px, httpTimeoutMs);
+          if (verbose) {
+            console.error('LIVE close maker attempt:', {
+              attempt,
+              maxAttempts: makerMaxAttempts,
+              symbol: sym,
+              reason: closeReason,
+              qty,
+              ask: px0,
+              px,
+              normQty: norm.qty,
+              normPrice: norm.price,
+              clientId: makerClientId,
+            });
+          }
+
+          const placed = await mexc.placeOrder({
+            symbol: sym,
+            side: 'SELL',
+            type: 'LIMIT_MAKER',
+            quantity: norm.qty,
+            price: norm.price,
+            newClientOrderId: makerClientId,
+          }, httpTimeoutMs);
+          makerOrderId = placed?.orderId || placed?.order_id || null;
+        }
+      } catch (e) {
+        const resp = e?.response?.data;
+        if (verbose) {
+          console.error('LIVE close maker place failed:', e.message, resp ? { resp } : '');
+        } else {
+          console.error('LIVE close maker place failed:', e.message);
+        }
+      }
+
+      if (makerOrderId) {
+        makerOrd = await mexc.waitForFill({
+          symbol: sym,
+          orderId: makerOrderId,
+          origClientOrderId: makerClientId,
+          timeoutMs: makerTimeoutMs,
+          pollMs: orderPollMs,
+          httpTimeoutMs,
+        });
+
+        try {
+          const ordNow = makerOrd || await mexc.getOrder({ symbol: sym, orderId: makerOrderId, origClientOrderId: makerClientId }, httpTimeoutMs);
+          if (ordNow) makerOrd = ordNow;
+        } catch (_) {}
+
+        makerExecQty = pickNum(makerOrd, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
+        makerAvg = mexc.orderAvgFillPrice(makerOrd);
+
+        // Cancel remainder of this attempt before retrying
+        try {
+          await mexc.cancelOrder({ symbol: sym, orderId: makerOrderId }, httpTimeoutMs);
+        } catch (_) {}
+      }
+
+      const filledEnough = makerExecQty >= (qty * 0.999999);
+      if (filledEnough) break;
+
+      if (attempt < makerMaxAttempts) {
+        if (makerRetrySleepMs > 0) await sleep(makerRetrySleepMs);
+      }
     }
 
     const filledEnough = makerExecQty >= (qty * 0.999999);
