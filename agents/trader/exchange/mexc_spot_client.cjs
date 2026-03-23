@@ -150,6 +150,14 @@ function createMexcSpotClient(opts) {
     return signed('GET', '/api/v3/openOrders', params, timeoutMs);
   }
 
+  async function myTrades(params, timeoutMs) {
+    return signed('GET', '/api/v3/myTrades', params, timeoutMs);
+  }
+
+  async function klines(params, timeoutMs) {
+    return publicGet('/api/v3/klines', params, timeoutMs);
+  }
+
   async function waitForFill({ symbol, orderId, origClientOrderId, timeoutMs = 15000, pollMs = 500, httpTimeoutMs }) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
@@ -176,6 +184,8 @@ function createMexcSpotClient(opts) {
     getOrder,
     cancelOrder,
     openOrders,
+    myTrades,
+    klines,
     waitForFill,
     // helpers
     isOrderFilled,

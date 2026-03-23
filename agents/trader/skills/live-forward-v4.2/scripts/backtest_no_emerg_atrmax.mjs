@@ -200,6 +200,13 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker,
   const MIN_MOMENTUM_PCT = Number(cfg.MIN_MOMENTUM_PCT ?? 0.0005);
   const MAX_MOMENTUM_PCT = Number(cfg.MAX_MOMENTUM_PCT ?? 1);
 
+  // IMPULSE mode (dynamic relaxation of ATR and momentum caps)
+  const IMPULSE_ENABLED = !!cfg.IMPULSE_ENABLED;
+  const IMPULSE_MAX_ATR_PCT = Number(cfg.IMPULSE_MAX_ATR_PCT ?? 0);
+  const IMPULSE_MAX_MOMENTUM_PCT = Number(cfg.IMPULSE_MAX_MOMENTUM_PCT ?? 0);
+  const IMPULSE_MIN_ADX = Number(cfg.IMPULSE_MIN_ADX ?? 0);
+  const IMPULSE_REQUIRE_MICRO_TRENDING = cfg.IMPULSE_REQUIRE_MICRO_TRENDING !== undefined ? !!cfg.IMPULSE_REQUIRE_MICRO_TRENDING : true;
+
   const MIN_SLOPE_NORM = Number(cfg.MIN_SLOPE_NORM ?? 0);
   const MIN_SLOPE_NORM_BY_SYMBOL = cfg.MIN_SLOPE_NORM_BY_SYMBOL || {};
   const minSlopeNormEff = Number.isFinite(Number(MIN_SLOPE_NORM_BY_SYMBOL[symbol]))
@@ -599,11 +606,18 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker,
           }
         }
 
-        // TP1 partial (wick-based, maker exit)
+        // TP1 partial (wick-based; configurable exit fee side)
         if (!didClose && !open.tp1AsTp && !open.tp1Hit && open.qtyA > 0 && Number.isFinite(curHigh) && curHigh >= open.tp1) {
           const exit = open.tp1;
           const grossA = open.qtyA * (exit - open.entryPrice);
-          const feeA = feeEstimate(open.entryPrice, exit, open.qtyA, feeRateMaker, feeRateMaker);
+          const partialExitTaker = !!cfg.PARTIAL_TP_EXIT_TAKER;
+          const feeA = feeEstimate(
+            open.entryPrice,
+            exit,
+            open.qtyA,
+            feeRateMaker,
+            partialExitTaker ? feeRateTaker : feeRateMaker
+          );
           open.realizedGross += grossA;
           open.realizedNet += (grossA - feeA);
           open.tp1Hit = true;
@@ -841,10 +855,6 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker,
       if (funnel) funnel.atr++;
       continue;
     }
-    if (Number.isFinite(DEF_MAX_ATR_PCT) && DEF_MAX_ATR_PCT > 0 && atrPctNum > DEF_MAX_ATR_PCT) {
-      if (funnel) funnel.atr++;
-      continue;
-    }
 
     const realizedVol = mr.computeRealizedVol(closesSeries, 30);
     const regimeInfo = mr.detectMarketRegime({
@@ -892,7 +902,7 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker,
 
     const dynamicMinMom = MIN_MOMENTUM_PCT * regimeInfo.kMinMomentum;
     const effectiveMinMom = dynamicMinMom;
-    const momentumOk = (momentum_pct >= effectiveMinMom) && (momentum_pct <= MAX_MOMENTUM_PCT);
+    let momentumOk = (momentum_pct >= effectiveMinMom) && (momentum_pct <= MAX_MOMENTUM_PCT);
 
     // Extra indicators (match live service gating; no effect if USE_* is false)
     const adxInfo = mr.computeAdx(window, ADX_WINDOW);
@@ -924,6 +934,27 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker,
     const stOk = (!USE_SUPERTREND_FILTER)
       ? true
       : (st.dir === 1);
+
+    // IMPULSE dynamic caps for ATR% and momentum
+    let effectiveMaxAtPct = DEF_MAX_ATR_PCT; // from env
+    let effectiveMaxMomPct = MAX_MOMENTUM_PCT;
+
+    if (IMPULSE_ENABLED) {
+      const adxVal = adxInfo?.adx;
+      if (adxVal != null && adxVal >= IMPULSE_MIN_ADX && trendUp && priceAboveSMA && donchOk && (!IMPULSE_REQUIRE_MICRO_TRENDING || regimeInfo?.microRegime === 'TRENDING')) {
+        if (IMPULSE_MAX_ATR_PCT > 0) effectiveMaxAtPct = IMPULSE_MAX_ATR_PCT;
+        if (IMPULSE_MAX_MOMENTUM_PCT > 0) effectiveMaxMomPct = IMPULSE_MAX_MOMENTUM_PCT;
+      }
+    }
+
+    // Apply ATR ceiling (dynamic)
+    if (effectiveMaxAtPct > 0 && atrPctNum > effectiveMaxAtPct) {
+      if (funnel) funnel.atr++;
+      continue;
+    }
+
+    // Re-evaluate momentumOk using dynamic cap
+    momentumOk = (momentum_pct >= effectiveMinMom) && (momentum_pct <= effectiveMaxMomPct);
 
     const shouldEnter = atrOk && slopeNormOk && momentumOk && trendUp && priceNearSMA && priceAboveSMA && volumeOk && adxOk && diBullOk && donchOk && stOk && !weakBody && !weakOpen && !explosive;
 

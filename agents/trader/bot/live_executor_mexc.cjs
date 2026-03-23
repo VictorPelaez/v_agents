@@ -137,8 +137,8 @@ function createLiveExecutorMexc(ctx) {
         const bid = pickNum(bt, 'bidPrice', 'bid');
         const _makerOffset = Number.isFinite(ctx.makerEntryPriceOffsetPct) ? ctx.makerEntryPriceOffsetPct : 0;
         let price = (bid != null && bid > 0)
-          ? bid * (1 + _makerOffset)
-          : trade.entryPrice * (1 + _makerOffset);
+          ? bid * (1 - _makerOffset)
+          : trade.entryPrice * (1 - _makerOffset);
         const norm = await mexc.normalizeLimit(sym, trade.size, price, httpTimeoutMs);
 
         entryOrder = await mexc.placeOrder({
@@ -306,6 +306,51 @@ function createLiveExecutorMexc(ctx) {
     return true;
   }
 
+  async function computeFeeUsdRealForOrderId(symbol, orderId) {
+    try {
+      const fills = await mexc.myTrades({ symbol, orderId }, httpTimeoutMs);
+      const arr = Array.isArray(fills) ? fills : (fills?.data || []);
+      if (!Array.isArray(arr) || arr.length === 0) return { feeUsd: null, feeByAsset: null, ts: null };
+
+      const feeByAsset = {};
+      let t0 = null;
+      for (const t of arr) {
+        const asset = String(t?.commissionAsset || '').toUpperCase();
+        const c = Number(t?.commission);
+        const tt = Number(t?.time);
+        if (!asset || !Number.isFinite(c)) continue;
+        feeByAsset[asset] = (feeByAsset[asset] || 0) + c;
+        if (Number.isFinite(tt)) t0 = (t0 == null) ? tt : Math.min(t0, tt);
+      }
+
+      let feeUsd = 0;
+      for (const [asset, amt] of Object.entries(feeByAsset)) {
+        if (!Number.isFinite(amt) || amt <= 0) continue;
+        if (asset === 'USDT') {
+          feeUsd += amt;
+          continue;
+        }
+        const pair = `${asset}USDT`;
+        // Use 1m kline around the earliest fill time.
+        const ts = (t0 != null) ? t0 : Date.now();
+        const kl = await mexc.klines({ symbol: pair, interval: '1m', startTime: ts - 60000, endTime: ts + 60000, limit: 3 }, httpTimeoutMs);
+        const k = Array.isArray(kl) && kl.length ? kl[kl.length - 1] : null;
+        const px = k ? Number(k[4]) : NaN; // close
+        if (Number.isFinite(px) && px > 0) {
+          feeUsd += amt * px;
+        } else {
+          // Can't convert -> return null to avoid writing incorrect "real" fees.
+          return { feeUsd: null, feeByAsset, ts };
+        }
+      }
+
+      return { feeUsd, feeByAsset, ts: t0 };
+    } catch (e) {
+      if (verbose) console.error('computeFeeUsdRealForOrderId failed:', e.message);
+      return { feeUsd: null, feeByAsset: null, ts: null };
+    }
+  }
+
   async function closeTradeLiveMarket(trade, closeReason) {
     const sym = trade.symbol;
     let qty = (await mexc.normalizeQuantity(sym, trade.size, httpTimeoutMs)).qty;
@@ -317,7 +362,7 @@ function createLiveExecutorMexc(ctx) {
       }
     } catch (_) {}
 
-    const clientId = `close_${label}_${trade.id}_${closeReason}`;
+    const clientId = sanitizeClientOrderId(`c_${label}_${Date.now()}_${trade.id}_mkt`);
     const mkt = await mexc.placeOrder({
       symbol: sym,
       side: 'SELL',
@@ -332,6 +377,23 @@ function createLiveExecutorMexc(ctx) {
       : null;
 
     const avgExit = mexc.orderAvgFillPrice(filled) ?? (await getTickerCached(sym, httpTimeoutMs, 0));
+
+    // Real fee (best-effort): sum entry+exit commissions converted to USDT using 1m kline of commission asset.
+    try {
+      const entryOrderId = trade.entryOrderId;
+      const exitOrderId = orderId;
+      const entryFee = entryOrderId ? await computeFeeUsdRealForOrderId(sym, entryOrderId) : { feeUsd: null };
+      const exitFee = exitOrderId ? await computeFeeUsdRealForOrderId(sym, exitOrderId) : { feeUsd: null };
+      const feeUsdReal = (Number.isFinite(entryFee.feeUsd) ? entryFee.feeUsd : 0) + (Number.isFinite(exitFee.feeUsd) ? exitFee.feeUsd : 0);
+      if (feeUsdReal > 0) {
+        trade.feeUsdReal = feeUsdReal;
+        // Precompute profit after real fees (closeTrade will compute profit the same way).
+        const qtyNum = Number(trade.size || 0);
+        const realizedGross = Number(trade.realizedGross || 0);
+        const profit = realizedGross + (avgExit - trade.entryPrice) * qtyNum;
+        trade.profitAfterFeesReal = profit - feeUsdReal;
+      }
+    } catch (_) {}
 
     trade.mode = 'live';
     trade.executionExit = 'taker';
@@ -355,16 +417,35 @@ function createLiveExecutorMexc(ctx) {
       }
     } catch (_) {}
 
-    // 1) Maker attempt: LIMIT_MAKER at best ask
-    const makerClientId = sanitizeClientOrderId(`close_${label}_${trade.id}_${closeReason}_mk`);
+    // 1) Maker attempt: LIMIT_MAKER slightly ABOVE best ask (avoid immediate-match rejection)
+    // IMPORTANT: clientOrderId must be unique per attempt (MEXC rejects duplicates with 400).
+    // Put entropy early to survive truncation in sanitizeClientOrderId.
+    const makerClientId = sanitizeClientOrderId(`c_${label}_${Date.now()}_${trade.id}_mk`);
     let makerOrderId = null;
     let makerOrd = null;
     try {
       const bt = await mexc.bookTicker(sym, httpTimeoutMs);
       const ask = pickNum(bt, 'askPrice', 'ask');
-      const px = (ask != null && ask > 0) ? ask : (await getTickerCached(sym, httpTimeoutMs, 0)) || null;
+      const px0 = (ask != null && ask > 0) ? ask : (await getTickerCached(sym, httpTimeoutMs, 0)) || null;
+
+      // Small offset to reduce LIMIT_MAKER 400 rejections when spread is tiny.
+      const makerCloseOffsetPct = 0.0002;
+      const px = (px0 != null && px0 > 0) ? (px0 * (1 + makerCloseOffsetPct)) : null;
+
       if (px != null && px > 0) {
         const norm = await mexc.normalizeLimit(sym, qty, px, httpTimeoutMs);
+        if (verbose) {
+          console.error('LIVE close maker-first attempt:', {
+            symbol: sym,
+            reason: closeReason,
+            qty,
+            ask: px0,
+            px,
+            normQty: norm.qty,
+            normPrice: norm.price,
+            clientId: makerClientId,
+          });
+        }
         const placed = await mexc.placeOrder({
           symbol: sym,
           side: 'SELL',
@@ -376,7 +457,12 @@ function createLiveExecutorMexc(ctx) {
         makerOrderId = placed?.orderId || placed?.order_id || null;
       }
     } catch (e) {
-      if (verbose) console.error('LIVE close maker-first place failed:', e.message);
+      const resp = e?.response?.data;
+      if (verbose) {
+        console.error('LIVE close maker-first place failed:', e.message, resp ? { resp } : '');
+      } else {
+        console.error('LIVE close maker-first place failed:', e.message);
+      }
     }
 
     let makerExecQty = 0;
@@ -409,6 +495,23 @@ function createLiveExecutorMexc(ctx) {
     const filledEnough = makerExecQty >= (qty * 0.999999);
     if (filledEnough) {
       const avgExit = (makerAvg != null) ? makerAvg : (await getTickerCached(sym, httpTimeoutMs, 0));
+
+      // Real fee (best-effort): entry+exit commissions converted to USDT
+      try {
+        const entryOrderId = trade.entryOrderId;
+        const exitOrderId = makerOrderId;
+        const entryFee = entryOrderId ? await computeFeeUsdRealForOrderId(sym, entryOrderId) : { feeUsd: null };
+        const exitFee = exitOrderId ? await computeFeeUsdRealForOrderId(sym, exitOrderId) : { feeUsd: null };
+        const feeUsdReal = (Number.isFinite(entryFee.feeUsd) ? entryFee.feeUsd : 0) + (Number.isFinite(exitFee.feeUsd) ? exitFee.feeUsd : 0);
+        if (feeUsdReal > 0) {
+          trade.feeUsdReal = feeUsdReal;
+          const qtyNum = Number(trade.size || 0);
+          const realizedGross = Number(trade.realizedGross || 0);
+          const profit = realizedGross + (avgExit - trade.entryPrice) * qtyNum;
+          trade.profitAfterFeesReal = profit - feeUsdReal;
+        }
+      } catch (_) {}
+
       trade.mode = 'live';
       trade.executionExit = 'maker';
       trade.feeRateExit = feeRateMaker;
@@ -421,18 +524,30 @@ function createLiveExecutorMexc(ctx) {
 
     let mktExecQty = 0;
     let mktAvg = null;
+    let mktOrderId = null;
 
     if (remaining > 0) {
-      const mktClientId = sanitizeClientOrderId(`close_${label}_${trade.id}_${closeReason}_mkt`);
-      const mkt = await mexc.placeOrder({
-        symbol: sym,
-        side: 'SELL',
-        type: 'MARKET',
-        quantity: remaining,
-        newClientOrderId: mktClientId,
-      }, httpTimeoutMs);
+      // Unique clientOrderId (avoid duplicate id across retries)
+      const mktClientId = sanitizeClientOrderId(`c_${label}_${Date.now()}_${trade.id}_mkt`);
+      if (verbose) {
+        console.error('LIVE close maker-first fallback MARKET:', { symbol: sym, reason: closeReason, remaining, clientId: mktClientId });
+      }
+      let mkt;
+      try {
+        mkt = await mexc.placeOrder({
+          symbol: sym,
+          side: 'SELL',
+          type: 'MARKET',
+          quantity: remaining,
+          newClientOrderId: mktClientId,
+        }, httpTimeoutMs);
+      } catch (e) {
+        const resp = e?.response?.data;
+        console.error('LIVE close maker-first MARKET failed:', e.message, resp ? { resp } : '');
+        throw e;
+      }
 
-      const mktOrderId = mkt?.orderId || mkt?.order_id || null;
+      mktOrderId = mkt?.orderId || mkt?.order_id || null;
       const filled = mktOrderId
         ? await mexc.waitForFill({ symbol: sym, orderId: mktOrderId, origClientOrderId: mktClientId, timeoutMs: 15000, pollMs: orderPollMs, httpTimeoutMs })
         : null;
@@ -445,6 +560,22 @@ function createLiveExecutorMexc(ctx) {
     const quoteMaker = (makerAvg != null ? makerAvg : trade.entryPrice) * makerExecQty;
     const quoteMkt = (mktAvg != null ? mktAvg : trade.entryPrice) * mktExecQty;
     const avgExit = execQty > 0 ? ((quoteMaker + quoteMkt) / execQty) : (await getTickerCached(sym, httpTimeoutMs, 0));
+
+    // Real fee (best-effort): entry+exit commissions converted to USDT
+    try {
+      const entryOrderId = trade.entryOrderId;
+      const exitOrderId = mktOrderId || makerOrderId;
+      const entryFee = entryOrderId ? await computeFeeUsdRealForOrderId(sym, entryOrderId) : { feeUsd: null };
+      const exitFee = exitOrderId ? await computeFeeUsdRealForOrderId(sym, exitOrderId) : { feeUsd: null };
+      const feeUsdReal = (Number.isFinite(entryFee.feeUsd) ? entryFee.feeUsd : 0) + (Number.isFinite(exitFee.feeUsd) ? exitFee.feeUsd : 0);
+      if (feeUsdReal > 0) {
+        trade.feeUsdReal = feeUsdReal;
+        const qtyNum = Number(trade.size || 0);
+        const realizedGross = Number(trade.realizedGross || 0);
+        const profit = realizedGross + (avgExit - trade.entryPrice) * qtyNum;
+        trade.profitAfterFeesReal = profit - feeUsdReal;
+      }
+    } catch (_) {}
 
     trade.mode = 'live';
     trade.executionExit = (makerExecQty > 0 && mktExecQty > 0) ? 'maker+fallback_taker' : 'taker';

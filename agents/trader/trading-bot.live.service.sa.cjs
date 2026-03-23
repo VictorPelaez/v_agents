@@ -1096,8 +1096,11 @@ async function gracefulShutdown(signal) {
         const impulseMaxAtrPct = Number.isFinite(Number(cfg.IMPULSE_MAX_ATR_PCT)) ? Number(cfg.IMPULSE_MAX_ATR_PCT) : 0;
         const impulseMaxMomentumPct = Number.isFinite(Number(cfg.IMPULSE_MAX_MOMENTUM_PCT)) ? Number(cfg.IMPULSE_MAX_MOMENTUM_PCT) : 0;
 
+        // Compute an internal trend gate for IMPULSE (cannot reference trendUpEff here due to TDZ)
+        const trendUpEffForImpulse = (String(TREND_GATE_MODE).toLowerCase() === 'no_trend') ? true : !!trendUp;
+
         const impulseCtx = impulseEnabled &&
-          trendUpEff &&
+          trendUpEffForImpulse &&
           priceAboveSMA &&
           donchBreakoutUp &&
           (adxInfo.adx != null && Number.isFinite(adxInfo.adx) && adxInfo.adx >= impulseMinAdx) &&
