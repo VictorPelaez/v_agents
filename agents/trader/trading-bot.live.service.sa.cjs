@@ -1126,7 +1126,8 @@ async function gracefulShutdown(signal) {
         const trendUpEff = (String(TREND_GATE_MODE).toLowerCase() === 'no_trend') ? true : !!trendUp;
 
         // Hour block filter (CLOSED_STRATEGY: skip trading at certain UTC hours)
-        const entryHour = new Date(Number(current[0])).getUTCHours();
+        // Use the just-closed candle timestamp (not a TDZ 'current' reference)
+        const entryHour = new Date(Number(candle.ts)).getUTCHours();
         const blockedHour = Array.isArray(cfg.BLOCKED_HOURS_UTC) && cfg.BLOCKED_HOURS_UTC.includes(entryHour);
 
         const shouldEnter = regimeOk &&
