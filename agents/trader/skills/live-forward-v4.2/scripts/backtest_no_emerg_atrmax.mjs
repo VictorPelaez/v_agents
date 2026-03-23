@@ -164,7 +164,7 @@ function nowIsoFromMs(ms) {
   return new Date(ms).toISOString();
 }
 
-function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker }) {
+function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker, debugFunnel }) {
   // Partial TP settings (fixed for this experiment)
   const TP1_PCT = Number(cfg.TP1_PCT ?? 0.005);     // +0.5%
   const TP1_FRAC = Number(cfg.TP1_FRAC ?? 0.5);     // 50%
@@ -207,7 +207,9 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
     : MIN_SLOPE_NORM;
 
   const minCandleBody = Number(cfg.MIN_BODY_CANDLE ?? 0.5);
-  const explosiveCandlePct = Number(cfg.EXPLOSIVE_CANDLE_PCT ?? 0);
+  // Important: if EXPLOSIVE_CANDLE_PCT is missing, default to a sensible non-zero value.
+  // A 0 default would block all entries (bodyPct must be >= explosiveCandlePct).
+  const explosiveCandlePct = Number(cfg.EXPLOSIVE_CANDLE_PCT ?? 0.003);
   const MIN_VOLUME = Number(cfg.MIN_VOLUME ?? 0);
   const smaTol = Number(cfg.SMA_TOLERANCE ?? 0.001);
 
@@ -273,11 +275,6 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
   // If >0, only trigger the reversal-exit if MFE% is below this threshold (i.e., "no continuation").
   const DEF_EXIT_REVERSAL_MFE_MAX_PCT = Number(process.env.DEF_EXIT_REVERSAL_MFE_MAX_PCT || 0);
 
-  const rt = {
-    atrHistory: [],
-    lastAtrCandleTs: null,
-  };
-
   function computeRegimeFromWindow(window) {
     try {
       const closesSeries = mr.getClosedCloses(window);
@@ -296,11 +293,39 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
   }
 
   /** open trade or null */
+  // Debug funnel (local, ES module safe)
+  const useDebugFunnel = String(process.env.DEBUG_FUNNEL || '0') === '1';
+  const funnel = useDebugFunnel ? {
+    total: 0,
+    atr: 0,
+    vol: 0,
+    body: 0,
+    explosive: 0,
+    momentum: 0,
+    slopeAbs: 0,
+    trend: 0,
+    donch: 0,
+    adx: 0,
+    diBull: 0,
+    st: 0,
+    weakBody: 0,
+    weakOpen: 0,
+    regime: 0,
+    curLow: 0,
+    netProfit: 0,
+    passed: 0,
+    blockedHour: 0
+  } : null;
+
   let open = null;
   const closes = [];
+  // Adaptive ATR state (per symbol series)
+  const rt = { atrHistory: [], lastAtrCandleTs: null };
 
   // Need room for current candle
   for (let idx = Math.max(SMA_WINDOW + 5, ATR_WINDOW + 10); idx < klines.length - 2; idx++) {
+    if (debugFunnel) debugFunnel.total++;
+    if (funnel) funnel.total++;
     const sliceStart = Math.max(0, idx - 500);
     const window = klines.slice(sliceStart, idx + 2); // includes current candle at idx+1
 
@@ -332,6 +357,11 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
         if (Number.isFinite(curHigh) && Number.isFinite(open._maxPriceSinceOpen)) {
           open._maxPriceSinceOpen = Math.max(open._maxPriceSinceOpen, curHigh);
         }
+        // Track MAE using candle low
+        if (open._minPriceSinceOpen == null || !Number.isFinite(open._minPriceSinceOpen)) open._minPriceSinceOpen = open.entryPrice;
+        if (Number.isFinite(curLow) && Number.isFinite(open._minPriceSinceOpen)) {
+          open._minPriceSinceOpen = Math.min(open._minPriceSinceOpen, curLow);
+        }
 
         let didClose = false;
         if (ageS > timeStopMinutes * 60) {
@@ -352,6 +382,8 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
             net: open.realizedNet + (remQty * (exit - open.entryPrice) - fee),
             tp1_hit: !!open.tp1Hit,
             duration_s: ageS,
+            mfe_pct: open._maxPriceSinceOpen != null && open.entryPrice > 0 ? ((open._maxPriceSinceOpen - open.entryPrice) / open.entryPrice) : 0,
+            mae_pct: open._minPriceSinceOpen != null && open.entryPrice > 0 ? ((open.entryPrice - open._minPriceSinceOpen) / open.entryPrice) : 0,
           });
           open = null;
           didClose = true;
@@ -387,6 +419,8 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
                 gross,
                 net: gross - fee,
                 duration_s: ageS,
+                mfe_pct: open._maxPriceSinceOpen != null && open.entryPrice > 0 ? ((open._maxPriceSinceOpen - open.entryPrice) / open.entryPrice) : 0,
+                mae_pct: open._minPriceSinceOpen != null && open.entryPrice > 0 ? ((open.entryPrice - open._minPriceSinceOpen) / open.entryPrice) : 0,
               });
               open = null;
               didClose = true;
@@ -449,6 +483,8 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
                     net,
                     tp1_hit: !!open.tp1Hit,
                     duration_s: ageS,
+                    mfe_pct: open._maxPriceSinceOpen != null && open.entryPrice > 0 ? ((open._maxPriceSinceOpen - open.entryPrice) / open.entryPrice) : 0,
+                    mae_pct: open._minPriceSinceOpen != null && open.entryPrice > 0 ? ((open.entryPrice - open._minPriceSinceOpen) / open.entryPrice) : 0,
                   });
                   open = null;
                   didClose = true;
@@ -553,6 +589,8 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
                   gross,
                   net: gross - fee,
                   duration_s: ageS,
+                  mfe_pct: open._maxPriceSinceOpen != null && open.entryPrice > 0 ? ((open._maxPriceSinceOpen - open.entryPrice) / open.entryPrice) : 0,
+                  mae_pct: open._minPriceSinceOpen != null && open.entryPrice > 0 ? ((open.entryPrice - open._minPriceSinceOpen) / open.entryPrice) : 0,
                 });
                 open = null;
                 didClose = true;
@@ -604,6 +642,8 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
               net: open.realizedNet + (remQty * (exit - open.entryPrice) - fee),
               tp1_hit: !!open.tp1Hit,
               duration_s: ageS,
+              mfe_pct: open._maxPriceSinceOpen != null && open.entryPrice > 0 ? ((open._maxPriceSinceOpen - open.entryPrice) / open.entryPrice) : 0,
+              mae_pct: open._minPriceSinceOpen != null && open.entryPrice > 0 ? ((open.entryPrice - open._minPriceSinceOpen) / open.entryPrice) : 0,
             });
             open = null;
             didClose = true;
@@ -676,6 +716,8 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
                   net: open.realizedNet + (remQty * (exit - open.entryPrice) - fee),
                   tp1_hit: !!open.tp1Hit,
                   duration_s: ageS,
+                  mfe_pct: open._maxPriceSinceOpen != null && open.entryPrice > 0 ? ((open._maxPriceSinceOpen - open.entryPrice) / open.entryPrice) : 0,
+                  mae_pct: open._minPriceSinceOpen != null && open.entryPrice > 0 ? ((open.entryPrice - open._minPriceSinceOpen) / open.entryPrice) : 0,
                 });
                 open = null;
                 didClose = true;
@@ -703,6 +745,8 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
               net: open.realizedNet + (remQty * (exit - open.entryPrice) - fee),
               tp1_hit: (open.tp1AsTp ? true : !!open.tp1Hit),
               duration_s: ageS,
+              mfe_pct: open._maxPriceSinceOpen != null && open.entryPrice > 0 ? ((open._maxPriceSinceOpen - open.entryPrice) / open.entryPrice) : 0,
+              mae_pct: open._minPriceSinceOpen != null && open.entryPrice > 0 ? ((open.entryPrice - open._minPriceSinceOpen) / open.entryPrice) : 0,
             });
             open = null;
           }
@@ -712,6 +756,15 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
 
     // --- 2) entry evaluation (only if no open position) ---
     if (open) continue;
+
+    // Filter blocked hours UTC
+    if (Array.isArray(cfg.BLOCKED_HOURS_UTC) && cfg.BLOCKED_HOURS_UTC.length > 0) {
+      const entryHour = new Date(Number(current[0])).getUTCHours();
+      if (cfg.BLOCKED_HOURS_UTC.includes(entryHour)) {
+        if (funnel) funnel.blockedHour = (funnel.blockedHour || 0) + 1;
+        continue;
+      }
+    }
 
     // closes series from closed candles
     const closesSeries = mr.getClosedCloses(window);
@@ -746,7 +799,9 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
         if (!Number.isFinite(hi) || !Number.isFinite(lo) || !Number.isFinite(cl) || cl <= 0) return 0;
         return (hi - lo) / cl;
       });
-      explosive = ranges.some((r) => r > explosiveCandlePct);
+      explosive = (Number.isFinite(explosiveCandlePct) && explosiveCandlePct > 0)
+        ? ranges.some((r) => r > explosiveCandlePct)
+        : false;
     } catch {
       explosive = false;
     }
@@ -783,9 +838,11 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
 
     // Defensive hard skip on ATR% (entry only)
     if (Number.isFinite(DEF_MIN_ATR_PCT_HARD) && DEF_MIN_ATR_PCT_HARD > 0 && atrPctNum < DEF_MIN_ATR_PCT_HARD) {
+      if (funnel) funnel.atr++;
       continue;
     }
     if (Number.isFinite(DEF_MAX_ATR_PCT) && DEF_MAX_ATR_PCT > 0 && atrPctNum > DEF_MAX_ATR_PCT) {
+      if (funnel) funnel.atr++;
       continue;
     }
 
@@ -800,17 +857,23 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
 
     // --- Defensive hard skips (entry only) ---
     if (DEF_SKIP_LOW_VOL_HARD && regimeInfo.volRegime === 'LOW_VOL') {
+      if (funnel) funnel.regime++;
       continue;
     }
     if (DEF_SKIP_CHOPPY_LOWVOL && regimeInfo.volRegime === 'LOW_VOL' && regimeInfo.microRegime === 'CHOPPY') {
+      if (funnel) funnel.regime++;
       continue;
     }
     if (DEF_SKIP_CHOPPY_HIGHVOL && regimeInfo.volRegime === 'HIGH_VOL' && regimeInfo.microRegime === 'CHOPPY') {
+      if (funnel) funnel.regime++;
       continue;
     }
     if (DEF_SKIP_CHOPPY_ALWAYS && regimeInfo.microRegime === 'CHOPPY') {
+      if (funnel) funnel.regime++;
       continue;
     }
+
+    // afterSkips no se usa; omitimos
 
     const dynamicMinSlopeAbs = MIN_SMA_SLOPE * regimeInfo.kMinSlope;
     const dynamicMinSlopePct = (MIN_SMA_SLOPE_PCT != null && Number.isFinite(MIN_SMA_SLOPE_PCT))
@@ -863,7 +926,34 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
       : (st.dir === 1);
 
     const shouldEnter = atrOk && slopeNormOk && momentumOk && trendUp && priceNearSMA && priceAboveSMA && volumeOk && adxOk && diBullOk && donchOk && stOk && !weakBody && !weakOpen && !explosive;
+
+    // Funnel counters (desired fields only)
+    if (funnel) {
+      if (!atrOk) funnel.atr++;
+      if (!momentumOk) funnel.momentum++;
+      if (!trendUp) {
+        if (dynamicMinSlopePct != null) {
+          funnel.trend++;
+        } else {
+          funnel.slopeAbs++;
+        }
+      }
+      if (!volumeOk) funnel.vol++;
+      if (!adxOk) funnel.adx++;
+      if (!diBullOk) funnel.diBull++;
+      if (!donchOk) funnel.donch++;
+      if (!stOk) funnel.st++;
+      if (weakBody) {
+        funnel.body++;
+        funnel.weakBody++;
+      }
+      if (weakOpen) funnel.weakOpen++;
+      if (explosive) funnel.explosive++;
+    }
+
     if (!shouldEnter) continue;
+
+    if (funnel) funnel.passed++;
 
     // Build TP/SL
     const entryPrice = candle.close;
@@ -896,13 +986,19 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
 
     // Skip if current candle already pierced ARMED SL (match live)
     const currentLow = Number(current?.[3]);
-    if (Number.isFinite(currentLow) && currentLow <= stopLoss) continue;
+    if (Number.isFinite(currentLow) && currentLow <= stopLoss) {
+      if (funnel) funnel.curLow++;
+      continue;
+    }
 
     const grossProfitAtTp = qty * (takeProfit - entryPrice);
     // Entry assumed maker (bot uses maker-entry attempts); TP assumed maker for this check.
     const feeEstAtTp = feeEstimate(entryPrice, takeProfit, qty, feeRateMaker, feeRateMaker);
     const netProfitAtTp = grossProfitAtTp - feeEstAtTp;
-    if (netProfitAtTp <= 0) continue;
+    if (netProfitAtTp <= 0) {
+      if (funnel) funnel.netProfit++;
+      continue;
+    }
 
     // Partial TP sizing (if TP1 is the only TP, disable partial logic)
     const qtyA = tp1AsTp ? 0 : Number((qty * TP1_FRAC).toFixed(8));
@@ -961,8 +1057,10 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker 
       openedAtMs: Number(current[0]),
       _slBreachStartMs: null,
       _maxPriceSinceOpen: entryPrice,
+      _minPriceSinceOpen: entryPrice,
       _rev5mChecked: false,
     };
+    if (debugFunnel) debugFunnel.opened++;
   }
 
   return closes;
@@ -986,6 +1084,25 @@ function summarize(closes) {
 async function main() {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const skillDir = path.resolve(__dirname, '..');
+
+  // Debug funnel (opt-in)
+  const DEBUG_FUNNEL = String(process.env.DEBUG_FUNNEL || '0') === '1';
+  const funnel = DEBUG_FUNNEL ? {
+    total: 0,
+    atr: 0, atrHard: 0, atrMax: 0,
+    vol: 0,
+    body: 0, explosive: 0,
+    momentum: 0, momentumMax: 0,
+    priceNear: 0, priceAbove: 0,
+    slopeNorm: 0, slopeAbs: 0, trend: 0,
+    donch: 0,
+    adx: 0, diBull: 0,
+    st: 0,
+    weakBody: 0, weakOpen: 0,
+    afterSkips: 0, shouldEnter: 0,
+    curLow: 0, netProfit: 0,
+    opened: 0
+  } : null;
 
   // --- CLI args ---
   const argv = process.argv.slice(2);
@@ -1073,7 +1190,14 @@ async function main() {
 
   const allCloses = [];
   for (const sym of symbols) {
-    const closes = backtestSymbolSeries({ symbol: sym, klines: klinesBySymbol[sym], cfg, feeRateMaker, feeRateTaker });
+    const closes = backtestSymbolSeries({ 
+      symbol: sym, 
+      klines: klinesBySymbol[sym], 
+      cfg, 
+      feeRateMaker, 
+      feeRateTaker,
+      debugFunnel: DEBUG_FUNNEL ? funnel : null 
+    });
     for (const c of closes) allCloses.push({ ...c, symbol: sym });
   }
 
@@ -1087,6 +1211,10 @@ async function main() {
   for (const sym of symbols) {
     const s = summarize(allCloses.filter((x) => x.symbol === sym));
     console.log(`  ${sym}:`, s);
+  }
+
+  if (DEBUG_FUNNEL) {
+    console.log('\nFUNNEL:', JSON.stringify(funnel, null, 2));
   }
 
   console.log('\nCLOSES (last 10):');

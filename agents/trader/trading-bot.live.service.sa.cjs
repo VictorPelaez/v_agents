@@ -1125,6 +1125,10 @@ async function gracefulShutdown(signal) {
         // Trend gate mode (strict by default)
         const trendUpEff = (String(TREND_GATE_MODE).toLowerCase() === 'no_trend') ? true : !!trendUp;
 
+        // Hour block filter (CLOSED_STRATEGY: skip trading at certain UTC hours)
+        const entryHour = new Date(Number(current[0])).getUTCHours();
+        const blockedHour = Array.isArray(cfg.BLOCKED_HOURS_UTC) && cfg.BLOCKED_HOURS_UTC.includes(entryHour);
+
         const shouldEnter = regimeOk &&
           atrOk &&
           atrHardOk &&
@@ -1141,7 +1145,8 @@ async function gracefulShutdown(signal) {
           supertrendOk &&
           !weakCandleBody &&
           !weakOpen &&
-          !candleExplosive;
+          !candleExplosive &&
+          !blockedHour;
 
         const decision = {
           iter: iterCount,
