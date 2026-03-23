@@ -451,6 +451,8 @@ async function gracefulShutdown(signal) {
     ? String(process.env.MAKER_ENTRY_ONLY) === '1'
     : !!cfgLive.MAKER_ENTRY_ONLY;
   const MAKER_ENTRY_TIMEOUT_MS = parseInt(process.env.MAKER_ENTRY_TIMEOUT_MS || cfgLive.MAKER_ENTRY_TIMEOUT_MS || 15000, 10);
+  const MAKER_ENTRY_MAX_ATTEMPTS = parseInt(process.env.MAKER_ENTRY_MAX_ATTEMPTS || cfgLive.MAKER_ENTRY_MAX_ATTEMPTS || 3, 10);
+  const MAKER_ENTRY_RETRY_SLEEP_MS = parseInt(process.env.MAKER_ENTRY_RETRY_SLEEP_MS || cfgLive.MAKER_ENTRY_RETRY_SLEEP_MS || 750, 10);
   const ORDER_POLL_MS = parseInt(process.env.ORDER_POLL_MS || cfgLive.ORDER_POLL_MS || 500, 10);
 
   const minCandleBody = parseFloat(process.env.MIN_BODY_CANDLE || cfgLive.MIN_BODY_CANDLE || 0.5);
@@ -641,6 +643,8 @@ async function gracefulShutdown(signal) {
         candleBucketMs,
         httpTimeoutMs: HTTP_TIMEOUT_MS,
         makerEntryTimeoutMs: MAKER_ENTRY_TIMEOUT_MS,
+        makerEntryMaxAttempts: MAKER_ENTRY_MAX_ATTEMPTS,
+        makerEntryRetrySleepMs: MAKER_ENTRY_RETRY_SLEEP_MS,
         makerEntryOnly: MAKER_ENTRY_ONLY,
         orderPollMs: ORDER_POLL_MS,
         tpOnExchange: TP_ON_EXCHANGE,
