@@ -406,7 +406,7 @@ function createLiveExecutorMexc(ctx) {
   // Use ONLY when it's acceptable that the maker leg might not fill quickly (e.g., time_stop).
   async function closeTradeLiveMakerFirst(trade, closeReason, opts) {
     const sym = trade.symbol;
-    const makerTimeoutMs = Number(opts?.makerTimeoutMs ?? 8000);
+    const makerTimeoutMs = Number(opts?.makerTimeoutMs ?? ctx?.makerCloseTimeoutMs ?? 8000);
 
     let qty = (await mexc.normalizeQuantity(sym, trade.size, httpTimeoutMs)).qty;
 
@@ -418,10 +418,18 @@ function createLiveExecutorMexc(ctx) {
     } catch (_) {}
 
     // 1) Maker attempts (LIMIT_MAKER) with fresh bookTicker each time
-    // Reuse existing maker-entry params (avoid introducing new config keys)
-    const makerCloseOffsetPct = Number.isFinite(ctx?.makerEntryPriceOffsetPct) ? ctx.makerEntryPriceOffsetPct : 0.0002;
-    const makerMaxAttempts = Math.max(1, Number(opts?.makerMaxAttempts ?? makerEntryMaxAttempts ?? 1));
-    const makerRetrySleepMs = Math.max(0, Number(opts?.makerRetrySleepMs ?? makerEntryRetrySleepMs ?? 0));
+    // Close-maker params (prefer dedicated config; fallback to entry params)
+    const makerCloseOffsetPct = Number.isFinite(ctx?.makerCloseOffsetPct)
+      ? ctx.makerCloseOffsetPct
+      : (Number.isFinite(ctx?.makerEntryPriceOffsetPct) ? ctx.makerEntryPriceOffsetPct : 0.0002);
+
+    const makerMaxAttempts = Math.max(1, Number(
+      opts?.makerMaxAttempts ?? ctx?.makerCloseMaxAttempts ?? makerEntryMaxAttempts ?? 1
+    ));
+
+    const makerRetrySleepMs = Math.max(0, Number(
+      opts?.makerRetrySleepMs ?? ctx?.makerCloseRetrySleepMs ?? makerEntryRetrySleepMs ?? 0
+    ));
 
     let makerExecQty = 0;
     let makerAvg = null;

@@ -454,6 +454,13 @@ async function gracefulShutdown(signal) {
   const MAKER_ENTRY_MAX_ATTEMPTS = parseInt(process.env.MAKER_ENTRY_MAX_ATTEMPTS || cfgLive.MAKER_ENTRY_MAX_ATTEMPTS || 3, 10);
   const MAKER_ENTRY_RETRY_SLEEP_MS = parseInt(process.env.MAKER_ENTRY_RETRY_SLEEP_MS || cfgLive.MAKER_ENTRY_RETRY_SLEEP_MS || 750, 10);
   const MAKER_ENTRY_PRICE_OFFSET_PCT = parseFloat(process.env.MAKER_ENTRY_PRICE_OFFSET_PCT || cfgLive.MAKER_ENTRY_PRICE_OFFSET_PCT || 0);
+
+  // Close-maker tuning (optional; defaults chosen for safety)
+  const MAKER_CLOSE_PRICE_OFFSET_PCT = parseFloat(process.env.MAKER_CLOSE_PRICE_OFFSET_PCT || cfgLive.MAKER_CLOSE_PRICE_OFFSET_PCT || 0.0001);
+  const MAKER_CLOSE_MAX_ATTEMPTS = parseInt(process.env.MAKER_CLOSE_MAX_ATTEMPTS || cfgLive.MAKER_CLOSE_MAX_ATTEMPTS || 3, 10);
+  const MAKER_CLOSE_RETRY_SLEEP_MS = parseInt(process.env.MAKER_CLOSE_RETRY_SLEEP_MS || cfgLive.MAKER_CLOSE_RETRY_SLEEP_MS || 500, 10);
+  const MAKER_CLOSE_TIMEOUT_MS = parseInt(process.env.MAKER_CLOSE_TIMEOUT_MS || cfgLive.MAKER_CLOSE_TIMEOUT_MS || 8000, 10);
+
   const ORDER_POLL_MS = parseInt(process.env.ORDER_POLL_MS || cfgLive.ORDER_POLL_MS || 500, 10);
 
   const minCandleBody = parseFloat(process.env.MIN_BODY_CANDLE || cfgLive.MIN_BODY_CANDLE || 0.5);
@@ -647,6 +654,10 @@ async function gracefulShutdown(signal) {
         makerEntryMaxAttempts: MAKER_ENTRY_MAX_ATTEMPTS,
         makerEntryRetrySleepMs: MAKER_ENTRY_RETRY_SLEEP_MS,
         makerEntryPriceOffsetPct: MAKER_ENTRY_PRICE_OFFSET_PCT,
+        makerCloseOffsetPct: MAKER_CLOSE_PRICE_OFFSET_PCT,
+        makerCloseMaxAttempts: MAKER_CLOSE_MAX_ATTEMPTS,
+        makerCloseRetrySleepMs: MAKER_CLOSE_RETRY_SLEEP_MS,
+        makerCloseTimeoutMs: MAKER_CLOSE_TIMEOUT_MS,
         makerEntryOnly: MAKER_ENTRY_ONLY,
         orderPollMs: ORDER_POLL_MS,
         tpOnExchange: TP_ON_EXCHANGE,
@@ -772,7 +783,7 @@ async function gracefulShutdown(signal) {
 
           if (ageS > timeStopMinutes * 60) {
             if (runMode === 'live') {
-              if (closeTradeLiveMakerFirst) await closeTradeLiveMakerFirst(tr, 'time_stop', { makerTimeoutMs: 8000 });
+              if (closeTradeLiveMakerFirst) await closeTradeLiveMakerFirst(tr, 'time_stop', { makerTimeoutMs: MAKER_CLOSE_TIMEOUT_MS });
               else await closeTradeLiveMarket(tr, 'time_stop');
             } else {
               await closeTrade(tr, market, 'time_stop', candleBucketMs, feeRate);
