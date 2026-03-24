@@ -1179,7 +1179,7 @@ async function gracefulShutdown(signal) {
         const { explosiveBlock, impulseCount } = evaluateImpulseBypass({
           rt,
           cfg,
-          MIN_MOMENTUM_PCT,
+          baseMinMomentum: BASE_MIN_MOM,
           momentum_pct,
           volumeOk,
           priceAboveSMA,

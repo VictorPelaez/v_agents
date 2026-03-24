@@ -15,7 +15,7 @@
 function evaluateImpulseBypass({
   rt,
   cfg,
-  MIN_MOMENTUM_PCT,
+  baseMinMomentum,
   momentum_pct,
   volumeOk,
   priceAboveSMA,
@@ -29,7 +29,7 @@ function evaluateImpulseBypass({
     return { explosiveBlock: !!candleExplosive, impulseCount: 0 };
   }
 
-  const impulseCriteria = !!candleExplosive && !!volumeOk && !!priceAboveSMA && (momentum_pct >= MIN_MOMENTUM_PCT);
+  const impulseCriteria = !!candleExplosive && !!volumeOk && !!priceAboveSMA && (momentum_pct >= baseMinMomentum);
   if (impulseCriteria) {
     rt.impulseCount = (rt.impulseCount || 0) + 1;
     if (rt.impulseCount > impulseBypassN) rt.impulseCount = impulseBypassN;
