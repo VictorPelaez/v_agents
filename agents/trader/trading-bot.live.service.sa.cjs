@@ -42,6 +42,9 @@ const { evalSlPolicy } = require('./bot/sl_policy.cjs');
 // LIVE execution engine
 const { createLiveExecutorMexc } = require('./bot/live_executor_mexc.cjs');
 
+// Impulse bypass helper
+const { evaluateImpulseBypass } = require('./bot/sa/impulse_bypass.cjs');
+
 const {
   getClosedCloses,
   computeSmaPair,
@@ -113,7 +116,10 @@ function getSymbolRuntime(symbol) {
 
       // ATR adaptive (per-symbol)
       atrHistory: [],
-      lastAtrCandleTs: null
+      lastAtrCandleTs: null,
+
+      // IMPULSE3 bypass explosive
+      impulseCount: 0
     });
   }
   return state.symbolRuntime.get(symbol);
@@ -1169,6 +1175,17 @@ async function gracefulShutdown(signal) {
         const entryHour = new Date(Number(candle.ts)).getUTCHours();
         const blockedHour = Array.isArray(cfg.BLOCKED_HOURS_UTC) && cfg.BLOCKED_HOURS_UTC.includes(entryHour);
 
+        // IMPULSE3 bypass (module)
+        const { explosiveBlock, impulseCount } = evaluateImpulseBypass({
+          rt,
+          cfg,
+          MIN_MOMENTUM_PCT,
+          momentum_pct,
+          volumeOk,
+          priceAboveSMA,
+          candleExplosive
+        });
+
         const shouldEnter = regimeOk &&
           atrOk &&
           atrHardOk &&
@@ -1185,7 +1202,7 @@ async function gracefulShutdown(signal) {
           supertrendOk &&
           !weakCandleBody &&
           !weakOpen &&
-          !candleExplosive &&
+          !explosiveBlock &&
           !blockedHour;
 
         const decision = {
@@ -1236,7 +1253,10 @@ async function gracefulShutdown(signal) {
           supertrendOk: !!supertrendOk,
           shouldEnter: !!shouldEnter,
           effective_min_momentum: Number(effectiveMinMom.toFixed(6)),
-          green_run
+          green_run,
+          // IMPULSE3 bypass
+          impulseCount: Number(impulseCount || 0),
+          impulseBypassN: Number(cfg.IMPULSE3_BYPASS_EXPLOSIVE_N || 0)
         };
 
         state.decisionBySymbol.set(sym, decision);
@@ -1292,6 +1312,8 @@ async function gracefulShutdown(signal) {
             'shouldEnter=' + (decision.shouldEnter ? 1 : 0),
             'effective_min_momentum=' + decision.effective_min_momentum,
             'green_run=' + decision.green_run,
+            'impulseCount=' + (impulseCount || 0),
+            'impulseBypassN=' + (cfg.IMPULSE3_BYPASS_EXPLOSIVE_N || 0),
             'openTrades=' + state.openTradesById.size,
             'openTradesSym=' + getOpenTradesArray(sym).length
           );
