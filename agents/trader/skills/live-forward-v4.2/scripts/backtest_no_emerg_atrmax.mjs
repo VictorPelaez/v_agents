@@ -1013,7 +1013,23 @@ function backtestSymbolSeries({ symbol, klines, cfg, feeRateMaker, feeRateTaker,
     let takeProfit = entryPrice + riskDist * rr;
     if (tp1AsTp) takeProfit = tp1;
 
-    const qty = Number((tradeUSD / entryPrice).toFixed(8));
+    // IMPULSE_TRADE_MULT — paridad con live
+    const _impulseEnabled = !!cfg.IMPULSE_ENABLED;
+    const _impulseMinAdx = Number(cfg.IMPULSE_MIN_ADX || 45);
+    const _impulseRequireTrending = cfg.IMPULSE_REQUIRE_MICRO_TRENDING !== false;
+    const _impulseMult = Number(cfg.IMPULSE_TRADE_MULT || 1.0);
+
+    const _impulseCtx = _impulseEnabled &&
+      _impulseMult > 1 &&
+      !!trendUp &&
+      !!priceAboveSMA &&
+      !!donchOk &&
+      Number.isFinite(adxInfo?.adx) &&
+      adxInfo.adx >= _impulseMinAdx &&
+      (!_impulseRequireTrending || regimeInfo.microRegime === 'TRENDING');
+
+    const effectiveTradeUsd = _impulseCtx ? tradeUSD * _impulseMult : tradeUSD;
+    const qty = Number((effectiveTradeUsd / entryPrice).toFixed(8));
 
     // Skip if current candle already pierced ARMED SL (match live)
     const currentLow = Number(current?.[3]);

@@ -45,6 +45,9 @@ const { createLiveExecutorMexc } = require('./bot/live_executor_mexc.cjs');
 // Impulse bypass helper
 const { evaluateImpulseBypass } = require('./bot/sa/impulse_bypass.cjs');
 
+// Market bias (logging only)
+const { getMarketBias } = require('./bot/sa/market_bias.cjs');
+
 const {
   getClosedCloses,
   computeSmaPair,
@@ -843,13 +846,19 @@ async function gracefulShutdown(signal) {
                 // Do not close; keep monitoring (TP/time_stop may still close).
                 // Note: breachStartMs remains tracked by evalSlPolicy state.
               } else {
-                if (runMode === 'live') await closeTradeLiveMarket(tr, slRes.closeReason);
+                if (runMode === 'live') {
+                  if (closeTradeLiveMakerFirst) await closeTradeLiveMakerFirst(tr, slRes.closeReason, { makerTimeoutMs: 5000 });
+                  else await closeTradeLiveMarket(tr, slRes.closeReason);
+                }
                 else await closeTrade(tr, market, slRes.closeReason, candleBucketMs, feeRate);
                 if (slRes.emergency && HALT_TRADING_ON_EMERGENCY) emergencyHaltYmd = getYmd(Date.now());
                 continue;
               }
             } else {
-              if (runMode === 'live') await closeTradeLiveMarket(tr, slRes.closeReason);
+              if (runMode === 'live') {
+                if (closeTradeLiveMakerFirst) await closeTradeLiveMakerFirst(tr, slRes.closeReason, { makerTimeoutMs: 5000 });
+                else await closeTradeLiveMarket(tr, slRes.closeReason);
+              }
               else await closeTrade(tr, market, slRes.closeReason, candleBucketMs, feeRate);
               if (slRes.emergency && HALT_TRADING_ON_EMERGENCY) emergencyHaltYmd = getYmd(Date.now());
               continue;
@@ -859,8 +868,9 @@ async function gracefulShutdown(signal) {
           // 3) Take profit fallback (only if no TP on exchange)
           if (tr.takeProfit && market >= tr.takeProfit) {
             if (runMode === 'live' && TP_ON_EXCHANGE) {
-              // If TP order wasn't placed/known, fall back to market close.
-              await closeTradeLiveMarket(tr, 'TP');
+              // If TP order wasn't placed/known, fall back to maker-first close with quick timeout.
+              if (closeTradeLiveMakerFirst) await closeTradeLiveMakerFirst(tr, 'TP', { makerTimeoutMs: 5000 });
+              else await closeTradeLiveMarket(tr, 'TP');
             } else {
               await closeTrade(tr, market, 'TP', candleBucketMs, feeRate);
             }
@@ -1068,6 +1078,18 @@ async function gracefulShutdown(signal) {
         const trendUp = (dynamicMinSlopePct != null)
           ? (smaSlopePct > dynamicMinSlopePct)
           : (smaSlopeAbs > dynamicMinSlopeAbs);
+
+        // Market bias (logging only)
+        const marketBias = getMarketBias({
+          regime,
+          microRegime: regimeInfo.microRegime,
+          slopeNorm: Number(regimeInfo.slopeNorm || 0),
+          trendUp: !!trendUp,
+          priceAboveSMA: !!priceAboveSMA,
+          adx: Number(adxInfo?.adx || 0),
+          diPlus: Number(adxInfo?.diPlus || 0),
+          diMinus: Number(adxInfo?.diMinus || 0),
+        });
 
         // Green run
         let green_run = 0;
@@ -1314,6 +1336,7 @@ async function gracefulShutdown(signal) {
             'green_run=' + decision.green_run,
             'impulseCount=' + (impulseCount || 0),
             'impulseBypassN=' + (cfg.IMPULSE3_BYPASS_EXPLOSIVE_N || 0),
+            'marketBias=' + marketBias,
             'openTrades=' + state.openTradesById.size,
             'openTradesSym=' + getOpenTradesArray(sym).length
           );
@@ -1337,6 +1360,7 @@ async function gracefulShutdown(signal) {
             'slopeNorm=' + decision.slopeNorm,
             'slopeNormOk=' + (decision.slopeNormOk ? 1 : 0),
             'shouldEnter=' + (decision.shouldEnter ? 1 : 0),
+            'marketBias=' + marketBias,
             'openTrades=' + state.openTradesById.size
           );
         }
@@ -1404,7 +1428,12 @@ async function gracefulShutdown(signal) {
         const current = klines[klines.length - 1];
         const currentLow = Number(current?.[3]);
 
-        const qty = Number((tradeUSD / entryPrice).toFixed(8));
+        // ---- TAMAÑO DINÁMICO IMPULSE ----
+        const impulseMult = Number(cfg.IMPULSE_TRADE_MULT || 1.0);
+        const effectiveTradeUsd = (impulseCtx && impulseMult > 1) ? tradeUSD * impulseMult : tradeUSD;
+        // ----------------------------------
+
+        const qty = Number((effectiveTradeUsd / entryPrice).toFixed(8));
 
         const grossProfitAtTp = qty * (takeProfit - entryPrice);
         const feeEstAtTp = (entryPrice * qty + takeProfit * qty) * feeRate;

@@ -137,8 +137,8 @@ function createLiveExecutorMexc(ctx) {
         const bid = pickNum(bt, 'bidPrice', 'bid');
         const _makerOffset = Number.isFinite(ctx.makerEntryPriceOffsetPct) ? ctx.makerEntryPriceOffsetPct : 0;
         let price = (bid != null && bid > 0)
-          ? bid * (1 + _makerOffset)
-          : trade.entryPrice * (1 + _makerOffset);
+          ? bid * (1 - _makerOffset)
+          : trade.entryPrice * (1 - _makerOffset);
         const norm = await mexc.normalizeLimit(sym, trade.size, price, httpTimeoutMs);
 
         entryOrder = await mexc.placeOrder({
@@ -408,6 +408,11 @@ function createLiveExecutorMexc(ctx) {
     const sym = trade.symbol;
     const makerTimeoutMs = Number(opts?.makerTimeoutMs ?? ctx?.makerCloseTimeoutMs ?? 8000);
 
+    // DEBUG: log offset
+    if (verbose) {
+      console.error('[DEBUG closeTradeLiveMakerFirst] makerCloseOffsetPct:', ctx?.makerCloseOffsetPct, 'makerEntryOffset:', ctx?.makerEntryPriceOffsetPct);
+    }
+
     let qty = (await mexc.normalizeQuantity(sym, trade.size, httpTimeoutMs)).qty;
 
     // Cancel TP if present
@@ -446,8 +451,8 @@ function createLiveExecutorMexc(ctx) {
         const ask = pickNum(bt, 'askPrice', 'ask');
         const px0 = (ask != null && ask > 0) ? ask : (await getTickerCached(sym, httpTimeoutMs, 0)) || null;
 
-        // SELL maker: place slightly BELOW ask to be best ask without crossing bid
-        const px = (px0 != null && px0 > 0) ? (px0 * (1 - makerCloseOffsetPct)) : null;
+        // SELL maker: place slightly ABOVE ask to be best ask without crossing bid
+        const px = (px0 != null && px0 > 0) ? (px0 * (1 + makerCloseOffsetPct)) : null;
 
         if (px != null && px > 0) {
           const norm = await mexc.normalizeLimit(sym, qty, px, httpTimeoutMs);
