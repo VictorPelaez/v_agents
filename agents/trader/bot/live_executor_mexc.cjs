@@ -451,8 +451,9 @@ function createLiveExecutorMexc(ctx) {
         const ask = pickNum(bt, 'askPrice', 'ask');
         const px0 = (ask != null && ask > 0) ? ask : (await getTickerCached(sym, httpTimeoutMs, 0)) || null;
 
-        // SELL maker: place slightly ABOVE ask to be best ask without crossing bid
-        const px = (px0 != null && px0 > 0) ? (px0 * (1 + makerCloseOffsetPct)) : null;
+        // SELL maker: place slightly BELOW ask to sit at/inside spread without crossing bid
+        // (Using +offset makes it less likely to fill and can leave positions hanging.)
+        const px = (px0 != null && px0 > 0) ? (px0 * (1 - makerCloseOffsetPct)) : null;
 
         if (px != null && px > 0) {
           const norm = await mexc.normalizeLimit(sym, qty, px, httpTimeoutMs);
@@ -548,70 +549,21 @@ function createLiveExecutorMexc(ctx) {
       return closeTrade(trade, avgExit, closeReason, candleBucketMs, feeRateMaker);
     }
 
-    // 2) Fallback: market for remaining
-    let remaining = Math.max(0, qty - makerExecQty);
-    remaining = (await mexc.normalizeQuantity(sym, remaining, httpTimeoutMs)).qty;
-
-    let mktExecQty = 0;
-    let mktAvg = null;
-    let mktOrderId = null;
-
-    if (remaining > 0) {
-      // Unique clientOrderId (avoid duplicate id across retries)
-      const mktClientId = sanitizeClientOrderId(`c_${label}_${Date.now()}_${trade.id}_mkt`);
-      if (verbose) {
-        console.error('LIVE close maker-first fallback MARKET:', { symbol: sym, reason: closeReason, remaining, clientId: mktClientId });
-      }
-      let mkt;
-      try {
-        mkt = await mexc.placeOrder({
-          symbol: sym,
-          side: 'SELL',
-          type: 'MARKET',
-          quantity: remaining,
-          newClientOrderId: mktClientId,
-        }, httpTimeoutMs);
-      } catch (e) {
-        const resp = e?.response?.data;
-        console.error('LIVE close maker-first MARKET failed:', e.message, resp ? { resp } : '');
-        throw e;
-      }
-
-      mktOrderId = mkt?.orderId || mkt?.order_id || null;
-      const filled = mktOrderId
-        ? await mexc.waitForFill({ symbol: sym, orderId: mktOrderId, origClientOrderId: mktClientId, timeoutMs: 15000, pollMs: orderPollMs, httpTimeoutMs })
-        : null;
-
-      mktExecQty = pickNum(filled, 'executedQty', 'executedQuantity', 'cumulativeQuantity') || 0;
-      mktAvg = mexc.orderAvgFillPrice(filled);
-    }
-
-    const execQty = makerExecQty + mktExecQty;
-    const quoteMaker = (makerAvg != null ? makerAvg : trade.entryPrice) * makerExecQty;
-    const quoteMkt = (mktAvg != null ? mktAvg : trade.entryPrice) * mktExecQty;
-    const avgExit = execQty > 0 ? ((quoteMaker + quoteMkt) / execQty) : (await getTickerCached(sym, httpTimeoutMs, 0));
-
-    // Real fee (best-effort): entry+exit commissions converted to USDT
-    try {
-      const entryOrderId = trade.entryOrderId;
-      const exitOrderId = mktOrderId || makerOrderId;
-      const entryFee = entryOrderId ? await computeFeeUsdRealForOrderId(sym, entryOrderId) : { feeUsd: null };
-      const exitFee = exitOrderId ? await computeFeeUsdRealForOrderId(sym, exitOrderId) : { feeUsd: null };
-      const feeUsdReal = (Number.isFinite(entryFee.feeUsd) ? entryFee.feeUsd : 0) + (Number.isFinite(exitFee.feeUsd) ? exitFee.feeUsd : 0);
-      if (feeUsdReal > 0) {
-        trade.feeUsdReal = feeUsdReal;
-        const qtyNum = Number(trade.size || 0);
-        const realizedGross = Number(trade.realizedGross || 0);
-        const profit = realizedGross + (avgExit - trade.entryPrice) * qtyNum;
-        trade.profitAfterFeesReal = profit - feeUsdReal;
-      }
-    } catch (_) {}
+    // 2) Maker-only mode: NO market fallback.
+    // If we couldn't fully close as maker, leave the position open and let the next ticks/time_stop retries handle it.
+    console.error('LIVE close maker-only: not fully filled; leaving trade open', {
+      symbol: sym,
+      reason: closeReason,
+      qty,
+      makerExecQty,
+      makerMaxAttempts,
+      makerTimeoutMs,
+    });
 
     trade.mode = 'live';
-    trade.executionExit = (makerExecQty > 0 && mktExecQty > 0) ? 'maker+fallback_taker' : 'taker';
-    trade.feeRateExit = feeRateTaker;
-
-    return closeTrade(trade, avgExit, closeReason, candleBucketMs, feeRateTaker);
+    trade.executionExit = 'maker_unfilled';
+    trade.feeRateExit = feeRateMaker;
+    return null;
   }
 
   async function reconcileLiveTpOrders() {

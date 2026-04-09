@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const axios = require('axios');
-require('dotenv').config();
+const dotenv = require('dotenv');
 
 // Reuse common SA helpers from local bot/sa
 const { ensureDir, readJsonFile } = require('./bot/sa/file_io.cjs');
@@ -24,22 +24,52 @@ const { createMarketData } = require('./bot/sa/market_data.cjs');
 const { buildCloseReason } = require('./bot/sa/trade_helpers.cjs');
 const { createMexcSpotClient } = require('./exchange/mexc_spot_client.cjs');
 
+// Indicators (reuse momentum bot calculations for dashboard/journal)
+const {
+  getClosedCloses,
+  computeSmaPair,
+  computeAtr,
+  computeRealizedVol,
+  detectMarketRegime
+} = require('../../market-regime.sa.cjs');
+
 // Grid engine
 const { GridEngine } = require('./bot/grid/engine.cjs');
 
 // Config
 const LABEL = 'grid';
-// Self-contained skill folder
-const BASE_DIR = path.join(__dirname);
-const CONFIG_PATH = path.join(BASE_DIR, 'config_grid.json');
+// Code dir (where this service lives)
+const CODE_DIR = path.join(__dirname);
+
+// State dir (journals/snapshots/locks). Allows separating GRID PAPER vs GRID LIVE like the main LIVE bot.
+const BASE_DIR = process.env.GRID_BASE_DIR ? path.resolve(process.env.GRID_BASE_DIR) : CODE_DIR;
+
+// Env loading: allow reusing the LIVE bot .env (Victor request)
+// Default: .env next to this service code (not state dir).
+dotenv.config({ path: process.env.DOTENV_PATH || path.join(CODE_DIR, '.env') });
+
+const CONFIG_PATH = process.env.GRID_CONFIG_PATH || path.join(CODE_DIR, 'config_grid.json');
 const LOCK_PATH = path.join(BASE_DIR, 'grid.lock');
 const OPEN_POSITIONS_PATH = path.join(BASE_DIR, 'open_positions.json');
+const OPEN_ORDERS_PATH = path.join(BASE_DIR, 'open_orders.json');
+const BALANCES_PATH = path.join(BASE_DIR, 'balances.json');
 
 function loadGridConfig() {
   return readJsonFile(CONFIG_PATH, {});
 }
 
 const cfg = loadGridConfig();
+// Runtime overrides via env (LIVE launch uses env for safety)
+cfg.TRADING_MODE = process.env.TRADING_MODE || cfg.TRADING_MODE || 'PAPER';
+
+// Safety: only apply sizing/behavior overrides when explicitly in LIVE mode.
+if (String(cfg.TRADING_MODE).toUpperCase() === 'LIVE') {
+  if (process.env.CAPITAL_USD != null) cfg.CAPITAL_USD = Number(process.env.CAPITAL_USD);
+  if (process.env.SEED_INVENTORY_PCT != null) cfg.SEED_INVENTORY_PCT = Number(process.env.SEED_INVENTORY_PCT);
+  if (process.env.MAKER_ENTRY_PRICE_OFFSET_PCT != null) cfg.MAKER_ENTRY_PRICE_OFFSET_PCT = Number(process.env.MAKER_ENTRY_PRICE_OFFSET_PCT);
+  if (process.env.SPACING_USD != null) cfg.SPACING_USD = Number(process.env.SPACING_USD);
+  if (process.env.REQUIRE_KEYS != null) cfg.REQUIRE_KEYS = Number(process.env.REQUIRE_KEYS);
+}
 const EXCHANGE = process.env.EXCHANGE || cfg.EXCHANGE || 'binance';
 const MARKET_DATA_EXCHANGE = process.env.MARKET_DATA_EXCHANGE || cfg.MARKET_DATA_EXCHANGE || EXCHANGE;
 
@@ -71,7 +101,13 @@ function getSymbolRuntime(symbol) {
       lastOpenTs: 0,
       lastKlinesPollMs: 0,
       grid: null,
-      lastRebalanceTs: 0
+      lastRebalanceTs: 0,
+      lastReconcileTs: 0,
+      lastMyTradesCheckTs: 0,
+
+      // ATR adaptive (per-symbol), same concept as momentum bot (used for logging only)
+      lastAtrCandleTs: null,
+      atrHistory: [],
     });
   }
   return state.symbolRuntime.get(symbol);
@@ -177,6 +213,572 @@ function createGridEngine(symbol) {
   });
 }
 
+async function computeEntryContextForJournal(symbol) {
+  // NOTE: calculation-only; does NOT affect grid entries.
+  try {
+    const rt = getSymbolRuntime(symbol);
+
+    const SMA_WINDOW = Number(cfg.SMA_WINDOW ?? 20);
+    const smaTol = Number(cfg.SMA_TOLERANCE ?? 0.001);
+
+    const ATR_WINDOW = Number(cfg.ATR_WINDOW ?? 14);
+
+    const BASE_MIN_MOM = Number(cfg.MIN_MOMENTUM_PCT ?? 0);
+    const MAX_MOM = Number(cfg.MAX_MOMENTUM_PCT ?? 0);
+
+    const minSmaSlopePct = Number(cfg.MIN_SMA_SLOPE_PCT ?? 0);
+
+    const ATR_ADAPTIVE_ENABLED = !!cfg.ATR_ADAPTIVE_ENABLED;
+    const ATR_ADAPTIVE_PCTL = Number(cfg.ATR_ADAPTIVE_PCTL ?? 0.55);
+    const ATR_ADAPTIVE_WINDOW = Number(cfg.ATR_ADAPTIVE_WINDOW ?? 240);
+    const ATR_ADAPTIVE_MIN_SAMPLES = Number(cfg.ATR_ADAPTIVE_MIN_SAMPLES ?? 60);
+
+    const MIN_ATR_PCT = Number(cfg.MIN_ATR_PCT ?? 0);
+
+    const GREEN_KLINES = Number(cfg.GREEN_KLINES_FOR_REDUCTION ?? 0);
+    const MOM_REDUCTION_PCT = Number(cfg.MOMENTUM_REDUCTION_PCT_ON_GREEN_RUN ?? 0);
+
+    const limit = Number(cfg.INDICATOR_KLINES_LIMIT ?? (Math.max(220, SMA_WINDOW + ATR_WINDOW + 50)));
+
+    const klines = await getRecentKlines(symbol, limit, '1m');
+    if (!Array.isArray(klines) || klines.length < Math.max(ATR_WINDOW + 3, SMA_WINDOW + 3)) return null;
+
+    const lastClosed = klines[klines.length - 2];
+    const candle = {
+      ts: Number(lastClosed[0]),
+      open: Number(lastClosed[1]),
+      high: Number(lastClosed[2]),
+      low: Number(lastClosed[3]),
+      close: Number(lastClosed[4]),
+      volume: Number(lastClosed[5])
+    };
+
+    const closes = getClosedCloses(klines);
+    if (!Array.isArray(closes) || closes.length < 3) return null;
+
+    const last = closes[closes.length - 1];
+    const prev = closes[closes.length - 2] || last;
+    const momentum_pct = prev ? (last - prev) / prev : 0;
+
+    const { sma, smaPrev } = computeSmaPair(closes, SMA_WINDOW);
+    const smaSlopeAbs = (sma != null && smaPrev != null) ? (sma - smaPrev) : 0;
+    const smaSlopePct = (sma != null && smaPrev != null && smaPrev !== 0) ? (sma - smaPrev) / smaPrev : 0;
+
+    const priceNearSMA = (sma != null) ? (candle.close >= sma * (1 - smaTol)) : true;
+    const priceAboveSMA = (sma != null) ? (candle.close > sma) : true;
+
+    const { atrPct } = computeAtr(klines, ATR_WINDOW);
+    const atrPctNum = Number.isFinite(Number(atrPct)) ? Number(atrPct) : 0;
+
+    // ATR adaptive history (per symbol)
+    if (ATR_ADAPTIVE_ENABLED && Number.isFinite(candle.ts) && rt.lastAtrCandleTs !== candle.ts) {
+      rt.lastAtrCandleTs = candle.ts;
+      rt.atrHistory.push(atrPctNum);
+      if (rt.atrHistory.length > ATR_ADAPTIVE_WINDOW) {
+        rt.atrHistory.splice(0, rt.atrHistory.length - ATR_ADAPTIVE_WINDOW);
+      }
+    }
+
+    let atrPctlThr = 0;
+    if (ATR_ADAPTIVE_ENABLED && rt.atrHistory.length >= ATR_ADAPTIVE_MIN_SAMPLES) {
+      atrPctlThr = percentile(rt.atrHistory, ATR_ADAPTIVE_PCTL);
+    }
+    const minAtrEffective = Math.max(MIN_ATR_PCT || 0, atrPctlThr || 0);
+
+    const realizedVol = computeRealizedVol(closes, Math.min(60, Math.max(20, Math.floor(SMA_WINDOW / 2))));
+
+    const regimeInfo = detectMarketRegime({
+      atrPct: atrPctNum,
+      realizedVol,
+      smaSlope: smaSlopeAbs,
+      lastClose: candle.close,
+      priceAboveSma: priceAboveSMA
+    });
+
+    // Green run (same metric as momentum bot)
+    let green_run = 0;
+    if (GREEN_KLINES > 0 && Array.isArray(klines)) {
+      for (let j = klines.length - 2; j > 0 && green_run < GREEN_KLINES; j--) {
+        const cur = Number(klines[j][4]);
+        const op = Number(klines[j][1]);
+        if (Number.isFinite(cur) && Number.isFinite(op) && cur > op) green_run++;
+        else break;
+      }
+    }
+
+    const dynamicMinMomentum = (BASE_MIN_MOM || 0) * (Number(regimeInfo?.kMinMomentum) || 1);
+
+    let effectiveMinMom = dynamicMinMomentum;
+    if (green_run >= GREEN_KLINES && GREEN_KLINES > 0 && MOM_REDUCTION_PCT > 0) {
+      effectiveMinMom = dynamicMinMomentum * (1 - MOM_REDUCTION_PCT);
+    }
+
+    // NOTE: We store thresholds for dashboard display; grid engine does not use them.
+    return {
+      sma: (sma == null) ? null : Number(sma),
+      price_near_sma: !!priceNearSMA,
+      price_above_sma: !!priceAboveSMA,
+
+      momentum_pct: Number(momentum_pct),
+      base_min_momentum: Number(BASE_MIN_MOM || 0),
+      effective_minimum: Number(effectiveMinMom || 0),
+      max_momentum_pct: Number(MAX_MOM || 0),
+      green_run,
+
+      sma_slope: Number(smaSlopeAbs),
+      sma_slope_pct: Number(smaSlopePct),
+      min_sma_slope_pct: Number(minSmaSlopePct || 0),
+
+      atr_pct: Number(atrPctNum),
+      min_atr_pct: Number(minAtrEffective || 0),
+
+      regime: regimeInfo?.volRegime ?? null,
+      micro_regime: regimeInfo?.microRegime ?? null,
+      slope_norm: Number(regimeInfo?.slopeNorm || 0),
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function mergeReasonDetails(trade, extra) {
+  if (!extra) return trade;
+  const cur = trade.reason_details || trade.reasonDetails || {};
+  trade.reason_details = { ...cur, ...extra };
+  return trade;
+}
+
+async function reconcileTpFillsFromMyTrades(symbol) {
+  // Reconcile executed TP SELL fills from exchange into journal CLOSE events.
+  // This prevents "missing closes" after restarts or when we miss an order poll.
+  if (!isLiveMode()) return;
+
+  const rt = getSymbolRuntime(symbol);
+  const now = Date.now();
+  const intervalMs = 10_000; // lightweight; myTrades limit small
+  if (rt.lastMyTradesCheckTs && (now - rt.lastMyTradesCheckTs) < intervalMs) return;
+  rt.lastMyTradesCheckTs = now;
+
+  try {
+    const mexc = getMexcClient();
+    const tr = await mexc.myTrades({ symbol, limit: 50 });
+    const arr = Array.isArray(tr) ? tr : (tr?.data || []);
+    const sells = arr.filter((t) => !t.isBuyer);
+    if (!sells.length) return;
+
+    const opens = getOpenTradesArray(symbol);
+    if (!opens.length) return;
+
+    for (const s of sells) {
+      const cid = String(s.clientOrderId || s.origClientOrderId || '');
+      if (!cid.startsWith('TPSELL_')) continue;
+
+      const sellPrice = Number(s.price);
+      const sellQty = Number(s.qty);
+      const sellTimeMs = Number(s.time || s.timestamp || 0);
+      if (!Number.isFinite(sellPrice) || !Number.isFinite(sellQty) || !Number.isFinite(sellTimeMs)) continue;
+
+      // Try match: tp == sell price and qty == size
+      const match = opens.find((t) => {
+        const tp = Number(t.takeProfit ?? t.tp);
+        const q = Number(t.size ?? t.qty);
+        if (!Number.isFinite(tp) || !Number.isFinite(q)) return false;
+        const qtyOk = Math.abs(q - sellQty) <= Math.max(1e-12, sellQty * 0.002);
+        const priceOk = Math.abs(tp - sellPrice) <= 0.02;
+        return qtyOk && priceOk;
+      });
+      if (!match) continue;
+
+      // Write CLOSE (idempotent via persistJournalEvent event_key)
+      const entry = Number(match.entryPrice ?? match.entry_price ?? 0);
+      const profit = (Number.isFinite(entry) ? (sellPrice - entry) * sellQty : null);
+
+      const closeTrade = {
+        ...match,
+        close_time_iso: new Date(sellTimeMs).toISOString(),
+        exit_price: sellPrice,
+        close_reason: 'TP',
+        profit,
+        profit_pct: (entry > 0) ? ((sellPrice - entry) / entry) * 100 : null,
+        fee_usd_est: 0,
+        profit_after_fees_est: profit,
+        tp_fill_client_id: cid,
+      };
+
+      await persistJournalEvent({ ts: nowIso(), type: 'CLOSE', trade: closeTrade });
+    }
+  } catch (e) {
+    // silent-ish; avoid log spam
+  }
+}
+
+async function reconcileSymbolWithExchange(symbol) {
+  // Purpose: prevent "ghost opens" when the user manually closes positions on the exchange.
+  // Strategy:
+  // - TP sell orders placed by the bot use clientOrderId = TPSELL_<SYMBOL>_L<level>_<batch13>
+  // - If a trade is open in our journal state but no longer has a corresponding TPSELL on exchange,
+  //   we DO NOT fabricate a CLOSE. Instead, we try to re-place/attach the missing TPSELL.
+  //   (Maker-only rule: never market-sell; and never close a grid trade at a loss due to missing TP order.)
+  if (!isLiveMode()) return;
+  if (!cfg.RECONCILE_ENABLED) return;
+
+  const rt = getSymbolRuntime(symbol);
+  const intervalMin = Number(cfg.RECONCILE_INTERVAL_MINUTES ?? 5);
+  const graceMin = Number(cfg.RECONCILE_GRACE_MINUTES ?? 15);
+  const intervalMs = Math.max(60_000, intervalMin * 60_000);
+  const graceMs = Math.max(0, graceMin * 60_000);
+
+  const now = Date.now();
+  if (rt.lastReconcileTs && (now - rt.lastReconcileTs) < intervalMs) return;
+  rt.lastReconcileTs = now;
+
+  try {
+    const mexc = getMexcClient();
+    const oo = await mexc.openOrders({ symbol });
+    const arr = Array.isArray(oo) ? oo : (oo?.data || []);
+
+    // Keep a set of BUY ids that still have an active TPSELL on exchange.
+    const keepBuyIds = new Set();
+    for (const o of arr) {
+      const side = String(o?.side || '').toUpperCase();
+      if (side !== 'SELL') continue;
+      const cid = String(o?.clientOrderId || o?.origClientOrderId || '');
+      if (!cid.startsWith('TPSELL_')) continue;
+      const buyId = buyIdFromTpSellClientId(cid);
+      if (buyId) keepBuyIds.add(buyId);
+    }
+
+    const opens = getOpenTradesArray(symbol);
+    if (!opens.length) return;
+
+    let fixed = 0;
+    for (const t of opens) {
+      const buyId = String(t?.id || '');
+      if (!buyId) continue;
+      if (keepBuyIds.has(buyId)) continue;
+
+      // Only act on trades old enough (avoid racing while TP order is still being placed).
+      const openedAt = Date.parse(t?.openedAt || t?.open_time_iso || '') || 0;
+      if (openedAt && graceMs > 0 && (now - openedAt) < graceMs) continue;
+
+      // Try to re-place/attach the missing TPSELL.
+      const qty = Number(t?.size ?? t?.qty ?? 0);
+      const tp = Number(t?.takeProfit ?? t?.tp ?? t?.take_profit ?? 0);
+      if (!(qty > 0) || !(tp > 0)) continue;
+
+      const tpCid = makeTpSellClientOrderIdFromBuyId(buyId);
+      try {
+        const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: tp, qty, clientOrderId: tpCid });
+        // Journal it (so we can see it in the dashboard/journal even if state reloads).
+        await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'SELL', level: null, price: placed.price, qty: placed.qty, orderId: tpCid, kind: 'GRID_SELL_TP', correspondingBuyOrderId: buyId, exchangeOrderId: placed.orderId, note: 'reconcile_replace_missing_tp' } });
+        fixed++;
+      } catch (e) {
+        // Best effort. Do NOT fabricate a close.
+      }
+    }
+
+    if (fixed > 0) {
+      await flushOpenPositionsSnapshot(true);
+      console.log(`[GRID RECONCILE ${symbol}] re-placed missing TPSELL=${fixed}`);
+    }
+  } catch (e) {
+    console.warn(`[GRID RECONCILE ${symbol}] failed: ${e.message}`);
+  }
+}
+
+async function ensureTpSellsForJournalOpenTrades(symbol) {
+  if (!isLiveMode()) return;
+  try {
+    const mexc = getMexcClient();
+
+    // Get current open SELL orders once
+    const oo = await mexc.openOrders({ symbol });
+    const arr = Array.isArray(oo) ? oo : (oo?.data || []);
+    const sellClientIds = new Set();
+    for (const o of arr) {
+      if (String(o?.side || '').toUpperCase() !== 'SELL') continue;
+      const cid = String(o?.clientOrderId || o?.origClientOrderId || '');
+      if (cid) sellClientIds.add(cid);
+    }
+
+    // Leer posiciones abiertas desde el snapshot (open_positions.json)
+    const snapshotPath = OPEN_POSITIONS_PATH;
+    let opens = [];
+    try {
+      if (fs.existsSync(snapshotPath)) {
+        opens = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+      }
+    } catch (_) {}
+
+    if (!Array.isArray(opens) || opens.length === 0) return;
+
+    for (const t of opens) {
+      const buyId = String(t?.id || '');
+      if (!buyId) continue;
+
+      const qty = Number(t?.size ?? t?.qty ?? 0);
+      const tp = Number(t?.takeProfit ?? t?.tp ?? t?.take_profit ?? 0);
+      if (!(qty > 0) || !(tp > 0)) continue;
+
+      const cid = makeTpSellClientOrderIdFromBuyId(buyId);
+      if (sellClientIds.has(cid)) continue; // already present on exchange
+
+      // Place missing TPSELL
+      const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: tp, qty, clientOrderId: cid });
+      await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'SELL', level: null, price: placed.price, qty: placed.qty, orderId: cid, kind: 'GRID_SELL_TP', correspondingBuyOrderId: buyId, exchangeOrderId: placed.orderId, note: 'ensure_tp_for_journal_open' } });
+
+      // Update set to avoid duplicate in the same loop
+      sellClientIds.add(cid);
+    }
+  } catch (e) {
+    // Best-effort; avoid spam
+  }
+}
+
+function makeTpSellClientOrderIdFromBuyId(buyId) {
+  // BUY ids are like: BUY-BTCUSDT-L10-1775677040703
+  // TPSELL id must be <=32 chars and unique across levels.
+  // Format: TPSELL_<SYMBOL>_L<level>_<batch13>
+  const m = /^BUY-([A-Z0-9]+)-L(\d+)-(\d{13})$/.exec(String(buyId || ''));
+  if (!m) throw new Error(`Invalid BUY id for TPSELL mapping: ${buyId}`);
+  const symbol = m[1];
+  const level = m[2];
+  const batch = m[3];
+  const cid = `TPSELL_${symbol}_L${level}_${batch}`;
+  // Safety check for MEXC constraint: ^[0-9a-zA-Z_-]{1,32}$
+  if (!/^[0-9A-Za-z_-]{1,32}$/.test(cid)) throw new Error(`Bad TPSELL clientOrderId: ${cid}`);
+  return cid;
+}
+
+function buyIdFromTpSellClientId(cid) {
+  const m = /^TPSELL_([A-Z0-9]+)_L(\d+)_([0-9]{13})$/.exec(String(cid || ''));
+  if (!m) return null;
+  return `BUY-${m[1]}-L${m[2]}-${m[3]}`;
+}
+
+function isLiveMode() {
+  return String(cfg.TRADING_MODE || 'PAPER').toUpperCase() === 'LIVE';
+}
+
+function getMakerOffsetPct() {
+  // Reuse the same constant concept as the LIVE bot.
+  const v = process.env.MAKER_ENTRY_PRICE_OFFSET_PCT ?? cfg.MAKER_ENTRY_PRICE_OFFSET_PCT;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0.0002;
+}
+
+function pickNum(obj, ...keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    const n = (v == null) ? NaN : Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function orderIdFromResp(resp) {
+  // MEXC can return different shapes; keep it defensive.
+  return resp?.orderId || resp?.data?.orderId || resp?.data || resp?.result?.orderId || null;
+}
+
+async function placeLimitMakerLive({ symbol, side, price, qty, clientOrderId }) {
+  const mexc = getMexcClient();
+  const offset = getMakerOffsetPct();
+
+  // Ensure maker by quoting away from spread if needed.
+  const bt = await mexc.bookTicker(symbol);
+  const bid = pickNum(bt, 'bidPrice', 'bid');
+  const ask = pickNum(bt, 'askPrice', 'ask');
+
+  let p = Number(price);
+  if (side === 'BUY') {
+    // BUY maker (live-parity conservative): if p is at/above bid, pull it slightly below bid.
+    // This reduces the chance of becoming marketable due to fast spread changes.
+    if (bid != null && p >= bid) p = bid * (1 - offset);
+    // If p would cross the ask, also pull it below ask.
+    if (ask != null && p >= ask) p = Math.min(p, ask * (1 - offset));
+  } else {
+    // SELL maker: only unsafe if it would cross the bid (marketable).
+    // If p <= bid, push it just above bid to ensure post-only.
+    if (bid != null && p <= bid) p = bid * (1 + offset);
+    // NOTE: do NOT push sells above ask (that makes fills much less likely and can leave BTC stuck).
+  }
+
+  const norm = await mexc.normalizeLimit(symbol, qty, p);
+  const params = {
+    symbol,
+    side,
+    type: 'LIMIT_MAKER',
+    quantity: norm.qty,
+    price: norm.price,
+    newClientOrderId: clientOrderId,
+  };
+
+  const resp = await mexc.placeOrder(params);
+  const orderId = orderIdFromResp(resp);
+  return { orderId, clientOrderId, price: norm.price, qty: norm.qty, raw: resp };
+}
+
+async function getOrderLive({ symbol, orderId, clientOrderId }) {
+  const mexc = getMexcClient();
+  return mexc.getOrder({ symbol, orderId, origClientOrderId: clientOrderId });
+}
+
+async function cancelAllGridOpenOrdersLive(symbol, opts = {}) {
+  const mexc = getMexcClient();
+  const oo = await mexc.openOrders({ symbol });
+  const arr = Array.isArray(oo) ? oo : (oo?.data || []);
+
+  const keepOrderIds = opts.keepOrderIds instanceof Set ? opts.keepOrderIds : new Set(opts.keepOrderIds || []);
+  const keepClientOrderIds = opts.keepClientOrderIds instanceof Set ? opts.keepClientOrderIds : new Set(opts.keepClientOrderIds || []);
+
+  for (const o of arr) {
+    const cid = o.clientOrderId || o.origClientOrderId;
+
+    // Only cancel our grid-tagged orders (client ids we create)
+    const isGridTagged = (
+      cid && (
+        String(cid).startsWith('BUY-') ||
+        String(cid).startsWith('SELL-') ||
+        String(cid).startsWith('GBUY-') ||
+        String(cid).startsWith('GSELL-')
+      )
+    );
+    if (!isGridTagged) continue;
+
+    // SAFETY: never cancel active TP sells for already-open trades.
+    // Caller provides a keep-list (exchange orderIds / clientOrderIds) derived from grid.sellLevels.
+    if (keepOrderIds.has(String(o.orderId))) continue;
+    if (cid && keepClientOrderIds.has(String(cid))) continue;
+
+    try {
+      await mexc.cancelOrder({ symbol, orderId: o.orderId, origClientOrderId: cid });
+    } catch (e) {
+      // ignore; may already be filled/canceled
+    }
+  }
+}
+
+// --- Stray BTC unwind (maker-only) ---
+// Goal: if there is BTC available in spot ("colgado") without an active trade/TPSELL, try to exit using maker-only
+// by quoting at bid + 1 tick. This never uses taker/market.
+const UNWIND_ENABLED = String(process.env.UNWIND_ENABLED ?? cfg.UNWIND_ENABLED ?? 'false').toLowerCase() === 'true';
+const UNWIND_MIN_USD = Number(process.env.UNWIND_MIN_USD ?? cfg.UNWIND_MIN_USD ?? 50);
+const UNWIND_MAX_CHUNKS = Math.max(1, Number(process.env.UNWIND_MAX_CHUNKS ?? cfg.UNWIND_MAX_CHUNKS ?? 2));
+const UNWIND_TICK_USD = Number(process.env.UNWIND_TICK_USD ?? cfg.UNWIND_TICK_USD ?? 0.01);
+const UNWIND_PROFIT_USD = Number(process.env.UNWIND_PROFIT_USD ?? cfg.UNWIND_PROFIT_USD ?? 50);
+const UNWIND_STEP_DOWN_USD = Number(process.env.UNWIND_STEP_DOWN_USD ?? cfg.UNWIND_STEP_DOWN_USD ?? 20);
+const UNWIND_REQUOTE_SECONDS = Number(process.env.UNWIND_REQUOTE_SECONDS ?? cfg.UNWIND_REQUOTE_SECONDS ?? 10);
+
+const _unwindRt = new Map(); // symbol -> { attempt, lastPlaceMs, lastClientId, lastExchangeOrderId }
+
+async function maybeUnwindStrayBtc(symbol, grid) {
+  if (!isLiveMode()) return;
+  if (!UNWIND_ENABLED) return;
+  if (!(UNWIND_MIN_USD > 0)) return;
+
+  // Only unwind when grid has no tracked open trades (avoid interfering with normal TP logic).
+  if (grid?.openTrades && grid.openTrades.size > 0) return;
+
+  const mexc = getMexcClient();
+
+  // Open orders gate + re-quote logic.
+  // - If there is a non-unwind SELL open, do nothing (avoid fighting TPSELL/grid).
+  // - If there is an unwind SELL open, re-quote (cancel/replace) only after UNWIND_REQUOTE_SECONDS.
+  let hasUnwindSellOpen = false;
+  const rt = _unwindRt.get(symbol) || { attempt: 0, lastPlaceMs: 0, lastClientId: null, lastExchangeOrderId: null };
+  try {
+    const oo = await mexc.openOrders({ symbol });
+    const arr = Array.isArray(oo) ? oo : (oo?.data || []);
+    for (const o of arr) {
+      if (String(o?.side || '').toUpperCase() !== 'SELL') continue;
+      const cid = String(o?.clientOrderId || o?.origClientOrderId || '');
+      const isUnwind = cid.startsWith('UW_');
+      if (!isUnwind) return; // some other SELL is open -> do nothing
+      hasUnwindSellOpen = true;
+      rt.lastClientId = cid || rt.lastClientId;
+      rt.lastExchangeOrderId = o?.orderId || o?.order_id || rt.lastExchangeOrderId;
+    }
+  } catch (_) {}
+
+  if (hasUnwindSellOpen) {
+    const ageS = (Date.now() - (rt.lastPlaceMs || 0)) / 1000;
+    if (Number.isFinite(ageS) && ageS < UNWIND_REQUOTE_SECONDS) {
+      _unwindRt.set(symbol, rt);
+      return;
+    }
+    // Re-quote: cancel previous unwind order and step down.
+    try {
+      if (rt.lastExchangeOrderId) {
+        await mexc.cancelOrder({ symbol, orderId: rt.lastExchangeOrderId, origClientOrderId: rt.lastClientId }, 4000);
+      }
+    } catch (_) {}
+    rt.attempt = (rt.attempt || 0) + 1;
+  }
+  _unwindRt.set(symbol, rt);
+
+  // Read balances
+  let btcFree = 0;
+  try {
+    const acc = await mexc.account(4000);
+    const bals = acc?.balances || [];
+    const btc = bals.find((b) => String(b.asset).toUpperCase() === 'BTC');
+    btcFree = btc ? Number(btc.free) : 0;
+  } catch (_) {
+    return;
+  }
+
+  if (!Number.isFinite(btcFree) || btcFree <= 0) return;
+
+  // Price + notional
+  let bid = null;
+  let ask = null;
+  try {
+    const bt = await mexc.bookTicker(symbol, 4000);
+    bid = pickNum(bt, 'bidPrice', 'bid');
+    ask = pickNum(bt, 'askPrice', 'ask');
+  } catch (_) {}
+  if (!(bid && bid > 0)) return;
+
+  const notional = btcFree * bid;
+  if (notional < UNWIND_MIN_USD) return;
+
+  // Place one chunk at a time.
+  const chunks = Math.max(1, Math.min(UNWIND_MAX_CHUNKS, 10));
+  const chunkQtyRaw = btcFree / chunks;
+
+  const tick = (Number.isFinite(UNWIND_TICK_USD) && UNWIND_TICK_USD > 0) ? UNWIND_TICK_USD : 0.01;
+  const minPx = bid + tick; // maker-only: never cross bid
+
+  // Tender profit first, then step down on each requote attempt.
+  const startPx = (Number.isFinite(ask) && ask > 0)
+    ? (ask + (Number.isFinite(UNWIND_PROFIT_USD) ? UNWIND_PROFIT_USD : 0))
+    : (bid + (Number.isFinite(UNWIND_PROFIT_USD) ? UNWIND_PROFIT_USD : 0));
+
+  const attempt = (_unwindRt.get(symbol)?.attempt) || 0;
+  const step = (Number.isFinite(UNWIND_STEP_DOWN_USD) && UNWIND_STEP_DOWN_USD > 0) ? UNWIND_STEP_DOWN_USD : 20;
+  const targetPx = startPx - attempt * step;
+  const px = Math.max(minPx, targetPx);
+
+  // Normalize and place
+  const clientOrderId = `UW_${String(Date.now()).slice(-13)}`; // <= 16 chars
+
+  try {
+    const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: px, qty: chunkQtyRaw, clientOrderId });
+    const rt2 = _unwindRt.get(symbol) || { attempt: 0 };
+    rt2.lastPlaceMs = Date.now();
+    rt2.lastClientId = clientOrderId;
+    rt2.lastExchangeOrderId = placed.orderId;
+    _unwindRt.set(symbol, rt2);
+
+    console.log(`[UNWIND ${symbol}] placed SELL maker`, { clientOrderId, attempt, price: placed.price, qty: placed.qty, notionalApprox: placed.price * placed.qty });
+    await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'unwind', symbol, side: 'SELL', level: null, price: placed.price, qty: placed.qty, orderId: clientOrderId, kind: 'UNWIND_SELL', exchangeOrderId: placed.orderId, note: `attempt=${attempt}` } });
+  } catch (e) {
+    const extra = e?.response?.data ? ` | resp=${JSON.stringify(e.response.data)}` : '';
+    console.warn(`[UNWIND ${symbol}] place SELL maker failed: ${e.message}${extra}`);
+  }
+}
+
 // Symbol processing
 async function processSymbol(symbol) {
   const rt = getSymbolRuntime(symbol);
@@ -187,15 +789,19 @@ async function processSymbol(symbol) {
     // Journal seed OPEN trades first (so later SELL fills can CLOSE them)
     if (typeof rt.grid.drainSeedOpens === 'function') {
       for (const t of rt.grid.drainSeedOpens()) {
+        const ctx = await computeEntryContextForJournal(symbol);
+        mergeReasonDetails(t, ctx);
         await persistJournalEvent({ ts: nowIso(), type: 'OPEN', trade: t });
       }
     } else {
       console.warn('[GRID] drainSeedOpens() missing — seed inventory disabled or old engine loaded');
     }
 
-    // Journal initial grid orders (PAPER)
-    for (const o of rt.grid.drainNewOrders()) {
-      await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: o });
+    // Journal initial grid orders (PAPER only)
+    if (!isLiveMode()) {
+      for (const o of rt.grid.drainNewOrders()) {
+        await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: o });
+      }
     }
 
     // Force snapshot now so /api/positions sees these opens immediately
@@ -261,22 +867,132 @@ async function processSymbol(symbol) {
           `dLower=${dLo} dUpper=${dUp} pos=${pos} lvl≈${s.approxLevel} ` +
           `open=${counts.total}`
         );
+
+        // Verbose-compatible indicator line (same key style as momentum bot).
+        const ctx = await computeEntryContextForJournal(symbol);
+        if (ctx) {
+          console.log(
+            'ITER_SUMMARY:',
+            'bot=grid',
+            'iter=' + iterCount,
+            'symbol=' + symbol,
+            'Started at: ' + tsUtc,
+            'momentum=' + Number(ctx.momentum_pct).toFixed(6),
+            'sma=' + (ctx.sma == null ? 'null' : Number(ctx.sma).toFixed(2)),
+            'smaSlope=' + Number(ctx.sma_slope).toFixed(2),
+            'smaSlopePct=' + Number(ctx.sma_slope_pct).toFixed(6),
+            'minSlopePct=' + (ctx.min_sma_slope_pct == null ? 'null' : Number(ctx.min_sma_slope_pct).toFixed(6)),
+            'atr_pct=' + Number(ctx.atr_pct).toFixed(6),
+            'min_atr_pct=' + Number(ctx.min_atr_pct).toFixed(6),
+            'regime=' + (ctx.regime ?? 'null'),
+            'micro=' + (ctx.micro_regime ?? 'null'),
+            'priceNearSMA=' + (ctx.price_near_sma ? 1 : 0),
+            'priceAboveSMA=' + (ctx.price_above_sma ? 1 : 0),
+            'effective_min_momentum=' + Number(ctx.effective_minimum).toFixed(6),
+            'green_run=' + Number(ctx.green_run || 0),
+            'openTrades=' + counts.total
+          );
+        }
       }
     }
   }
 
   // Rebalance if needed
   if (grid.shouldRebalance()) {
+    if (isLiveMode()) {
+      // IMPORTANT (prod safety): cancel existing exchange openOrders before rebuilding ladder,
+      // otherwise we duplicate orders every rebalance interval.
+      // BUGFIX: do NOT cancel active TP sell orders for already-open trades.
+      const keepOrderIds = new Set();
+      const keepClientOrderIds = new Set();
+      for (const sell of grid.sellLevels?.values?.() || []) {
+        if (!sell || !sell.correspondingBuyOrderId) continue; // only keep TP-linked sells
+        if (sell.exchangeOrderId) keepOrderIds.add(String(sell.exchangeOrderId));
+        if (sell.clientOrderId || sell.orderId) keepClientOrderIds.add(String(sell.clientOrderId || sell.orderId));
+      }
+
+      try {
+        await cancelAllGridOpenOrdersLive(symbol, { keepOrderIds, keepClientOrderIds });
+      } catch (e) {
+        console.warn(`[GRID LIVE ${symbol}] cancel before rebalance failed: ${e.message}`);
+      }
+    }
+
     await grid.rebalance();
     rt.lastRebalanceTs = Date.now();
   }
 
-  // Detect fills
-  const fills = await grid.detectFills();
+  // LIVE: ensure pending BUY grid orders are placed on exchange
+  if (isLiveMode()) {
+    for (const [lvl, buy] of grid.buyLevels?.entries?.() || []) {
+      if (!buy || buy.status !== 'pending') continue;
+      if (buy.exchangeOrderId) continue;
 
-  // Journal any newly scheduled orders since last loop
-  for (const o of grid.drainNewOrders()) {
-    await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: o });
+      const clientOrderId = buy.orderId || `GBUY-${symbol}-L${lvl}-${Date.now()}`;
+      try {
+        const placed = await placeLimitMakerLive({ symbol, side: 'BUY', price: buy.price, qty: buy.qty, clientOrderId });
+        buy.orderId = clientOrderId;
+        buy.clientOrderId = clientOrderId;
+        buy.exchangeOrderId = placed.orderId;
+        buy.price = placed.price;
+        buy.qty = placed.qty;
+
+        await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'BUY', level: lvl, price: buy.price, qty: buy.qty, orderId: buy.orderId, kind: 'GRID_BUY_LEVEL', exchangeOrderId: buy.exchangeOrderId } });
+      } catch (e) {
+        console.warn(`[GRID LIVE ${symbol}] place BUY L${lvl} failed: ${e.message}`);
+      }
+    }
+  }
+
+  // Detect fills
+  let fills = [];
+  if (isLiveMode()) {
+    const mexc = getMexcClient();
+
+    // BUY fills
+    for (const [lvl, buy] of grid.buyLevels?.entries?.() || []) {
+      if (!buy || buy.status !== 'pending' || !buy.exchangeOrderId) continue;
+      try {
+        const ord = await getOrderLive({ symbol, orderId: buy.exchangeOrderId, clientOrderId: buy.clientOrderId || buy.orderId });
+        if (mexc.isOrderFilled(ord)) {
+          buy.status = 'filled';
+          buy.fillTime = nowIso();
+          const fillPrice = mexc.orderAvgFillPrice(ord) ?? buy.price;
+          fills.push({ type: 'BUY', level: lvl, orderId: buy.orderId, exchangeOrderId: buy.exchangeOrderId, price: fillPrice, qty: buy.qty, fillTime: buy.fillTime, timestamp: Date.now() });
+        }
+      } catch (e) {
+        // ignore transient
+      }
+    }
+
+    // SELL fills
+    for (const [key, sell] of grid.sellLevels?.entries?.() || []) {
+      if (!sell || sell.status !== 'pending' || !sell.exchangeOrderId) continue;
+      try {
+        const ord = await getOrderLive({ symbol, orderId: sell.exchangeOrderId, clientOrderId: sell.clientOrderId || sell.orderId });
+        if (mexc.isOrderFilled(ord)) {
+          sell.status = 'filled';
+          sell.fillTime = nowIso();
+          const fillPrice = mexc.orderAvgFillPrice(ord) ?? sell.price;
+          fills.push({ type: 'SELL', level: sell.level, orderId: sell.orderId, exchangeOrderId: sell.exchangeOrderId, buyOrderId: sell.correspondingBuyOrderId, price: fillPrice, qty: sell.qty, fillTime: sell.fillTime, timestamp: Date.now() });
+        }
+      } catch (e) {
+        // ignore transient
+      }
+    }
+  } else {
+    fills = await grid.detectFills();
+  }
+
+  // Journal any newly scheduled orders since last loop.
+  // In LIVE we avoid journaling internal simulated grid orders (BUY/SELL levels) because execution is real.
+  if (!isLiveMode()) {
+    for (const o of grid.drainNewOrders()) {
+      await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: o });
+    }
+  } else {
+    // just drain to avoid accumulating
+    grid.drainNewOrders();
   }
 
   // Process fills
@@ -284,13 +1000,58 @@ async function processSymbol(symbol) {
     if (fill.type === 'BUY') {
       // Create OPEN trade
       const trade = grid.createOpenTrade(fill);
+      const ctx = await computeEntryContextForJournal(symbol);
+      mergeReasonDetails(trade, ctx);
       await persistJournalEvent({
         ts: nowIso(),
         type: 'OPEN',
         trade
       });
-      // Schedule TP
+      // Schedule TP (internal)
       await grid.placeTpOrder(trade);
+
+      // LIVE: place the TP SELL on exchange
+      if (isLiveMode()) {
+        // find the TP sell order by correspondingBuyOrderId
+        for (const [k, sell] of grid.sellLevels?.entries?.() || []) {
+          if (!sell || sell.status !== 'pending') continue;
+          if (sell.correspondingBuyOrderId !== trade.id) continue;
+          if (sell.exchangeOrderId) continue;
+
+          // MEXC constraint: newClientOrderId must match ^[0-9a-zA-Z_-]{1,32}$.
+          // IMPORTANT: clientOrderId must be UNIQUE per grid level.
+          // Old scheme used only the batch suffix and caused collisions across L1..L10.
+          // Format (<=32 chars): TPSELL_<SYMBOL>_L<level>_<batch13>
+          const clientOrderId = makeTpSellClientOrderIdFromBuyId(trade.id);
+          try {
+            const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: sell.price, qty: sell.qty, clientOrderId });
+            sell.orderId = clientOrderId;
+            sell.clientOrderId = clientOrderId;
+            sell.exchangeOrderId = placed.orderId;
+            sell.price = placed.price;
+            sell.qty = placed.qty;
+
+            await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'SELL', level: sell.level, price: sell.price, qty: sell.qty, orderId: sell.orderId, kind: 'GRID_SELL_TP', correspondingBuyOrderId: trade.id, exchangeOrderId: sell.exchangeOrderId } });
+          } catch (e) {
+            const extra = e?.response?.data ? ` | resp=${JSON.stringify(e.response.data)}` : '';
+            console.warn(`[GRID LIVE ${symbol}] place TP SELL maker failed: ${e.message}${extra}`);
+
+            // Robustness: sometimes the exchange accepts the order but we fail to capture orderId (or we hit a duplicate clientId on retry).
+            // Try to fetch by clientOrderId and attach it to prevent "BTC without TPSELL".
+            try {
+              const ord = await getOrderLive({ symbol, orderId: null, clientOrderId });
+              const exId = ord?.orderId || ord?.order_id || null;
+              if (exId) {
+                sell.exchangeOrderId = exId;
+                await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'SELL', level: sell.level, price: sell.price, qty: sell.qty, orderId: sell.orderId, kind: 'GRID_SELL_TP', correspondingBuyOrderId: trade.id, exchangeOrderId: sell.exchangeOrderId, note: 'attach_after_place_error' } });
+              }
+            } catch (_) {}
+
+            // Maker-only policy: do NOT fallback to taker orders.
+          }
+        }
+      }
+
       // Update open_positions.json promptly so dashboard shows the new open immediately
       await flushOpenPositionsSnapshot(true);
     } else if (fill.type === 'SELL') {
@@ -298,19 +1059,105 @@ async function processSymbol(symbol) {
       const openTrade = grid.openTrades.get(fill.buyOrderId);
       if (openTrade) {
         const closeTrade = grid.createCloseTrade(openTrade, fill);
+
+        // Defensive: if maker-only, force exit fee to 0 and recompute net fields.
+        if (cfg.MAKER_ONLY) {
+          closeTrade.fee_rate_exit = 0;
+          const entry = Number(closeTrade.entry_price) || 0;
+          const exitp = Number(closeTrade.exit_price) || 0;
+          const qty = Number(closeTrade.qty) || 0;
+          const feeEntry = entry * qty * (Number(closeTrade.fee_rate_entry) || 0);
+          const feeExit = exitp * qty * 0;
+          closeTrade.fee_usd_est = feeEntry + feeExit;
+          closeTrade.profit_after_fees_est = (Number(closeTrade.profit) || 0) - closeTrade.fee_usd_est;
+        }
+
         await persistJournalEvent({
           ts: nowIso(),
           type: 'CLOSE',
           trade: closeTrade
         });
-        // Replenish buy after sell
+        // Replenish buy after sell (internal)
         await grid.placeNewBuyAfterSell(closeTrade);
+
+        // LIVE: place any newly scheduled BUY level that is pending and not yet on exchange
+        if (isLiveMode()) {
+          for (const [lvl, buy] of grid.buyLevels?.entries?.() || []) {
+            if (!buy || buy.status !== 'pending') continue;
+            if (buy.exchangeOrderId) continue;
+
+            const clientOrderId = buy.orderId || `GBUY-${symbol}-L${lvl}-${Date.now()}`;
+            try {
+              const placed = await placeLimitMakerLive({ symbol, side: 'BUY', price: buy.price, qty: buy.qty, clientOrderId });
+              buy.orderId = clientOrderId;
+              buy.clientOrderId = clientOrderId;
+              buy.exchangeOrderId = placed.orderId;
+              buy.price = placed.price;
+              buy.qty = placed.qty;
+
+              await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'BUY', level: lvl, price: buy.price, qty: buy.qty, orderId: buy.orderId, kind: 'GRID_BUY_LEVEL', exchangeOrderId: buy.exchangeOrderId } });
+            } catch (e) {
+              console.warn(`[GRID LIVE ${symbol}] place replenish BUY failed: ${e.message}`);
+            }
+          }
+        }
+
         // Update open_positions.json promptly so dashboard reflects the close
         await flushOpenPositionsSnapshot(true);
       } else {
         console.warn(`[GRID ${symbol}] SELL fill without matching open trade: ${fill.orderId}`);
       }
     }
+  }
+
+  // LIVE: reconcile TP SELL fills from exchange → journal CLOSE
+  await reconcileTpFillsFromMyTrades(symbol);
+
+  // LIVE: ensure TPSELL exists for ALL journal-open trades (even after restart).
+  // NOTE: grid engines currently do not reconstruct sellLevels from journal on bootstrap, so relying only on grid.sellLevels
+  // can leave BTC without an exit order.
+  await ensureTpSellsForJournalOpenTrades(symbol);
+
+  // LIVE: retry placing any missing TP SELL orders tracked in grid engine (fills within this runtime)
+  if (isLiveMode()) {
+    for (const [k, sell] of grid.sellLevels?.entries?.() || []) {
+      if (!sell || sell.status !== 'pending') continue;
+      if (!sell.correspondingBuyOrderId) continue;
+      if (sell.exchangeOrderId) continue;
+
+      const cid = makeTpSellClientOrderIdFromBuyId(sell.correspondingBuyOrderId);
+      try {
+        const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: sell.price, qty: sell.qty, clientOrderId: cid });
+        sell.orderId = cid;
+        sell.clientOrderId = cid;
+        sell.exchangeOrderId = placed.orderId;
+        sell.price = placed.price;
+        sell.qty = placed.qty;
+        await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'SELL', level: sell.level, price: sell.price, qty: sell.qty, orderId: sell.orderId, kind: 'GRID_SELL_TP', correspondingBuyOrderId: sell.correspondingBuyOrderId, exchangeOrderId: sell.exchangeOrderId, note: 'retry_place_tp' } });
+      } catch (e) {
+        // Maker-only: no fallback. But try to attach if the order already exists (duplicate clientId, late response, etc.).
+        try {
+          const ord = await getOrderLive({ symbol, orderId: null, clientOrderId: cid });
+          const exId = ord?.orderId || ord?.order_id || null;
+          if (exId) {
+            sell.exchangeOrderId = exId;
+            sell.clientOrderId = cid;
+            await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'SELL', level: sell.level, price: sell.price, qty: sell.qty, orderId: cid, kind: 'GRID_SELL_TP', correspondingBuyOrderId: sell.correspondingBuyOrderId, exchangeOrderId: sell.exchangeOrderId, note: 'attach_after_retry_error' } });
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  // LIVE: maker-only unwind for stray BTC inventory (no open trades)
+  await maybeUnwindStrayBtc(symbol, grid);
+
+  // LIVE: reconcile journal opens vs exchange (handles manual closes/cancels)
+  await reconcileSymbolWithExchange(symbol);
+
+  // LIVE: write pending open orders snapshot for dashboard
+  if (isLiveMode()) {
+    await writeOpenOrdersSnapshot(symbol, grid);
   }
 
   // Rate limiting
@@ -323,6 +1170,44 @@ async function bootstrap() {
   await rebuildStateFromJournal();
   // Reconstruct grid engines from open trades? For now, we skip; paper bot starts fresh each session.
   console.log('State rebuilt. Open trades:', getOpenTradesArray().length);
+}
+
+async function writeOpenOrdersSnapshot(symbol, _grid) {
+  if (!isLiveMode()) return;
+  try {
+    // Source of truth: exchange openOrders (so filled/canceled orders disappear immediately).
+    const mexc = getMexcClient();
+    const oo = await mexc.openOrders({ symbol });
+    const arr = Array.isArray(oo) ? oo : (oo?.data || []);
+
+    const out = arr.map((o) => ({
+      symbol,
+      side: o.side,
+      price: Number(o.price),
+      qty: Number(o.origQty || o.quantity || o.origQuantity || o.executedQty || o.executedQuantity),
+      status: o.status,
+      clientOrderId: o.clientOrderId || o.origClientOrderId || null,
+      exchangeOrderId: o.orderId || null,
+    }));
+
+    await writeJsonFileAtomic(OPEN_ORDERS_PATH, out);
+
+    // Also snapshot balances so dashboard can use exchange-truth to suppress ghost opens.
+    try {
+      const acc = await mexc.account(2500);
+      const balances = acc?.balances || [];
+      const pick = (asset) => balances.find((b) => String(b.asset).toUpperCase() === asset);
+      const btc = pick('BTC');
+      const usdt = pick('USDT');
+      await writeJsonFileAtomic(BALANCES_PATH, {
+        ts: nowIso(),
+        BTC: btc ? { free: Number(btc.free), locked: Number(btc.locked) } : { free: 0, locked: 0 },
+        USDT: usdt ? { free: Number(usdt.free), locked: Number(usdt.locked) } : { free: 0, locked: 0 },
+      });
+    } catch (_) {}
+  } catch (e) {
+    console.warn(`[GRID LIVE ${symbol}] writeOpenOrdersSnapshot failed: ${e.message}`);
+  }
 }
 
 // Rate limiting helpers
