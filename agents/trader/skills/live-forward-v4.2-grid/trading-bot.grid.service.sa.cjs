@@ -1031,6 +1031,7 @@ async function processSymbol(symbol) {
             sell.price = placed.price;
             sell.qty = placed.qty;
 
+
             await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'grid', symbol, side: 'SELL', level: sell.level, price: sell.price, qty: sell.qty, orderId: sell.orderId, kind: 'GRID_SELL_TP', correspondingBuyOrderId: trade.id, exchangeOrderId: sell.exchangeOrderId } });
           } catch (e) {
             const extra = e?.response?.data ? ` | resp=${JSON.stringify(e.response.data)}` : '';
