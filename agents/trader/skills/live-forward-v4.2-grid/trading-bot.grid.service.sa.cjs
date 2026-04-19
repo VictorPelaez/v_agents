@@ -648,7 +648,7 @@ function findJournalOpenTradeById(buyId, symbol) {
 }
 
 function hasJournalCloseForTpFill(tpCid, buyId, sellTimeMs) {
-  const closeIso = Number.isFinite(sellTimeMs) && sellTimeMs > 0 ? new Date(sellTimeMs).toISOString() : null;
+  const closeMs = Number.isFinite(sellTimeMs) && sellTimeMs > 0 ? sellTimeMs : null;
   for (const file of listRecentJournalFiles()) {
     let lines = [];
     try {
@@ -661,8 +661,20 @@ function hasJournalCloseForTpFill(tpCid, buyId, sellTimeMs) {
         const rec = JSON.parse(line);
         if (rec?.type !== 'CLOSE' || !rec.trade) continue;
         const t = rec.trade;
+
+        // Strongest idempotency key: same TP fill client id.
         if (tpCid && t.tp_fill_client_id === tpCid) return true;
-        if (buyId && t.id === buyId && closeIso && String(t.close_time_iso || '') === closeIso) return true;
+
+        // A trade id must only ever have one CLOSE. If it already has one in journal, do not emit another.
+        if (buyId && t.id === buyId) return true;
+
+        // Legacy fallback: tolerate small timestamp deltas between runtime-close and myTrades-close.
+        if (buyId && closeMs) {
+          const existingCloseMs = Date.parse(String(t.close_time_iso || ''));
+          if (Number.isFinite(existingCloseMs) && Math.abs(existingCloseMs - closeMs) <= 30_000) {
+            return true;
+          }
+        }
       } catch (_) {}
     }
   }
@@ -728,6 +740,89 @@ async function getLiveTpSellLocks(symbol) {
 
 function isLiveMode() {
   return String(cfg.TRADING_MODE || 'PAPER').toUpperCase() === 'LIVE';
+}
+
+function isPaperExtraLayersEnabled() {
+  if (isLiveMode()) return false;
+  return !!cfg.PAPER_EXTRA_LAYERS_ENABLED;
+}
+
+function getPaperExtraLevelSpecs() {
+  if (!isPaperExtraLayersEnabled()) return [];
+  const spacing = Number(cfg.SPACING_USD || 0);
+  const raw = Array.isArray(cfg.PAPER_EXTRA_LEVELS_USD) ? cfg.PAPER_EXTRA_LEVELS_USD : [];
+  return raw
+    .map((x) => Number(x))
+    .filter((x) => Number.isFinite(x) && x > 0 && spacing > 0)
+    .map((offsetUsd) => ({ offsetUsd, level: Math.round(offsetUsd / spacing) }))
+    .filter((x) => Number.isFinite(x.level) && x.level > Number(cfg.LEVELS_PER_SIDE || 0))
+    .sort((a, b) => a.level - b.level);
+}
+
+function getPaperExtraQtyPerLevel(basePrice) {
+  const capPct = Number(cfg.PAPER_EXTRA_CAPITAL_PCT || 0);
+  const specs = getPaperExtraLevelSpecs();
+  if (!(capPct > 0) || !specs.length || !(Number.isFinite(basePrice) && basePrice > 0)) return null;
+  const capUsd = Number(cfg.CAPITAL_USD || 0) * capPct;
+  if (!(capUsd > 0)) return null;
+  return (capUsd / specs.length) / basePrice;
+}
+
+function getTradeBuyLevel(grid, tr) {
+  // Prefer explicit level stored at open time (stable across rebalance / buyLevels overwrites).
+  const rd = tr?.reason_details || tr?.reasonDetails || {};
+  const lvl0 = rd?.level;
+  const lvlN = (lvl0 == null) ? null : Number(lvl0);
+  if (Number.isFinite(lvlN)) return lvlN;
+
+  // Fallback: infer from current buyLevels mapping (can fail after recenter/overwrite).
+  const buyLevel = (typeof grid?.findLevelForBuyOrder === 'function') ? grid.findLevelForBuyOrder(tr?.id) : null;
+  const buyLevelN = (buyLevel == null) ? null : Number(buyLevel);
+  return Number.isFinite(buyLevelN) ? buyLevelN : null;
+}
+
+function hasOpenTradeForLevel(grid, level) {
+  const target = Number(level);
+  if (!Number.isFinite(target)) return false;
+
+  for (const tr of grid.openTrades?.values?.() || []) {
+    const buyLevel = getTradeBuyLevel(grid, tr);
+    if (buyLevel === target) return true;
+  }
+  return false;
+}
+
+function ensurePaperExtraBuyLevels(grid) {
+  if (!isPaperExtraLayersEnabled() || !grid) return;
+  const specs = getPaperExtraLevelSpecs();
+  if (!specs.length) return;
+  const qty = getPaperExtraQtyPerLevel(Number(grid.basePrice || 0));
+  if (!(Number.isFinite(qty) && qty > 0)) return;
+
+  for (const spec of specs) {
+    const level = spec.level;
+    if (hasOpenTradeForLevel(grid, level)) continue;
+
+    const desiredPrice = Number(grid.basePrice) - spec.offsetUsd;
+    const existing = grid.buyLevels?.get?.(level);
+    if (existing && existing.status === 'pending') {
+      existing.price = desiredPrice;
+      existing.qty = qty;
+      existing.paperExtra = true;
+      existing.offsetUsd = spec.offsetUsd;
+      continue;
+    }
+
+    if (typeof grid.scheduleBuy === 'function') {
+      grid.scheduleBuy(level, desiredPrice);
+      const placed = grid.buyLevels?.get?.(level);
+      if (placed) {
+        placed.qty = qty;
+        placed.paperExtra = true;
+        placed.offsetUsd = spec.offsetUsd;
+      }
+    }
+  }
 }
 
 function getMakerOffsetPct() {
@@ -1009,6 +1104,7 @@ async function processSymbol(symbol) {
 
     // Journal initial grid orders (PAPER only)
     if (!isLiveMode()) {
+      ensurePaperExtraBuyLevels(rt.grid);
       for (const o of rt.grid.drainNewOrders()) {
         await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: o });
       }
@@ -1123,6 +1219,7 @@ async function processSymbol(symbol) {
       rt.lastRebalanceTs = Date.now();
     } else {
       await grid.rebalance();
+      ensurePaperExtraBuyLevels(grid);
       rt.lastRebalanceTs = Date.now();
     }
   }
@@ -1207,6 +1304,7 @@ async function processSymbol(symbol) {
   // Journal any newly scheduled orders since last loop.
   // In LIVE we avoid journaling internal simulated grid orders (BUY/SELL levels) because execution is real.
   if (!isLiveMode()) {
+    ensurePaperExtraBuyLevels(grid);
     for (const o of grid.drainNewOrders()) {
       await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: o });
     }
