@@ -53,6 +53,8 @@ const LOCK_PATH = path.join(BASE_DIR, 'grid.lock');
 const OPEN_POSITIONS_PATH = path.join(BASE_DIR, 'open_positions.json');
 const OPEN_ORDERS_PATH = path.join(BASE_DIR, 'open_orders.json');
 const BALANCES_PATH = path.join(BASE_DIR, 'balances.json');
+const FORCED_SELL_TIME_STOP_CANCELS_PATH = path.join(BASE_DIR, 'forced_sell_time_stop_cancels.jsonl');
+const DISPOSAL_STATE_PATH = path.join(BASE_DIR, 'disposal_state.json');
 
 function loadGridConfig() {
   return readJsonFile(CONFIG_PATH, {});
@@ -108,9 +110,20 @@ function getSymbolRuntime(symbol) {
       // ATR adaptive (per-symbol), same concept as momentum bot (used for logging only)
       lastAtrCandleTs: null,
       atrHistory: [],
+
+      // PAPER 3/100 rebalance gate telemetry for dashboard/snapshot
+      lastRebalanceGate: null,
     });
   }
   return state.symbolRuntime.get(symbol);
+}
+
+function isPaper3100Mode() {
+  try {
+    return !isLiveMode() && String(BASE_DIR || '').includes('state_paper_3100');
+  } catch (_) {
+    return false;
+  }
 }
 
 // Exchange clients
@@ -335,9 +348,35 @@ async function computeEntryContextForJournal(symbol) {
       regime: regimeInfo?.volRegime ?? null,
       micro_regime: regimeInfo?.microRegime ?? null,
       slope_norm: Number(regimeInfo?.slopeNorm || 0),
+      dist_from_sma_pct: (sma == null || !Number.isFinite(Number(candle.close)) || !Number.isFinite(Number(sma)) || Number(sma) === 0)
+        ? null
+        : Number((Number(candle.close) - Number(sma)) / Number(sma)),
     };
   } catch (e) {
     return null;
+  }
+}
+
+async function flushOpenPositionsSnapshotWithPaperGate(force = false) {
+  await flushOpenPositionsSnapshot(force);
+  if (!isPaper3100Mode()) return;
+  try {
+    const rtEntries = Array.from(state.symbolRuntime.entries()).map(([symbol, rt]) => ({
+      symbol,
+      paper_rebalance_gate: rt?.lastRebalanceGate || null,
+    }));
+    const current = readJsonFile(OPEN_POSITIONS_PATH, []);
+    const arr = Array.isArray(current) ? current : [];
+    const meta = {
+      _paper_rebalance_gate_meta: {
+        ts: nowIso(),
+        mode: 'PAPER_3100',
+        symbols: rtEntries,
+      }
+    };
+    await writeJsonFileAtomic(OPEN_POSITIONS_PATH, Object.assign(arr, meta));
+  } catch (e) {
+    console.warn(`[GRID PAPER 3100] snapshot gate meta write failed: ${e.message}`);
   }
 }
 
@@ -346,6 +385,112 @@ function mergeReasonDetails(trade, extra) {
   const cur = trade.reason_details || trade.reasonDetails || {};
   trade.reason_details = { ...cur, ...extra };
   return trade;
+}
+
+function loadForcedTpCancelIndex() {
+  try {
+    if (!fs.existsSync(FORCED_SELL_TIME_STOP_CANCELS_PATH)) return new Set();
+    const lines = fs.readFileSync(FORCED_SELL_TIME_STOP_CANCELS_PATH, 'utf8').split('\\n').filter(Boolean);
+    const out = new Set();
+    for (const line of lines) {
+      try {
+        const rec = JSON.parse(line);
+        const buyId = String(rec?.buyOrderId || '');
+        const active = rec?.active_skip_tp_reattach;
+        if (buyId && active) out.add(buyId);
+      } catch (_) {}
+    }
+    return out;
+  } catch (_) {
+    return new Set();
+  }
+}
+
+async function appendForcedTpCancelAudit(rec) {
+  try {
+    await appendJsonl(FORCED_SELL_TIME_STOP_CANCELS_PATH, rec);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function isBuyIdForcedTpCancelled(buyId) {
+  if (!buyId) return false;
+  const idx = loadForcedTpCancelIndex();
+  return idx.has(String(buyId));
+}
+
+function loadDisposalState() {
+  try {
+    if (!fs.existsSync(DISPOSAL_STATE_PATH)) {
+      return { disposal_active: false, disposal_orders: [], items: [] };
+    }
+    const raw = JSON.parse(fs.readFileSync(DISPOSAL_STATE_PATH, 'utf8'));
+    return {
+      disposal_active: !!raw?.disposal_active,
+      disposal_orders: Array.isArray(raw?.disposal_orders) ? raw.disposal_orders : [],
+      items: Array.isArray(raw?.items) ? raw.items : [],
+    };
+  } catch (_) {
+    return { disposal_active: false, disposal_orders: [], items: [] };
+  }
+}
+
+async function saveDisposalState(st) {
+  await writeJsonFileAtomic(DISPOSAL_STATE_PATH, {
+    disposal_active: !!st?.disposal_active,
+    disposal_orders: Array.isArray(st?.disposal_orders) ? st.disposal_orders : [],
+    items: Array.isArray(st?.items) ? st.items : [],
+    updatedAt: nowIso(),
+  });
+}
+
+async function rebuildDisposalStateFromForcedCancels() {
+  const thresholdCfg = Number(cfg.DISPOSAL_THRESHOLD ?? cfg.LEVELS_PER_SIDE ?? 1);
+  const maxLevels = Math.max(1, Number(cfg.LEVELS_PER_SIDE || 1));
+  const threshold = Math.min(maxLevels, Math.max(1, thresholdCfg));
+  const state0 = loadDisposalState();
+  const items = [];
+  try {
+    if (fs.existsSync(FORCED_SELL_TIME_STOP_CANCELS_PATH)) {
+      const lines = fs.readFileSync(FORCED_SELL_TIME_STOP_CANCELS_PATH, 'utf8').split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const rec = JSON.parse(line);
+          const buyOrderId = String(rec?.buyOrderId || '');
+          const entryPrice = Number(rec?.entryPrice ?? null);
+          const qty = Number(rec?.qty ?? null);
+          if (!buyOrderId || !Number.isFinite(entryPrice) || !Number.isFinite(qty)) continue;
+          items.push({
+            buyOrderId,
+            symbol: String(rec?.symbol || 'BTCUSDT'),
+            entryPrice,
+            qty,
+            cancelledAt: rec?.ts || null,
+            targetPrice: Math.max(entryPrice, entryPrice + Number(cfg.SPACING_USD || 0)),
+            daysWaiting: rec?.ts ? Math.max(0, (Date.now() - Date.parse(rec.ts)) / 86400000) : 0,
+            limitOrderId: null,
+            limitClientOrderId: null,
+            status: 'waiting',
+          });
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+  const next = {
+    disposal_active: !!cfg.DISPOSAL_ENABLED && items.length >= threshold,
+    disposal_orders: state0.disposal_orders || [],
+    items,
+  };
+  await saveDisposalState(next);
+  return next;
+}
+
+async function maybeRunDisposalModule(symbol) {
+  const state1 = await rebuildDisposalStateFromForcedCancels();
+  if (!cfg.DISPOSAL_ENABLED) return state1;
+  return state1;
 }
 
 async function reconcileTpFillsFromMyTrades(symbol) {
@@ -496,6 +641,7 @@ async function reconcileSymbolWithExchange(symbol) {
       const buyId = String(t?.id || '');
       if (!buyId) continue;
       if (keepBuyIds.has(buyId)) continue;
+      if (isBuyIdForcedTpCancelled(buyId)) continue;
 
       // Only act on trades old enough (avoid racing while TP order is still being placed).
       const openedAt = Date.parse(t?.openedAt || t?.open_time_iso || '') || 0;
@@ -518,7 +664,7 @@ async function reconcileSymbolWithExchange(symbol) {
     }
 
     if (fixed > 0) {
-      await flushOpenPositionsSnapshot(true);
+      await flushOpenPositionsSnapshotWithPaperGate(true);
       console.log(`[GRID RECONCILE ${symbol}] re-placed missing TPSELL=${fixed}`);
     }
   } catch (e) {
@@ -562,6 +708,7 @@ async function ensureTpSellsForJournalOpenTrades(symbol) {
 
       const cid = makeTpSellClientOrderIdFromBuyId(buyId);
       if (sellClientIds.has(cid)) continue; // already present on exchange
+      if (isBuyIdForcedTpCancelled(buyId)) continue;
 
       // Place missing TPSELL
       const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: tp, qty, clientOrderId: cid });
@@ -908,6 +1055,84 @@ async function getOrderLive({ symbol, orderId, clientOrderId }) {
   return mexc.getOrder({ symbol, orderId, origClientOrderId: clientOrderId });
 }
 
+
+async function maybeForceCancelExpiredTpSells(symbol, grid) {
+  if (!isLiveMode()) return;
+  if (!cfg.GRID_SELL_TIME_STOP_ENABLED) return;
+  const maxHours = Number(cfg.GRID_SELL_TIME_STOP_HOURS ?? 0);
+  if (!(Number.isFinite(maxHours) && maxHours > 0)) return;
+
+  let balances = null;
+  try {
+    const mexc = getMexcClient();
+    const acc = await mexc.account(4000);
+    const bals = acc?.balances || [];
+    const usdt = bals.find((b) => String(b.asset).toUpperCase() === 'USDT');
+    balances = { freeUsdt: usdt ? Number(usdt.free) : 0 };
+  } catch (_) {
+    return;
+  }
+
+  if (!(balances && Number.isFinite(balances.freeUsdt) && balances.freeUsdt > 0)) return;
+
+  const mexc = getMexcClient();
+  const oo = await mexc.openOrders({ symbol });
+  const arr = Array.isArray(oo) ? oo : (oo?.data || []);
+  const nowMs = Date.now();
+
+  for (const o of arr) {
+    const side = String(o?.side || '').toUpperCase();
+    if (side !== 'SELL') continue;
+    const cid = String(o?.clientOrderId || o?.origClientOrderId || '');
+    if (!cid.startsWith('TPSELL_')) continue;
+    const buyId = buyIdFromTpSellClientId(cid);
+    if (!buyId) continue;
+    if (isBuyIdForcedTpCancelled(buyId)) continue;
+
+    const tr = grid?.openTrades?.get?.(buyId) || findJournalOpenTradeById(buyId, symbol);
+    if (!tr) continue;
+    const openedAt = Date.parse(String(tr?.openedAt || tr?.open_time_iso || ''));
+    if (!Number.isFinite(openedAt) || openedAt <= 0) continue;
+
+    const ageHours = (nowMs - openedAt) / 3600000;
+    if (!(ageHours >= maxHours)) continue;
+
+    try {
+      await mexc.cancelOrder({ symbol, orderId: o.orderId, origClientOrderId: cid }, 4000);
+
+      // Prevent automatic TP recreation after this intentional cancel.
+      if (grid?.sellLevels?.size) {
+        for (const [k, sell] of grid.sellLevels.entries()) {
+          if (!sell) continue;
+          if (String(sell.correspondingBuyOrderId || '') !== String(buyId)) continue;
+          grid.sellLevels.delete(k);
+          break;
+        }
+      }
+
+      await appendForcedTpCancelAudit({
+        ts: nowIso(),
+        reason: 'GRID_SELL_TIME_STOP',
+        active_skip_tp_reattach: true,
+        symbol,
+        buyOrderId: buyId,
+        clientOrderId: cid,
+        exchangeOrderId: o.orderId || null,
+        openedAt: tr?.openedAt || tr?.open_time_iso || null,
+        entryPrice: Number(tr?.entryPrice ?? tr?.entry_price ?? null),
+        qty: Number(tr?.size ?? tr?.qty ?? null),
+        tpPrice: Number(tr?.takeProfit ?? tr?.tp ?? o?.price ?? null),
+        ageHours,
+        usdtFree: balances.freeUsdt,
+      });
+
+      console.log(`[GRID LIVE ${symbol}] forced TP cancel by time-stop: buyId=${buyId} age=${ageHours.toFixed(2)}h usdtFree=${balances.freeUsdt.toFixed(2)}`);
+    } catch (e) {
+      console.warn(`[GRID LIVE ${symbol}] forced TP cancel failed for ${cid}: ${e.message}`);
+    }
+  }
+}
+
 async function cancelAllGridOpenOrdersLive(symbol, opts = {}) {
   const mexc = getMexcClient();
   const oo = await mexc.openOrders({ symbol });
@@ -940,126 +1165,6 @@ async function cancelAllGridOpenOrdersLive(symbol, opts = {}) {
     } catch (e) {
       // ignore; may already be filled/canceled
     }
-  }
-}
-
-// --- Stray BTC unwind (maker-only) ---
-// Goal: if there is BTC available in spot ("colgado") without an active trade/TPSELL, try to exit using maker-only
-// by quoting at bid + 1 tick. This never uses taker/market.
-const UNWIND_ENABLED = String(process.env.UNWIND_ENABLED ?? cfg.UNWIND_ENABLED ?? 'false').toLowerCase() === 'true';
-const UNWIND_MIN_USD = Number(process.env.UNWIND_MIN_USD ?? cfg.UNWIND_MIN_USD ?? 50);
-const UNWIND_MAX_CHUNKS = Math.max(1, Number(process.env.UNWIND_MAX_CHUNKS ?? cfg.UNWIND_MAX_CHUNKS ?? 2));
-const UNWIND_TICK_USD = Number(process.env.UNWIND_TICK_USD ?? cfg.UNWIND_TICK_USD ?? 0.01);
-const UNWIND_PROFIT_USD = Number(process.env.UNWIND_PROFIT_USD ?? cfg.UNWIND_PROFIT_USD ?? 50);
-const UNWIND_STEP_DOWN_USD = Number(process.env.UNWIND_STEP_DOWN_USD ?? cfg.UNWIND_STEP_DOWN_USD ?? 20);
-const UNWIND_REQUOTE_SECONDS = Number(process.env.UNWIND_REQUOTE_SECONDS ?? cfg.UNWIND_REQUOTE_SECONDS ?? 10);
-
-const _unwindRt = new Map(); // symbol -> { attempt, lastPlaceMs, lastClientId, lastExchangeOrderId }
-
-async function maybeUnwindStrayBtc(symbol, grid) {
-  if (!isLiveMode()) return;
-  if (!UNWIND_ENABLED) return;
-  if (!(UNWIND_MIN_USD > 0)) return;
-
-  // Only unwind when grid has no tracked open trades (avoid interfering with normal TP logic).
-  if (grid?.openTrades && grid.openTrades.size > 0) return;
-
-  const mexc = getMexcClient();
-
-  // Open orders gate + re-quote logic.
-  // - If there is a non-unwind SELL open, do nothing (avoid fighting TPSELL/grid).
-  // - If there is an unwind SELL open, re-quote (cancel/replace) only after UNWIND_REQUOTE_SECONDS.
-  let hasUnwindSellOpen = false;
-  const rt = _unwindRt.get(symbol) || { attempt: 0, lastPlaceMs: 0, lastClientId: null, lastExchangeOrderId: null };
-  try {
-    const oo = await mexc.openOrders({ symbol });
-    const arr = Array.isArray(oo) ? oo : (oo?.data || []);
-    for (const o of arr) {
-      if (String(o?.side || '').toUpperCase() !== 'SELL') continue;
-      const cid = String(o?.clientOrderId || o?.origClientOrderId || '');
-      const isUnwind = cid.startsWith('UW_');
-      if (!isUnwind) return; // some other SELL is open -> do nothing
-      hasUnwindSellOpen = true;
-      rt.lastClientId = cid || rt.lastClientId;
-      rt.lastExchangeOrderId = o?.orderId || o?.order_id || rt.lastExchangeOrderId;
-    }
-  } catch (_) {}
-
-  if (hasUnwindSellOpen) {
-    const ageS = (Date.now() - (rt.lastPlaceMs || 0)) / 1000;
-    if (Number.isFinite(ageS) && ageS < UNWIND_REQUOTE_SECONDS) {
-      _unwindRt.set(symbol, rt);
-      return;
-    }
-    // Re-quote: cancel previous unwind order and step down.
-    try {
-      if (rt.lastExchangeOrderId) {
-        await mexc.cancelOrder({ symbol, orderId: rt.lastExchangeOrderId, origClientOrderId: rt.lastClientId }, 4000);
-      }
-    } catch (_) {}
-    rt.attempt = (rt.attempt || 0) + 1;
-  }
-  _unwindRt.set(symbol, rt);
-
-  // Read balances
-  let btcFree = 0;
-  try {
-    const acc = await mexc.account(4000);
-    const bals = acc?.balances || [];
-    const btc = bals.find((b) => String(b.asset).toUpperCase() === 'BTC');
-    btcFree = btc ? Number(btc.free) : 0;
-  } catch (_) {
-    return;
-  }
-
-  if (!Number.isFinite(btcFree) || btcFree <= 0) return;
-
-  // Price + notional
-  let bid = null;
-  let ask = null;
-  try {
-    const bt = await mexc.bookTicker(symbol, 4000);
-    bid = pickNum(bt, 'bidPrice', 'bid');
-    ask = pickNum(bt, 'askPrice', 'ask');
-  } catch (_) {}
-  if (!(bid && bid > 0)) return;
-
-  const notional = btcFree * bid;
-  if (notional < UNWIND_MIN_USD) return;
-
-  // Place one chunk at a time.
-  const chunks = Math.max(1, Math.min(UNWIND_MAX_CHUNKS, 10));
-  const chunkQtyRaw = btcFree / chunks;
-
-  const tick = (Number.isFinite(UNWIND_TICK_USD) && UNWIND_TICK_USD > 0) ? UNWIND_TICK_USD : 0.01;
-  const minPx = bid + tick; // maker-only: never cross bid
-
-  // Tender profit first, then step down on each requote attempt.
-  const startPx = (Number.isFinite(ask) && ask > 0)
-    ? (ask + (Number.isFinite(UNWIND_PROFIT_USD) ? UNWIND_PROFIT_USD : 0))
-    : (bid + (Number.isFinite(UNWIND_PROFIT_USD) ? UNWIND_PROFIT_USD : 0));
-
-  const attempt = (_unwindRt.get(symbol)?.attempt) || 0;
-  const step = (Number.isFinite(UNWIND_STEP_DOWN_USD) && UNWIND_STEP_DOWN_USD > 0) ? UNWIND_STEP_DOWN_USD : 20;
-  const targetPx = startPx - attempt * step;
-  const px = Math.max(minPx, targetPx);
-
-  // Normalize and place
-  const clientOrderId = `UW_${String(Date.now()).slice(-13)}`; // <= 16 chars
-
-  try {
-    const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: px, qty: chunkQtyRaw, clientOrderId });
-    const rt2 = _unwindRt.get(symbol) || { attempt: 0 };
-    rt2.lastPlaceMs = Date.now();
-    rt2.lastClientId = clientOrderId;
-    rt2.lastExchangeOrderId = placed.orderId;
-    _unwindRt.set(symbol, rt2);
-
-    console.log(`[UNWIND ${symbol}] placed SELL maker`, { clientOrderId, attempt, price: placed.price, qty: placed.qty, notionalApprox: placed.price * placed.qty });
-    await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'unwind', symbol, side: 'SELL', level: null, price: placed.price, qty: placed.qty, orderId: clientOrderId, kind: 'UNWIND_SELL', exchangeOrderId: placed.orderId, note: `attempt=${attempt}` } });
-  } catch (e) {
-    const extra = e?.response?.data ? ` | resp=${JSON.stringify(e.response.data)}` : '';
-    console.warn(`[UNWIND ${symbol}] place SELL maker failed: ${e.message}${extra}`);
   }
 }
 
@@ -1112,6 +1217,16 @@ async function processSymbol(symbol) {
 
     // Force snapshot now so /api/positions sees these opens immediately
     await flushOpenPositionsSnapshot();
+
+    // Startup safety: on first boot cycle, check exchange TP SELL orders immediately
+    // and force-cancel any already-expired ones before normal loop logic continues.
+    if (isLiveMode()) {
+      try {
+        await maybeForceCancelExpiredTpSells(symbol, rt.grid);
+      } catch (e) {
+        console.warn(`[GRID LIVE ${symbol}] startup time-stop check failed: ${e.message}`);
+      }
+    }
   }
 
   const grid = rt.grid;
@@ -1205,7 +1320,34 @@ async function processSymbol(symbol) {
 
   // Rebalance if needed
   if (grid.shouldRebalance()) {
-    if (isLiveMode()) {
+    let blockedByPaperGate = false;
+    if (isPaper3100Mode() && cfg.PAPER_REBALANCE_SLOPE_DIST_GATE_ENABLED) {
+      const ctx = await computeEntryContextForJournal(symbol);
+      const slopeThr = Number(cfg.PAPER_REBALANCE_SLOPE_ABS_THRESHOLD_PCT || 0);
+      const distThr = Number(cfg.PAPER_REBALANCE_DIST_ABS_THRESHOLD_PCT || 0);
+      const slopePct = Number(ctx?.sma_slope_pct);
+      const distPct = Number(ctx?.dist_from_sma_pct);
+      const trendStrong = Number.isFinite(slopePct) ? Math.abs(slopePct) > slopeThr : false;
+      const farFromSma = Number.isFinite(distPct) ? Math.abs(distPct) > distThr : false;
+      blockedByPaperGate = !!(trendStrong && farFromSma);
+      rt.lastRebalanceGate = {
+        enabled: true,
+        blocked: blockedByPaperGate,
+        reason: blockedByPaperGate ? 'A1_SLOPE_DIST' : 'ALLOW',
+        slope_abs_threshold_pct: slopeThr,
+        dist_abs_threshold_pct: distThr,
+        sma_slope_pct: Number.isFinite(slopePct) ? slopePct : null,
+        dist_from_sma_pct: Number.isFinite(distPct) ? distPct : null,
+        ts: nowIso(),
+      };
+      if (blockedByPaperGate) {
+        console.log(`[GRID PAPER ${symbol}] Skip rebalance by A1 gate: slopePct=${Number.isFinite(slopePct) ? slopePct.toFixed(6) : 'null'} distPct=${Number.isFinite(distPct) ? distPct.toFixed(6) : 'null'} thrSlope=${slopeThr.toFixed(6)} thrDist=${distThr.toFixed(6)}`);
+        await flushOpenPositionsSnapshotWithPaperGate(true);
+      }
+    }
+    if (blockedByPaperGate) {
+      // keep current ladder/inventory untouched
+    } else if (isLiveMode()) {
       // Runtime policy:
       // - Always allow BUY ladder re-centering on rebalance.
       // - Never cancel TPSELL orders; only clear the stale BUY ladder.
@@ -1221,6 +1363,7 @@ async function processSymbol(symbol) {
       await grid.rebalance();
       ensurePaperExtraBuyLevels(grid);
       rt.lastRebalanceTs = Date.now();
+      await flushOpenPositionsSnapshotWithPaperGate(true);
     }
   }
 
@@ -1431,7 +1574,7 @@ async function processSymbol(symbol) {
         }
 
         // Update open_positions.json promptly so dashboard reflects the close
-        await flushOpenPositionsSnapshot(true);
+        await flushOpenPositionsSnapshotWithPaperGate(true);
       } else {
         console.warn(`[GRID ${symbol}] SELL fill without matching open trade: ${fill.orderId}`);
       }
@@ -1477,8 +1620,8 @@ async function processSymbol(symbol) {
     }
   }
 
-  // LIVE: maker-only unwind for stray BTC inventory (no open trades)
-  await maybeUnwindStrayBtc(symbol, grid);
+  await maybeForceCancelExpiredTpSells(symbol, grid);
+  await maybeRunDisposalModule(symbol);
 
   // LIVE: reconcile journal opens vs exchange (handles manual closes/cancels)
   await reconcileSymbolWithExchange(symbol);
