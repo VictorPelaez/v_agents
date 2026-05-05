@@ -421,6 +421,21 @@ function isBuyIdForcedTpCancelled(buyId) {
   return idx.has(String(buyId));
 }
 
+function shortHash(x) {
+  return crypto.createHash('sha1').update(String(x || '')).digest('hex').slice(0, 10).toUpperCase();
+}
+
+function makeDisposalSellClientOrderId(symbol, buyOrderId) {
+  const sym = String(symbol || 'BTCUSDT').replace(/[^A-Z0-9]/gi, '').toUpperCase();
+  return `DSPSELL_${sym}_${shortHash(buyOrderId)}`.slice(0, 32);
+}
+
+function makeDisposalSellClientOrderIdVersioned(symbol, buyOrderId, version) {
+  const base = makeDisposalSellClientOrderId(symbol, buyOrderId);
+  const v = Math.max(1, Number(version || 1));
+  return `${base}_R${v}`.slice(0, 32);
+}
+
 function loadDisposalState() {
   try {
     if (!fs.existsSync(DISPOSAL_STATE_PATH)) {
@@ -450,8 +465,9 @@ async function rebuildDisposalStateFromForcedCancels() {
   const thresholdCfg = Number(cfg.DISPOSAL_THRESHOLD ?? cfg.LEVELS_PER_SIDE ?? 1);
   const maxLevels = Math.max(1, Number(cfg.LEVELS_PER_SIDE || 1));
   const threshold = Math.min(maxLevels, Math.max(1, thresholdCfg));
+  const spacing = Number(cfg.SPACING_USD || 0);
   const state0 = loadDisposalState();
-  const items = [];
+  const prevByBuyId = new Map((state0.items || []).map((x) => [String(x.buyOrderId || ''), { ...x }]));
   try {
     if (fs.existsSync(FORCED_SELL_TIME_STOP_CANCELS_PATH)) {
       const lines = fs.readFileSync(FORCED_SELL_TIME_STOP_CANCELS_PATH, 'utf8').split('\n').filter(Boolean);
@@ -462,24 +478,40 @@ async function rebuildDisposalStateFromForcedCancels() {
           const entryPrice = Number(rec?.entryPrice ?? null);
           const qty = Number(rec?.qty ?? null);
           if (!buyOrderId || !Number.isFinite(entryPrice) || !Number.isFinite(qty)) continue;
-          items.push({
+          const prev = prevByBuyId.get(buyOrderId) || {};
+          const cancelledAt = rec?.ts || prev.cancelledAt || null;
+          const daysWaiting = cancelledAt ? Math.max(0, (Date.now() - Date.parse(cancelledAt)) / 86400000) : 0;
+          prevByBuyId.set(buyOrderId, {
+            ...prev,
             buyOrderId,
-            symbol: String(rec?.symbol || 'BTCUSDT'),
+            symbol: String(rec?.symbol || prev.symbol || 'BTCUSDT'),
+            disposalClientKey: prev.disposalClientKey || makeDisposalSellClientOrderId(String(rec?.symbol || prev.symbol || 'BTCUSDT'), buyOrderId),
             entryPrice,
             qty,
-            cancelledAt: rec?.ts || null,
-            targetPrice: Math.max(entryPrice, entryPrice + Number(cfg.SPACING_USD || 0)),
-            daysWaiting: rec?.ts ? Math.max(0, (Date.now() - Date.parse(rec.ts)) / 86400000) : 0,
-            limitOrderId: null,
-            limitClientOrderId: null,
-            status: 'waiting',
+            openedAt: rec?.openedAt || prev.openedAt || null,
+            ageHours: Number.isFinite(Number(rec?.ageHours)) ? Number(rec.ageHours) : (Number.isFinite(Number(prev.ageHours)) ? Number(prev.ageHours) : null),
+            cancelledAt,
+            targetPrice: Number.isFinite(Number(prev.targetPrice)) ? Number(prev.targetPrice) : Math.max(entryPrice, entryPrice + spacing),
+            daysWaiting,
+            limitOrderId: prev.limitOrderId || null,
+            limitClientOrderId: prev.limitClientOrderId || null,
+            status: prev.status || 'waiting',
+            lastTargetUpdateAt: prev.lastTargetUpdateAt || cancelledAt || null,
+            soldAt: prev.soldAt || null,
+            exitPrice: prev.exitPrice ?? null,
+            realizedPnl: prev.realizedPnl ?? null,
+            mtmPnl: prev.mtmPnl ?? null,
+            exchangePresent: prev.exchangePresent ?? false,
+            missingSince: prev.missingSince || null,
+            recreateSeq: Number.isFinite(Number(prev.recreateSeq)) ? Number(prev.recreateSeq) : 0,
           });
         } catch (_) {}
       }
     }
   } catch (_) {}
+  const items = Array.from(prevByBuyId.values()).sort((a, b) => String(a.cancelledAt || '').localeCompare(String(b.cancelledAt || '')));
   const next = {
-    disposal_active: !!cfg.DISPOSAL_ENABLED && items.length >= threshold,
+    disposal_active: !!cfg.DISPOSAL_ENABLED && items.filter((x) => !x.soldAt).length >= threshold,
     disposal_orders: state0.disposal_orders || [],
     items,
   };
@@ -487,9 +519,351 @@ async function rebuildDisposalStateFromForcedCancels() {
   return next;
 }
 
+async function ensureDisposalLimitOrders(symbol, st) {
+  if (!cfg.DISPOSAL_ENABLED || !st?.disposal_active) return st;
+  const mexc = getMexcClient();
+  const oo = await mexc.openOrders({ symbol });
+  const arr = Array.isArray(oo) ? oo : (oo?.data || []);
+  const byCid = new Map(arr.map((o) => [String(o?.clientOrderId || o?.origClientOrderId || ''), o]));
+  const spacing = Number(cfg.SPACING_USD || 0);
+
+  for (const item of st.items) {
+    if (String(item.symbol || '') !== String(symbol)) continue;
+    if (item.soldAt) {
+      item.exchangePresent = false;
+      continue;
+    }
+
+    item.disposalClientKey = item.disposalClientKey || makeDisposalSellClientOrderId(symbol, item.buyOrderId);
+    const cid = item.limitClientOrderId || item.disposalClientKey;
+    item.limitClientOrderId = cid;
+    const targetPrice = Math.max(Number(item.entryPrice), Number(item.targetPrice || (item.entryPrice + spacing)));
+    item.targetPrice = targetPrice;
+
+    const ex = byCid.get(cid);
+    if (ex) {
+      const stEx = String(ex.status || '').toUpperCase();
+      console.log(`[DISPOSAL ${symbol}] exists buyId=${item.buyOrderId} cid=${cid} exStatus=${stEx} price=${ex.price} qty=${ex.qty}`);
+      if (stEx === 'NEW' || stEx === 'PARTIALLY_FILLED') {
+        item.limitOrderId = ex.orderId || ex.order_id || item.limitOrderId || null;
+        item.status = item.status === 'degraded' ? 'degraded' : 'limit_active';
+        item.exchangePresent = true;
+        item.missingSince = null;
+        continue;
+      }
+    } else {
+      item.exchangePresent = false;
+      if (!item.missingSince) item.missingSince = nowIso();
+      if (!item.status || item.status === 'limit_active' || item.status === 'degraded' || item.status === 'waiting' || item.status === 'recreate_failed' || item.status === 'missing_on_exchange_unconfirmed') {
+        item.status = 'missing_on_exchange_unconfirmed';
+      }
+      console.log(`[DISPOSAL ${symbol}] missing_on_exchange buyId=${item.buyOrderId} cid=${cid} target=${targetPrice} qty=${item.qty}`);
+
+      // Conservative but operational: for unsold disposal inventory created by forced TP cancel,
+      // missing on exchange after restart means we should restore the dedicated disposal SELL.
+      // These orders are NOT grid TPSELL locks and do not count as grid levels.
+      try {
+        const nextSeq = Math.max(1, Number(item.recreateSeq || 0) + 1);
+        const recreateCid = makeDisposalSellClientOrderIdVersioned(symbol, item.buyOrderId, nextSeq);
+        const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: targetPrice, qty: Number(item.qty), clientOrderId: recreateCid });
+        item.limitOrderId = placed.orderId || null;
+        item.limitClientOrderId = recreateCid;
+        item.recreateSeq = nextSeq;
+        item.status = 'limit_active';
+        item.exchangePresent = true;
+        item.missingSince = null;
+        if (!item.lastTargetUpdateAt) item.lastTargetUpdateAt = nowIso();
+        console.log(`[DISPOSAL ${symbol}] recreate_ok buyId=${item.buyOrderId} cid=${recreateCid} exOrderId=${placed.orderId} price=${placed.price}`);
+        await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'disposal', symbol, side: 'SELL', level: null, price: placed.price, qty: placed.qty, orderId: recreateCid, kind: 'DISPOSAL_SELL', correspondingBuyOrderId: item.buyOrderId, exchangeOrderId: placed.orderId, note: 'recreated_if_missing' } });
+      } catch (e) {
+        const msg = String(e?.response?.data?.msg || e?.message || '');
+        console.warn(`[DISPOSAL ${symbol}] recreate_fail buyId=${item.buyOrderId} cid=${cid} msg=${msg}`);
+        if (/duplicate client order id/i.test(msg)) {
+          item.status = 'missing_on_exchange_unconfirmed';
+        } else if (isInsufficientBalanceError(e)) {
+          item.status = 'recreate_failed';
+        } else {
+          item.status = 'recreate_failed';
+        }
+      }
+      continue;
+    }
+  }
+  await saveDisposalState(st);
+  return st;
+}
+
+async function maybeDecayDisposalOrders(symbol, st) {
+  if (!cfg.DISPOSAL_ENABLED || !st?.disposal_active) return st;
+  const spacing = Number(cfg.SPACING_USD || 0);
+  const decayFactor = Number(cfg.DISPOSAL_DAILY_DECAY_FACTOR ?? 0.15);
+  if (!(spacing > 0) || !(decayFactor > 0)) return st;
+  const mexc = getMexcClient();
+  const now = Date.now();
+
+  for (const item of st.items) {
+    if (String(item.symbol || '') !== String(symbol)) continue;
+    if (item.soldAt) continue;
+    if (!(item.status === 'limit_active' || item.status === 'degraded')) continue;
+    if (item.exchangePresent === false) continue;
+    const lastTs = Date.parse(String(item.lastTargetUpdateAt || item.cancelledAt || ''));
+    const ageMs = Number.isFinite(lastTs) ? (now - lastTs) : NaN;
+    if (!Number.isFinite(lastTs) || ageMs < 86400000) {
+      console.log(`[DISPOSAL ${symbol}] skip_degrade buyId=${item.buyOrderId} ageHours=${Number.isFinite(ageMs) ? (ageMs/3600000).toFixed(2) : 'NaN'} target=${item.targetPrice}`);
+      continue;
+    }
+    const oldTarget = Number(item.targetPrice);
+    const newTarget = Math.max(Number(item.entryPrice), oldTarget - spacing * decayFactor);
+    if (!(Number.isFinite(oldTarget) && Number.isFinite(newTarget))) continue;
+
+    // Always persist the decision path; disposal_state is authoritative.
+    if (!(newTarget < oldTarget)) {
+      item.lastTargetUpdateAt = nowIso();
+      item.status = 'waiting';
+      continue;
+    }
+
+    // Only do cancel+replace if a full day has passed. If the order is missing, ensureDisposalLimitOrders handles recreation.
+    try {
+      console.log(`[DISPOSAL ${symbol}] degrade_cancel buyId=${item.buyOrderId} cid=${item.limitClientOrderId} oldTarget=${oldTarget} newTarget=${newTarget}`);
+      if (item.limitOrderId || item.limitClientOrderId) {
+        await mexc.cancelOrder({ symbol, orderId: item.limitOrderId, origClientOrderId: item.limitClientOrderId }, 4000);
+      }
+    } catch (e) {
+      console.warn(`[DISPOSAL ${symbol}] degrade_cancel_fail buyId=${item.buyOrderId} cid=${item.limitClientOrderId} msg=${String(e?.response?.data?.msg || e?.message || '')}`);
+    }
+
+    const nextSeq = Math.max(1, Number(item.recreateSeq || 0) + 1);
+    const cid = makeDisposalSellClientOrderIdVersioned(symbol, item.buyOrderId, nextSeq);
+    try {
+      const placed = await placeLimitMakerLive({ symbol, side: 'SELL', price: newTarget, qty: Number(item.qty), clientOrderId: cid });
+      item.targetPrice = newTarget;
+      item.limitOrderId = placed.orderId || null;
+      item.limitClientOrderId = cid;
+      item.recreateSeq = nextSeq;
+      item.status = 'degraded';
+      item.lastTargetUpdateAt = nowIso();
+      console.log(`[DISPOSAL ${symbol}] degrade_ok buyId=${item.buyOrderId} cid=${cid} price=${placed.price} exOrderId=${placed.orderId}`);
+      await persistJournalEvent({ ts: nowIso(), type: 'ORDER', order: { bot: 'disposal', symbol, side: 'SELL', level: null, price: placed.price, qty: placed.qty, orderId: cid, kind: 'DISPOSAL_SELL', correspondingBuyOrderId: item.buyOrderId, exchangeOrderId: placed.orderId, note: 'degraded' } });
+    } catch (e) {
+      console.warn(`[DISPOSAL ${symbol}] degrade_fail buyId=${item.buyOrderId} cid=${cid} msg=${String(e?.response?.data?.msg || e?.message || '')}`);
+      item.status = 'degrade_failed';
+    }
+  }
+  await saveDisposalState(st);
+  return st;
+}
+
+async function maybeSyncDisposalFills(symbol, st) {
+  if (!cfg.DISPOSAL_ENABLED) return st;
+  const mexc = getMexcClient();
+  const bt = await mexc.bookTicker(symbol).catch(() => null);
+  const last = pickNum(bt, 'bidPrice', 'bid');
+  const oo = await mexc.openOrders({ symbol }).catch(() => []);
+  const openArr = Array.isArray(oo) ? oo : (oo?.data || []);
+  const openByCid = new Map(openArr.map((o) => [String(o?.clientOrderId || o?.origClientOrderId || ''), o]));
+  for (const item of st.items) {
+    if (String(item.symbol || '') !== String(symbol)) continue;
+    if (!item.soldAt && Number.isFinite(Number(last)) && Number(last) > 0) {
+      item.mtmPnl = (Number(last) - Number(item.entryPrice)) * Number(item.qty);
+    }
+    if (!item.limitClientOrderId || item.soldAt) continue;
+
+    const exOpen = openByCid.get(String(item.limitClientOrderId));
+    if (exOpen) {
+      item.exchangePresent = true;
+      item.missingSince = null;
+      const stEx = String(exOpen?.status || '').toUpperCase();
+      if (stEx === 'NEW' || stEx === 'PARTIALLY_FILLED') {
+        item.limitOrderId = exOpen.orderId || exOpen.order_id || item.limitOrderId || null;
+        item.status = item.status === 'degraded' ? 'degraded' : 'limit_active';
+        continue;
+      }
+    } else {
+      item.exchangePresent = false;
+      if (!item.missingSince) item.missingSince = nowIso();
+    }
+
+    let ord = null;
+    try {
+      ord = await getOrderLive({ symbol, orderId: item.limitOrderId, clientOrderId: item.limitClientOrderId });
+    } catch (_) {}
+
+    let filled = false;
+    let fillPx = null;
+    let fillTs = null;
+
+    if (ord) {
+      const ordStatus = String(ord?.status || '').toUpperCase();
+      if (ordStatus === 'FILLED' || ordStatus === 'DONE') {
+        fillPx = mexc.orderAvgFillPrice(ord) || pickNum(ord, 'price');
+        fillTs = ord?.updateTime || ord?.transactTime || ord?.time || Date.now();
+        filled = true;
+      }
+    }
+
+    if (filled) {
+      item.soldAt = Number.isFinite(Number(fillTs)) ? new Date(Number(fillTs)).toISOString() : nowIso();
+      item.exitPrice = Number.isFinite(Number(fillPx)) ? Number(fillPx) : Number(item.targetPrice);
+      item.realizedPnl = (Number(item.exitPrice) - Number(item.entryPrice)) * Number(item.qty);
+      item.status = 'sold';
+      item.limitOrderId = null;
+      item.exchangePresent = false;
+      item.missingSince = null;
+      await persistJournalEvent({ ts: item.soldAt || nowIso(), type: 'INFO', info: { bot: 'disposal', symbol, kind: 'DISPOSAL_FILLED', correspondingBuyOrderId: item.buyOrderId, exitPrice: item.exitPrice, realizedPnl: item.realizedPnl } });
+      const closeTrade = {
+        id: String(item.buyOrderId || ''),
+        bot: 'grid',
+        label: 'grid',
+        mode: 'LIVE',
+        execution_entry: 'maker',
+        fee_rate_entry: 0,
+        fee_rate_exit: 0,
+        sl_policy: 'NONE',
+        symbol,
+        open_time_iso: item.openedAt || null,
+        side: 'LONG',
+        qty: Number(item.qty),
+        entry_price: Number(item.entryPrice),
+        sl: null,
+        tp: Number(item.targetPrice ?? item.exitPrice),
+        close_reason: 'DISPOSAL',
+        close_time_iso: item.soldAt,
+        exit_price: Number(item.exitPrice),
+        profit: Number(item.realizedPnl),
+        profit_pct: Number(item.entryPrice) ? ((Number(item.exitPrice) - Number(item.entryPrice)) / Number(item.entryPrice)) * 100 : null,
+        fee_usd_est: 0,
+        profit_after_fees_est: Number(item.realizedPnl),
+        reason_tag: 'grid',
+        reason_details: {
+          level: null,
+          disposal: true,
+          disposal_client_order_id: item.limitClientOrderId || null,
+          disposal_close: true,
+        },
+        tp_fill_client_id: item.limitClientOrderId || null,
+      };
+      await persistJournalEvent({ ts: item.soldAt || nowIso(), type: 'CLOSE', trade: closeTrade });
+      continue;
+    }
+
+    if (!exOpen && !item.soldAt) item.status = 'missing_on_exchange_unconfirmed';
+  }
+  await saveDisposalState(st);
+  return st;
+}
+
+async function reconcileDisposalFillsFromMyTrades(symbol) {
+  if (!isLiveMode() || !cfg.DISPOSAL_ENABLED) return;
+
+  const rt = getSymbolRuntime(symbol);
+  const now = Date.now();
+  const intervalMs = 10_000;
+  if (rt.lastDisposalMyTradesCheckTs && (now - rt.lastDisposalMyTradesCheckTs) < intervalMs) return;
+  rt.lastDisposalMyTradesCheckTs = now;
+
+  const st = loadDisposalState();
+  const items = Array.isArray(st?.items) ? st.items : [];
+  const pending = items.filter((x) => String(x?.symbol || '') === String(symbol) && !x?.soldAt && !!x?.limitClientOrderId);
+  if (!pending.length) return;
+
+  try {
+    const mexc = getMexcClient();
+    const tr = await mexc.myTrades({ symbol, limit: 100 });
+    const arr = Array.isArray(tr) ? tr : (tr?.data || []);
+    const sells = arr.filter((t) => !t.isBuyer);
+    const allRaw = await mexc.allOrders({ symbol, limit: 200 }).catch(() => []);
+    const allOrders = Array.isArray(allRaw) ? allRaw : (allRaw?.data || []);
+    if (!sells.length) return;
+
+    let changed = false;
+    for (const item of pending) {
+      const cid = String(item.limitClientOrderId || '');
+      const histOrd = allOrders.find((o) => {
+        const ocid = String(o.clientOrderId || o.origClientOrderId || '');
+        const ooid = String(o.orderId || o.order_id || '');
+        if (cid && ocid && cid === ocid) return true;
+        if (item.limitOrderId && ooid && String(item.limitOrderId) === ooid) return true;
+        return false;
+      }) || null;
+      const strong = sells.find((t) => {
+        const tcid = String(t.clientOrderId || t.origClientOrderId || '');
+        const toid = String(t.orderId || t.order_id || '');
+        if (cid && tcid && cid === tcid) return true;
+        if (item.limitOrderId && toid && String(item.limitOrderId) === toid) return true;
+        return false;
+      });
+
+      let ord = null;
+      try {
+        ord = await getOrderLive({ symbol, orderId: item.limitOrderId, clientOrderId: cid });
+      } catch (_) { ord = null; }
+
+      const status = String(ord?.status || ord?.state || histOrd?.status || histOrd?.state || '').toUpperCase();
+      const terminalFilled = status === 'FILLED' || status === 'DONE';
+      if (!terminalFilled && !strong) continue;
+      if (!terminalFilled && strong) continue;
+
+      const px = mexc.orderAvgFillPrice(ord || histOrd) || pickNum(ord || histOrd, 'price') || Number(strong?.price);
+      const ts = ord?.updateTime || ord?.transactTime || ord?.time || histOrd?.updateTime || histOrd?.time || strong?.time || Date.now();
+      item.soldAt = Number.isFinite(Number(ts)) ? new Date(Number(ts)).toISOString() : nowIso();
+      item.exitPrice = Number.isFinite(Number(px)) ? Number(px) : Number(item.targetPrice);
+      item.realizedPnl = (Number(item.exitPrice) - Number(item.entryPrice)) * Number(item.qty);
+      item.status = 'sold';
+      item.limitOrderId = null;
+      item.exchangePresent = false;
+      item.missingSince = null;
+
+      const closeTrade = {
+        id: String(item.buyOrderId || ''),
+        bot: 'grid',
+        label: 'grid',
+        mode: 'LIVE',
+        execution_entry: 'maker',
+        fee_rate_entry: 0,
+        fee_rate_exit: 0,
+        sl_policy: 'NONE',
+        symbol,
+        open_time_iso: item.openedAt || null,
+        side: 'LONG',
+        qty: Number(item.qty),
+        entry_price: Number(item.entryPrice),
+        sl: null,
+        tp: Number(item.targetPrice ?? item.exitPrice),
+        close_reason: 'DISPOSAL',
+        close_time_iso: item.soldAt,
+        exit_price: Number(item.exitPrice),
+        profit: Number(item.realizedPnl),
+        profit_pct: Number(item.entryPrice) ? ((Number(item.exitPrice) - Number(item.entryPrice)) / Number(item.entryPrice)) * 100 : null,
+        fee_usd_est: 0,
+        profit_after_fees_est: Number(item.realizedPnl),
+        reason_tag: 'grid',
+        reason_details: {
+          level: null,
+          disposal: true,
+          disposal_client_order_id: cid,
+          disposal_close: true,
+        },
+        tp_fill_client_id: cid,
+      };
+
+      await persistJournalEvent({ ts: item.soldAt || nowIso(), type: 'INFO', info: { bot: 'disposal', symbol, kind: 'DISPOSAL_FILLED', correspondingBuyOrderId: item.buyOrderId, exitPrice: item.exitPrice, realizedPnl: item.realizedPnl } });
+      await persistJournalEvent({ ts: item.soldAt || nowIso(), type: 'CLOSE', trade: closeTrade });
+      changed = true;
+    }
+
+    if (changed) await saveDisposalState(st);
+  } catch (_) {
+    // avoid spam
+  }
+}
+
 async function maybeRunDisposalModule(symbol) {
-  const state1 = await rebuildDisposalStateFromForcedCancels();
+  let state1 = await rebuildDisposalStateFromForcedCancels();
   if (!cfg.DISPOSAL_ENABLED) return state1;
+  state1 = await maybeSyncDisposalFills(symbol, state1);
+  state1 = await ensureDisposalLimitOrders(symbol, state1);
+  state1 = await maybeDecayDisposalOrders(symbol, state1);
   return state1;
 }
 
@@ -933,6 +1307,8 @@ function hasOpenTradeForLevel(grid, level) {
   if (!Number.isFinite(target)) return false;
 
   for (const tr of grid.openTrades?.values?.() || []) {
+    const buyId = String(tr?.id || '');
+    if (isBuyIdForcedTpCancelled(buyId)) continue;
     const buyLevel = getTradeBuyLevel(grid, tr);
     if (buyLevel === target) return true;
   }
@@ -1583,6 +1959,7 @@ async function processSymbol(symbol) {
 
   // LIVE: reconcile TP SELL fills from exchange → journal CLOSE
   await reconcileTpFillsFromMyTrades(symbol);
+  await reconcileDisposalFillsFromMyTrades(symbol);
 
   // LIVE: ensure TPSELL exists for ALL journal-open trades (even after restart).
   // NOTE: grid engines currently do not reconstruct sellLevels from journal on bootstrap, so relying only on grid.sellLevels
